@@ -1,0 +1,3 @@
+[submodule "Megakernels"]
+	path = Megakernels
+	url = https://github.com/AndreSlavescu/Megakernels.git

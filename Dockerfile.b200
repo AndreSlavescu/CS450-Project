@@ -1,0 +1,26 @@
+FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    python3-pip \
+    ninja-build \
+    git \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3 /usr/bin/python
+
+RUN pip install numpy ninja pytest uv && \
+    pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
+
+WORKDIR /workspace
+
+COPY Megakernels /workspace/Megakernels
+
+ENV THUNDERKITTENS_ROOT=/workspace/Megakernels/ThunderKittens
+ENV MEGAKERNELS_ROOT=/workspace/Megakernels
+ENV PYTHON_VERSION=3.11
+ENV GPU=B200
+
+RUN cd /workspace/Megakernels && pip install -e .
+
+RUN cd /workspace/Megakernels/demos/low-latency-llama && make
