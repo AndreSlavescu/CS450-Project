@@ -1,0 +1,39 @@
+name: Documentation Issue
+description: Report a docs issue or suggest improvements.
+title: "[Docs]: "
+labels: ["documentation", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping us improve the documentation!
+  - type: input
+    id: location
+    attributes:
+      label: Location
+      description: Link or file path to the docs section.
+      placeholder: README.md or https://...
+    validations:
+      required: false
+  - type: textarea
+    id: issue
+    attributes:
+      label: What’s wrong or missing?
+      description: Be specific about the issue.
+      placeholder: The setup steps are unclear because ...
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested fix
+      description: If you have a proposed change, include it here.
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Screenshots, examples, or other helpful context.
+    validations:
+      required: false

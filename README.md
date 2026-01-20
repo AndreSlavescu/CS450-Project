@@ -58,3 +58,11 @@ modal run run_modal.py --waterloo-megakernel --gpu h100 # run application target
 modal run run_modal.py --hazy-megakernel --gpu b200 # run application targetting b200 to reproduce hazy baseline 
 modal run run_modal.py --waterloo-megakernel --gpu b200 # run application targetting b200 to reproduce waterloo baseline
 ```
+
+## Relevant Links
+
+[Pull Request Template](.github/PULL_REQUEST_TEMPLATE.md)
+
+[Issue Templates](.github/ISSUE_TEMPLATE/)
+
+[Contributing Rules](.github/CONTRIBUTING.md)
