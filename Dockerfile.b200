@@ -1,15 +1,32 @@
 FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04
 
-RUN apt-get update && apt-get install -y \
+ARG DEBIAN_FRONTEND=noninteractive
+ENV PATH=/usr/local/cuda-13.0/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH}
+RUN which nvcc && nvcc --version && which ptxas && ptxas --version
+
+# install Python 3.12 via Deadsnakes PPA
+RUN apt-get update && apt-get install -y software-properties-common && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y \
+    python3.12 \
+    python3.12-dev \
     build-essential \
     cmake \
-    python3-pip \
     ninja-build \
     git \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -s /usr/bin/python3 /usr/bin/python
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN pip install numpy ninja pytest uv && \
+# set Python 3.12 as the default 'python' and 'python3'
+RUN ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3.12 /usr/bin/python && \
+    ln -sf /usr/bin/python3.12-config /usr/bin/python3-config
+
+# pip for Python 3.12
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+
+RUN pip install numpy ninja pytest uv "setuptools>=64.0.0" && \
     pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
 
 WORKDIR /workspace
@@ -18,9 +35,9 @@ COPY Megakernels /workspace/Megakernels
 
 ENV THUNDERKITTENS_ROOT=/workspace/Megakernels/ThunderKittens
 ENV MEGAKERNELS_ROOT=/workspace/Megakernels
-ENV PYTHON_VERSION=3.11
+ENV PYTHON_VERSION=3.12
 ENV GPU=B200
 
-RUN cd /workspace/Megakernels && pip install -e .
+RUN cd /workspace/Megakernels && pip install --no-build-isolation -e .
 
 RUN cd /workspace/Megakernels/demos/low-latency-llama && make
