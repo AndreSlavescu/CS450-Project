@@ -27,7 +27,7 @@ RUN ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
 
 RUN pip install numpy ninja pytest uv "setuptools>=64.0.0" && \
-    pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 WORKDIR /workspace
 
