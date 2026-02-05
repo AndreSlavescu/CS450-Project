@@ -15,11 +15,20 @@ h100_image = modal.Image.from_dockerfile(
 # )
 
 
-@app.function(image=h100_image, gpu="H100", timeout=3600)
+@app.function(
+    image=h100_image,
+    gpu="H100",
+    timeout=3600,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
 def run_hazy_h100():
+    import os
     import sys
 
     import torch
+
+    if "HF_TOKEN" not in os.environ:
+        print("MISSING HF_TOKEN!")
 
     sys.path.insert(0, "/workspace/Megakernels")
 
