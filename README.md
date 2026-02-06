@@ -31,6 +31,8 @@ Authenticate with Modal:
 modal setup
 ```
 
+When doing the setup, select the [`cs450-project`](https://modal.com/apps/cs450-project/main) shared environment.
+
 ### Docker Image
 
 The project uses GPU-specific Dockerfiles:
@@ -44,6 +46,22 @@ Both images:
 - Build the llama3 1b demo that target the respective GPU (B200 or H100)
 
 Modal will automatically build and cache this Docker image on first run. The image will only rebuild in the modal instance if you modify the Dockerfile.
+
+### HuggingFace Access to LLM
+
+We use a service called HuggingFace to retrieve the LLMs we wish to test on. You can go ahead and create an account here if you don't have one: [HuggingFace](https://huggingface.co/). Then, under account, create an access token.
+
+Once you have the token, run the following command:
+
+```bash
+modal secret create huggingface-secret HF_TOKEN=your_token_here
+```
+
+Then, you will need to request access for the particular model being used in the code.
+
+For the baseline, we are using [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct).
+
+Once on the model page, you have to request access and will be notified by email if your access is approved (takes around 30 mins).
 
 ### Running on Modal
 
