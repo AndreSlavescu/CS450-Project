@@ -8,10 +8,7 @@ Usage:
 
 import argparse
 import http.server
-import json
-import os
 import socketserver
-import sys
 import threading
 import webbrowser
 from pathlib import Path
@@ -235,12 +232,11 @@ def make_handler(trace_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="View a Perfetto trace locally")
-    parser.add_argument("trace", nargs="?", default=str(DEFAULT_TRACE),
-                        help=f"Path to trace JSON file (default: {DEFAULT_TRACE})")
-    parser.add_argument("--port", type=int, default=8384,
-                        help="Local server port (default: 8384)")
-    parser.add_argument("--no-open", action="store_true",
-                        help="Don't auto-open browser")
+    parser.add_argument(
+        "trace", nargs="?", default=str(DEFAULT_TRACE), help=f"Path to trace JSON file (default: {DEFAULT_TRACE})"
+    )
+    parser.add_argument("--port", type=int, default=8384, help="Local server port (default: 8384)")
+    parser.add_argument("--no-open", action="store_true", help="Don't auto-open browser")
     args = parser.parse_args()
 
     trace_path = Path(args.trace).resolve()
