@@ -1,0 +1,48 @@
+name: Code Quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    name: Python Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install black ruff
+
+      - name: Check formatting (black)
+        run: find . -type f -name '*.py' -not -path '*/ThunderKittens/*' | xargs black --check
+
+      - name: Lint (ruff)
+        run: find . -type f -name '*.py' -not -path '*/ThunderKittens/*' | xargs ruff check
+
+  cpp:
+    name: C++ Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install cpplint
+
+      - name: Check formatting (clang-format)
+        run: |
+          find . -type f \( -name '*.cuh' -o -name '*.cu' -o -name '*.h' -o -name '*.cpp' \) -not -path '*/ThunderKittens/*' \
+            | xargs clang-format --dry-run -Werror
+
+      - name: Lint (cpplint)
+        run: |
+          find . -type f \( -name '*.cuh' -o -name '*.cu' -o -name '*.h' -o -name '*.cpp' \) -not -path '*/ThunderKittens/*' \
+            | xargs cpplint --filter=-legal/copyright,-build/header_guard,-build/include_subdir,-runtime/references,-build/namespaces
