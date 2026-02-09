@@ -1,0 +1,54 @@
+name: Code Quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    name: Python Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install black ruff
+
+      - name: Check formatting (black)
+        run: |
+          EXCLUDE=$(git config --file .gitmodules --get-regexp path | awk '{printf "-not -path ./%s/* ", $2}')
+          find . -type f -name '*.py' $EXCLUDE | xargs black --check
+
+      - name: Lint (ruff)
+        run: |
+          EXCLUDE=$(git config --file .gitmodules --get-regexp path | awk '{printf "-not -path ./%s/* ", $2}')
+          find . -type f -name '*.py' $EXCLUDE | xargs ruff check
+
+  cpp:
+    name: C++ Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install cpplint
+
+      - name: Check formatting (clang-format)
+        run: |
+          EXCLUDE=$(git config --file .gitmodules --get-regexp path | awk '{printf "-not -path ./%s/* ", $2}')
+          find . -type f \( -name '*.cuh' -o -name '*.cu' -o -name '*.h' -o -name '*.cpp' \) $EXCLUDE \
+            | xargs clang-format --dry-run -Werror
+
+      - name: Lint (cpplint)
+        run: |
+          EXCLUDE=$(git config --file .gitmodules --get-regexp path | awk '{printf "-not -path ./%s/* ", $2}')
+          find . -type f \( -name '*.cuh' -o -name '*.cu' -o -name '*.h' -o -name '*.cpp' \) $EXCLUDE \
+            | xargs cpplint --filter=-legal/copyright,-build/header_guard,-build/include_subdir,-runtime/references,-build/namespaces,-whitespace/line_length,-runtime/int,-build/include_what_you_use,-whitespace/comments

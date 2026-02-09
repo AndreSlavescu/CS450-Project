@@ -1,4 +1,3 @@
-import argparse
 from pathlib import Path
 
 import modal
@@ -44,9 +43,7 @@ def run_hazy_h100():
     import os
 
     os.chdir("/workspace/Megakernels")
-    os.system(
-        'python megakernels/scripts/generate.py mode=mk prompt="tell me a funny joke about cookies" ntok=100'
-    )
+    os.system('python megakernels/scripts/generate.py mode=mk prompt="tell me a funny joke about cookies" ntok=100')
 
     return "Hazy H100 job completed"
 
@@ -102,9 +99,7 @@ def run_waterloo_h100():
 
 
 @app.local_entrypoint()
-def main(
-    hazy_megakernel: bool = False, waterloo_megakernel: bool = False, gpu: str = "b200"
-):
+def main(hazy_megakernel: bool = False, waterloo_megakernel: bool = False, gpu: str = "b200"):
     # Determine implementation logic
     implementation = "waterloo"  # Default
     if hazy_megakernel:
@@ -114,15 +109,13 @@ def main(
 
     if implementation == "hazy":
         if gpu == "h100":
-            result = run_hazy_h100.remote()
+            run_hazy_h100.remote()
         elif gpu == "b200":
             pass
-            # result = run_hazy_b200.remote()
+            # run_hazy_b200.remote()
     elif implementation == "waterloo":
         if gpu == "h100":
-            result = run_waterloo_h100.remote()
+            run_waterloo_h100.remote()
         elif gpu == "b200":
             pass
-            # result = run_waterloo_b200.remote()
-
-    # print(result)
+            # run_waterloo_b200.remote()

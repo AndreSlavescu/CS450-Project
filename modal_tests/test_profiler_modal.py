@@ -27,14 +27,12 @@ GPU_CONFIGS = {
     },
 }
 
-h100_image = (
-    modal.Image.from_dockerfile(GPU_CONFIGS["h100"]["dockerfile"])
-    .add_local_dir(str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc")
+h100_image = modal.Image.from_dockerfile(GPU_CONFIGS["h100"]["dockerfile"]).add_local_dir(
+    str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc"
 )
 
-b200_image = (
-    modal.Image.from_dockerfile(GPU_CONFIGS["b200"]["dockerfile"])
-    .add_local_dir(str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc")
+b200_image = modal.Image.from_dockerfile(GPU_CONFIGS["b200"]["dockerfile"]).add_local_dir(
+    str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc"
 )
 
 
@@ -52,7 +50,8 @@ def _run_profiler(arch: str) -> dict:
         f"-arch={arch}",
         "-I/workspace/src/csrc/profiler",
         "/workspace/src/csrc/profiler/test_profiler.cu",
-        "-o", "/workspace/test_profiler",
+        "-o",
+        "/workspace/test_profiler",
     ]
     print(f"Compiling: {' '.join(compile_cmd)}")
     result = subprocess.run(compile_cmd, capture_output=True, text=True)
