@@ -1,11 +1,15 @@
+import os
 from pathlib import Path
 
 import modal
+
+force_rebuild = os.environ.get("FORCE_REBUILD", "0") == "1"
 
 app = modal.App("cs450-project")
 
 h100_image = modal.Image.from_dockerfile(
     Path(__file__).parent / "Dockerfile.h100",
+    force_build=force_rebuild,
 )
 
 # b200_image = modal.Image.from_dockerfile(

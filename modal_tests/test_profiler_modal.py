@@ -4,13 +4,29 @@ Test the GPU profiler on Modal.
 Usage:
     modal run modal_tests/test_profiler_modal.py --gpu h100
     modal run modal_tests/test_profiler_modal.py --gpu b200
+
+    # if you want to force rebuild the image:
+    FORCE_REBUILD=1 modal run modal_tests/test_profiler_modal.py --gpu h100
+    FORCE_REBUILD=1 modal run modal_tests/test_profiler_modal.py --gpu b200
 """
 
+import os
+import sys
 from pathlib import Path
 
 import modal
 
 PROJECT_ROOT = Path(__file__).parent.parent
+
+force_rebuild = os.environ.get("FORCE_REBUILD", "0") == "1"
+
+# Parse --gpu from sys.argv at module level to only build the needed image.
+# Modal builds all images at import time, so we avoid building the unused one.
+_target_gpu = "h100"
+for i, arg in enumerate(sys.argv):
+    if arg == "--gpu" and i + 1 < len(sys.argv):
+        _target_gpu = sys.argv[i + 1].lower()
+        break
 
 app = modal.App("cs450-profiler-test")
 
@@ -27,13 +43,18 @@ GPU_CONFIGS = {
     },
 }
 
-h100_image = modal.Image.from_dockerfile(GPU_CONFIGS["h100"]["dockerfile"]).add_local_dir(
-    str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc"
-)
+_placeholder = modal.Image.debian_slim()
 
-b200_image = modal.Image.from_dockerfile(GPU_CONFIGS["b200"]["dockerfile"]).add_local_dir(
-    str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc"
-)
+if _target_gpu == "h100":
+    h100_image = modal.Image.from_dockerfile(
+        GPU_CONFIGS["h100"]["dockerfile"], force_build=force_rebuild
+    ).add_local_dir(str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc")
+    b200_image = _placeholder
+else:
+    h100_image = _placeholder
+    b200_image = modal.Image.from_dockerfile(
+        GPU_CONFIGS["b200"]["dockerfile"], force_build=force_rebuild
+    ).add_local_dir(str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc")
 
 
 def _run_profiler(arch: str) -> dict:
