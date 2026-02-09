@@ -1,8 +1,8 @@
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-ENV PATH=/usr/local/cuda-13.0/bin:${PATH}
-ENV LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH}
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 RUN which nvcc && nvcc --version && which ptxas && ptxas --version
 
 # install Python 3.12 via Deadsnakes PPA
@@ -40,4 +40,4 @@ ENV GPU=H100
 
 RUN cd /workspace/Megakernels && pip install --no-build-isolation -e .
 
-RUN cd /workspace/Megakernels/demos/low-latency-llama && make
+RUN cd /workspace/Megakernels/demos/low-latency-llama && make GPU=H100
