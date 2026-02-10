@@ -102,7 +102,7 @@ def _generate_reference(prompts: list[str], num_tokens: int) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="cuda",
         trust_remote_code=True,
     )
