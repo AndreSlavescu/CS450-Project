@@ -495,11 +495,11 @@ def _print_comparison_table(
             if ai < ridge_point and hf_bw_util > 30:
                 print("  -> Memory-bound")
             elif ai < ridge_point and hf_bw_util <= 30:
-                print(f"  -> Launch-bound ({hf_bw_util:.1f}% BW util.\n Kernel dispatch overhead dominates)")
+                print(f"  -> Launch-bound {hf_bw_util:.1f}% BW util.\n Kernel dispatch overhead dominates")
             elif ai >= ridge_point and hf_mfu > 20:
                 print("  -> Compute-bound")
             elif ai >= ridge_point:
-                print(f"  -> Latency-bound ({hf_mfu:.1f}% MFU.\n Fixed overhead dominates)")
+                print(f"  -> Latency-bound {hf_mfu:.1f}% MFU.\n Fixed overhead dominates")
             else:
                 print("  -> Underutilized")
 
