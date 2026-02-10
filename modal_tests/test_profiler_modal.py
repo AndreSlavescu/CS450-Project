@@ -32,8 +32,6 @@ PROJECT_ROOT = Path(__file__).parent.parent
 
 force_rebuild = os.environ.get("FORCE_REBUILD", "0") == "1"
 
-# Parse --gpu from sys.argv at module level to only build the needed image.
-# Modal builds all images at import time, so we avoid building the unused one.
 _target_gpu = "h100"
 for i, arg in enumerate(sys.argv):
     if arg == "--gpu" and i + 1 < len(sys.argv):
@@ -142,7 +140,6 @@ def _dispatch_profiler(gpu: str) -> dict:
 
 
 def _save_trace(result: dict, out_path: Path) -> bool:
-    """Save trace JSON to disk. Returns True if a trace was saved."""
     import json
 
     if not result["trace_json"]:
