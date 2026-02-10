@@ -2,8 +2,18 @@
 Test the GPU profiler on Modal.
 
 Usage:
+    # runs --mode reference by default. This generates reference logits
     modal run modal_tests/test_profiler_modal.py --gpu h100
     modal run modal_tests/test_profiler_modal.py --gpu b200
+
+    # runs --mode selfcheck which loads the megakernel implementation and the HF implementation
+    #   and then compares the results
+    modal run modal_tests/test_profiler_modal.py --gpu h100 --mode selfcheck
+    modal run modal_tests/test_profiler_modal.py --gpu b200 --mode selfcheck
+
+    # runs --mode compare which loads saved reference logits and compares against the megakernel implementation
+    modal run modal_tests/test_profiler_modal.py --gpu h100 --mode compare
+    modal run modal_tests/test_profiler_modal.py --gpu b200 --mode compare
 
     # if you want to force rebuild the image:
     FORCE_REBUILD=1 modal run modal_tests/test_profiler_modal.py --gpu h100
