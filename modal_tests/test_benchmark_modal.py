@@ -41,6 +41,9 @@ for i, arg in enumerate(sys.argv):
     elif arg == "--model" and i + 1 < len(sys.argv):
         _target_model = sys.argv[i + 1].lower()
 
+if _target_gpu not in ("h100", "b200"):
+    _target_gpu = "h100"
+
 app = modal.App("cs450-benchmark")
 
 GPU_CONFIGS = {
@@ -266,12 +269,15 @@ def _run_hf_benchmark(
                     max_new_tokens=seq_len - input_ids.shape[1],
                     do_sample=False,
                     use_cache=True,
+                    eos_token_id=[],
                 )
             input_ids = prefill_output
         elif seq_len < input_ids.shape[1]:
             input_ids = input_ids[:, :seq_len]
 
         actual_seq_len = input_ids.shape[1]
+        if actual_seq_len != seq_len:
+            print(f"  Warning: requested seq_len={seq_len} but got {actual_seq_len}")
         print(f"  Context length: {actual_seq_len}")
 
         with torch.no_grad():
@@ -327,7 +333,8 @@ def _run_hf_benchmark(
         achieved_bw_gb_s = total_bytes / (mean_ms / 1000.0) / 1e9
 
         result = {
-            "seq_len": actual_seq_len,
+            "requested_seq_len": seq_len,
+            "actual_seq_len": actual_seq_len,
             "mean_ms": mean_ms,
             "median_ms": median_ms,
             "min_ms": min_ms,
@@ -338,7 +345,7 @@ def _run_hf_benchmark(
             "achieved_bw_gb_s": achieved_bw_gb_s,
             "all_times_ms": times_ms,
         }
-        results[actual_seq_len] = result
+        results[seq_len] = result
 
         print(f"  Mean time: {mean_ms:.3f} ms | Median: {median_ms:.3f} ms | Min: {min_ms:.3f} ms")
         print(f"  Tokens/sec: {tokens_per_sec:.1f}")
