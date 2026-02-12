@@ -1,4 +1,3 @@
-import os
 import subprocess
 import time
 from pathlib import Path
@@ -32,7 +31,8 @@ def benchmark_megakernel_h100():
     cmd = (
         f"python {PROJECT_ROOT}/megakernels/scripts/generate.py "
         "mode=mk "
-        "prompt='This is a dummy prompt that is roughly thirty two tokens long to match the paper benchmark settings exactly.' "
+        "prompt='This is a dummy prompt that is roughly thirty two tokens "
+        "long to match the paper benchmark settings exactly.' "
         "ntok=128"
     )
 
