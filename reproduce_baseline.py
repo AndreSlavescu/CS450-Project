@@ -50,7 +50,6 @@ def benchmark_vllm_baseline():
     """
     Reproduces the VLLM baseline bar graph as per Figure 1.
     """
-    import time
 
     import requests
 
