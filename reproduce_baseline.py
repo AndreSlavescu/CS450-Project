@@ -6,12 +6,18 @@ import modal
 
 app = modal.App("cs450-reproduction")
 
-image = modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.h100").pip_install(
-    # "vllm",
-    "sglang[all]",
-    "pandas",
-    "tabulate",
-)  # add vllm, sglang and other dependencies
+# libnuma1 required by sgl_kernel (SGLang) native .so on Linux
+image = (
+    modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.h100")
+    .run_commands(
+        "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
+    )
+    .pip_install(
+        "sglang[all]",
+        "pandas",
+        "tabulate",
+    )
+)
 
 PROJECT_ROOT = "/workspace/Megakernels"
 
