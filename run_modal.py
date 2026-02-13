@@ -12,17 +12,16 @@ h100_image = modal.Image.from_dockerfile(
     force_build=force_rebuild,
 )
 
-# b200_image = modal.Image.from_dockerfile(
-#     Path(__file__).parent / "Dockerfile.b200",
-#     add_python="3.11",
-# )
+b200_image = modal.Image.from_dockerfile(
+    Path(__file__).parent / "Dockerfile.b200",
+    force_build=force_rebuild,
+)
 
 
 @app.function(
     image=h100_image,
     gpu="H100",
     timeout=3600,
-    secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def run_hazy_h100():
     import os
@@ -52,54 +51,90 @@ def run_hazy_h100():
     return "Hazy H100 job completed"
 
 
-# @app.function(image=b200_image, gpu="B200", timeout=3600)
-# def run_hazy_b200():
-#     import sys
-
-#     import torch
-
-#     sys.path.insert(0, "/workspace/Megakernels")
-
-#     print("Running Hazy baseline on B200.")
-#     print(f"CUDA available: {torch.cuda.is_available()}")
-#     if torch.cuda.is_available():
-#         print(f"Device: {torch.cuda.get_device_name(0)}")
-#         print(f"CUDA version: {torch.version.cuda}")
-
-#     print("Running Hazy megakernel demo...")
-#     import os
-
-#     os.chdir("/workspace/Megakernels")
-#     os.system(
-#         'python megakernels/scripts/generate.py mode=mk prompt="tell me a funny joke about cookies" ntok=100'
-#     )
-#     return "Hazy B200 job completed"
-
-
-@app.function(image=h100_image, gpu="H100", timeout=3600)
-def run_waterloo_h100():
+@app.function(
+    image=b200_image,
+    gpu="B200",
+    timeout=3600,
+)
+def run_hazy_b200():
+    import os
+    import sys
     import torch
 
-    print("Running Waterloo implementation on H100.")
+    if "HF_TOKEN" not in os.environ:
+        print("MISSING HF_TOKEN!")
+
+    sys.path.insert(0, "/workspace/Megakernels")
+
+    print("Running Hazy baseline on B200.")
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"Device: {torch.cuda.get_device_name(0)}")
         print(f"CUDA version: {torch.version.cuda}")
 
-    raise NotImplementedError("Waterloo megakernel implementation not yet available.")
+    print("Running Hazy megakernel demo...")
+
+    os.chdir("/workspace/Megakernels")
+    os.system(
+        'python megakernels/scripts/generate.py mode=mk prompt="tell me a funny joke about cookies" ntok=100'
+    )
+    return "Hazy B200 job completed"
 
 
-# @app.function(image=b200_image, gpu="B200", timeout=3600)
-# def run_waterloo_b200():
-#     import torch
+@app.function(image=h100_image, gpu="H100", timeout=3600)
+def run_waterloo_h100():
+    import sys
+    import torch
+    from pathlib import Path
 
-#     print("Running Waterloo implementation on B200.")
-#     print(f"CUDA available: {torch.cuda.is_available()}")
-#     if torch.cuda.is_available():
-#         print(f"Device: {torch.cuda.get_device_name(0)}")
-#         print(f"CUDA version: {torch.version.cuda}")
+    print("Running Waterloo SiLU implementation on H100.")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"Device: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA version: {torch.version.cuda}")
 
-#     raise NotImplementedError("Waterloo megakernel implementation not yet available.")
+    # Add kernel directory to path
+    sys.path.insert(0, "/workspace/src/csrc/kernels")
+    
+    from silu_torch import test_against_pytorch
+    
+    print("\nTesting SiLU kernel on H100...")
+    results = test_against_pytorch(shape=(28, 6144), verbose=True)
+    
+    if results['pass_vectorized'] and results['pass_fused']:
+        print("\n✓ Waterloo SiLU kernel test PASSED on H100")
+        return "Waterloo H100 test passed"
+    else:
+        print("\n✗ Waterloo SiLU kernel test FAILED on H100")
+        return "Waterloo H100 test failed"
+
+
+@app.function(image=b200_image, gpu="B200", timeout=3600)
+def run_waterloo_b200():
+    import sys
+    import torch
+    from pathlib import Path
+
+    print("Running Waterloo SiLU implementation on B200.")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"Device: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA version: {torch.version.cuda}")
+
+    # Add kernel directory to path
+    sys.path.insert(0, "/workspace/src/csrc/kernels")
+    
+    from silu_torch import test_against_pytorch
+    
+    print("\nTesting SiLU kernel on B200...")
+    results = test_against_pytorch(shape=(28, 6144), verbose=True)
+    
+    if results['pass_vectorized'] and results['pass_fused']:
+        print("\n✓ Waterloo SiLU kernel test PASSED on B200")
+        return "Waterloo B200 test passed"
+    else:
+        print("\n✗ Waterloo SiLU kernel test FAILED on B200")
+        return "Waterloo B200 test failed"
 
 
 @app.local_entrypoint()
@@ -115,11 +150,9 @@ def main(hazy_megakernel: bool = False, waterloo_megakernel: bool = False, gpu: 
         if gpu == "h100":
             run_hazy_h100.remote()
         elif gpu == "b200":
-            pass
-            # run_hazy_b200.remote()
+            run_hazy_b200.remote()
     elif implementation == "waterloo":
         if gpu == "h100":
             run_waterloo_h100.remote()
         elif gpu == "b200":
-            pass
-            # run_waterloo_b200.remote()
+            run_waterloo_b200.remote()
