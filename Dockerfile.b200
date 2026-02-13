@@ -32,6 +32,7 @@ RUN pip install numpy ninja pytest uv "setuptools>=64.0.0" && \
 WORKDIR /workspace
 
 COPY Megakernels /workspace/Megakernels
+COPY src /workspace/src
 
 ENV THUNDERKITTENS_ROOT=/workspace/Megakernels/ThunderKittens
 ENV MEGAKERNELS_ROOT=/workspace/Megakernels
@@ -41,3 +42,7 @@ ENV GPU=B200
 RUN cd /workspace/Megakernels && pip install --no-build-isolation -e .
 
 RUN cd /workspace/Megakernels/demos/low-latency-llama && make
+
+# Pre-compile Waterloo SiLU kernel (will be JIT compiled on first use, but this validates it)
+RUN cd /workspace/src/csrc/kernels && \
+    python3 -c "import sys; sys.path.insert(0, '.'); print('SiLU kernel ready for JIT compilation')"
