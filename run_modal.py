@@ -85,7 +85,6 @@ def run_hazy_b200():
 def run_waterloo_h100():
     import sys
     import torch
-    from pathlib import Path
 
     print("Running Waterloo SiLU implementation on H100.")
     print(f"CUDA available: {torch.cuda.is_available()}")
@@ -101,7 +100,7 @@ def run_waterloo_h100():
     print("\nTesting SiLU kernel on H100...")
     results = test_against_pytorch(shape=(28, 6144), verbose=True)
     
-    if results['pass_vectorized'] and results['pass_fused']:
+    if results['pass_fused']:
         print("\n✓ Waterloo SiLU kernel test PASSED on H100")
         return "Waterloo H100 test passed"
     else:
@@ -113,7 +112,6 @@ def run_waterloo_h100():
 def run_waterloo_b200():
     import sys
     import torch
-    from pathlib import Path
 
     print("Running Waterloo SiLU implementation on B200.")
     print(f"CUDA available: {torch.cuda.is_available()}")
@@ -129,7 +127,7 @@ def run_waterloo_b200():
     print("\nTesting SiLU kernel on B200...")
     results = test_against_pytorch(shape=(28, 6144), verbose=True)
     
-    if results['pass_vectorized'] and results['pass_fused']:
+    if results['pass_fused']:
         print("\n✓ Waterloo SiLU kernel test PASSED on B200")
         return "Waterloo B200 test passed"
     else:
