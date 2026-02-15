@@ -6,17 +6,28 @@ import modal
 
 app = modal.App("cs450-reproduction")
 
-# libnuma1 required by sgl_kernel (SGLang) native .so on Linux
-image = (
-    modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.h100")
-    .run_commands(
-        "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
+def _base_image():
+    return (
+        modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.h100")
+        .run_commands(
+            "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
+        )
     )
-    .pip_install(
-        "sglang[all]",
-        "pandas",
-        "tabulate",
-    )
+
+
+# Shared deps for megakernel (and bench_engines.py when used with vllm/sglang)
+image = _base_image().pip_install("pandas", "tabulate")
+
+# vLLM and SGLang use incompatible triton/torch stacks → separate images
+image_vllm = _base_image().pip_install(
+    "vllm==0.15.1",
+    "pandas",
+    "tabulate",
+)
+image_sglang = _base_image().pip_install(
+    "sglang[all]",
+    "pandas",
+    "tabulate",
 )
 
 PROJECT_ROOT = "/workspace/Megakernels"
@@ -48,7 +59,7 @@ def benchmark_megakernel_h100():
 
 
 @app.function(
-    image=image,
+    image=image_vllm,
     gpu="H100",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
@@ -127,7 +138,7 @@ def benchmark_vllm_baseline():
 
 
 @app.function(
-    image=image,
+    image=image_sglang,
     gpu="H100",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
