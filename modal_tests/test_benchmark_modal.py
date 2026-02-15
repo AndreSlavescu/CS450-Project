@@ -18,12 +18,16 @@ Usage:
     # Force rebuild the image
     FORCE_REBUILD=1 modal run modal_tests/test_benchmark_modal.py --gpu h100
     FORCE_REBUILD=1 modal run modal_tests/test_benchmark_modal.py --gpu b200
+
+    # Attention kernel microbenchmarks (FA4 / SDPA / ZigZag local)
+    modal run modal_tests/test_benchmark_modal.py --gpu b200 --mode kernels
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,11 +39,14 @@ force_rebuild = os.environ.get("FORCE_REBUILD", "0") == "1"
 
 _target_gpu = "h100"
 _target_model = "qwen3-1.7b"
+_target_mode = "model"
 for i, arg in enumerate(sys.argv):
     if arg == "--gpu" and i + 1 < len(sys.argv):
         _target_gpu = sys.argv[i + 1].lower()
     elif arg == "--model" and i + 1 < len(sys.argv):
         _target_model = sys.argv[i + 1].lower()
+    elif arg == "--mode" and i + 1 < len(sys.argv):
+        _target_mode = sys.argv[i + 1].lower()
 
 if _target_gpu not in ("h100", "b200"):
     _target_gpu = "h100"
@@ -133,6 +140,8 @@ WARMUP_ITERS = 5
 BENCH_ITERS = 20
 BENCH_SEQ_LENS = [1, 32, 128, 512, 1024]
 BENCH_PROMPT = "The quick brown fox jumps over the lazy dog"
+KERNEL_BENCH_SEQ_LENS = [1, 32, 128, 512, 1024, 2048]
+KERNEL_DEFAULTS = ("fa4", "fa4_lse", "sdpa", "sdpa_math", "zigzag_local")
 
 
 class TheoreticalPerf:
@@ -361,6 +370,239 @@ def _run_hf_benchmark(
     }
 
 
+def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
+    import os
+
+    import torch
+    from torch.utils.cpp_extension import load
+
+    kernels_dir = "/workspace/src/csrc/kernels"
+    need_fa4 = any(k in kernels for k in ("fa4", "fa4_lse"))
+    need_zigzag = "zigzag_local" in kernels
+
+    if not (need_fa4 or need_zigzag):
+        return None, None
+
+    arch_flags = ["-arch=sm_90a"] if gpu.lower() == "h100" else ["-gencode=arch=compute_100a,code=sm_100a"]
+    common_cuda_flags = [
+        "-O3",
+        "--use_fast_math",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "-lineinfo",
+    ] + arch_flags
+    common_cflags = ["-O3", "-std=c++20"]
+    include_paths = [kernels_dir]
+
+    print(f"Building attention kernels with torch cpp_extension.load (GPU={gpu.upper()})")
+    print(f"PyTorch version: {torch.__version__}")
+
+    fa4_attention = None
+    zigzag_attention = None
+
+    if need_fa4:
+        fa4_build_dir = "/tmp/torch_ext_fa4_attention_bench"
+        os.makedirs(fa4_build_dir, exist_ok=True)
+        fa4_attention = load(
+            name=f"fa4_attention_bench_{gpu.lower()}",
+            sources=[os.path.join(kernels_dir, "fa4_attention.cu")],
+            extra_include_paths=include_paths,
+            extra_cflags=common_cflags,
+            extra_cuda_cflags=common_cuda_flags,
+            verbose=True,
+            with_cuda=True,
+            build_directory=fa4_build_dir,
+        )
+
+    if need_zigzag:
+        zigzag_build_dir = "/tmp/torch_ext_zigzag_attention_bench"
+        os.makedirs(zigzag_build_dir, exist_ok=True)
+        zigzag_attention = load(
+            name=f"zigzag_attention_bench_{gpu.lower()}",
+            sources=[os.path.join(kernels_dir, "zigzag_attention.cu")],
+            extra_include_paths=include_paths,
+            extra_cflags=common_cflags,
+            extra_cuda_cflags=common_cuda_flags,
+            extra_ldflags=["-lnccl"],
+            verbose=True,
+            with_cuda=True,
+            build_directory=zigzag_build_dir,
+        )
+
+    return fa4_attention, zigzag_attention
+
+
+def _attention_theoretical_metrics(cfg: ModelConfig, seq_len: int) -> dict:
+    # Causal attention uses triangular score matrix.
+    pairs = seq_len * (seq_len + 1) // 2
+    flops_qk = 2 * cfg.num_q_heads * cfg.head_dim * pairs
+    flops_pv = 2 * cfg.num_q_heads * cfg.head_dim * pairs
+    total_flops = flops_qk + flops_pv
+
+    bytes_per_elem = 2  # bf16
+    q_bytes = cfg.num_q_heads * seq_len * cfg.head_dim * bytes_per_elem
+    kv_bytes = 2 * cfg.num_kv_heads * seq_len * cfg.head_dim * bytes_per_elem
+    o_bytes = cfg.num_q_heads * seq_len * cfg.head_dim * bytes_per_elem
+    total_bytes = q_bytes + kv_bytes + o_bytes
+
+    return {
+        "flops": total_flops,
+        "bytes": total_bytes,
+    }
+
+
+def _run_attention_kernels_benchmark(
+    model_cfg: dict,
+    seq_lens: list[int],
+    kernels: list[str],
+    gpu: str,
+    warmup_iters: int,
+    bench_iters: int,
+) -> dict:
+    import torch
+    import torch.nn.functional as F
+
+    cfg = ModelConfig(**model_cfg)
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    device_name = torch.cuda.get_device_name(0)
+    print(f"Device: {device_name}")
+    print(f"Benchmark kernels: {kernels}")
+
+    torch.manual_seed(0)
+    scale = 1.0 / (cfg.head_dim**0.5)
+
+    valid_kernels = set(KERNEL_DEFAULTS)
+    invalid = [k for k in kernels if k not in valid_kernels]
+    if invalid:
+        raise ValueError(f"Unknown kernels requested: {invalid}. Valid: {sorted(valid_kernels)}")
+
+    fa4_attention, zigzag_attention = _build_attention_kernel_modules(gpu, kernels)
+
+    def _sdpa_math_context():
+        # Prefer the newer API; fallback to legacy CUDA backend selector.
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
+            return sdpa_kernel(backends=[SDPBackend.MATH])
+        except Exception:
+            return torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True,
+                enable_cudnn=False,
+            )
+
+    results: dict[int, dict] = {}
+    for seq_len in seq_lens:
+        print(f"\n--- Kernel Benchmark seq_len={seq_len} ---")
+
+        Q = torch.randn((cfg.num_q_heads, seq_len, cfg.head_dim), dtype=torch.bfloat16, device="cuda")
+        K = torch.randn((cfg.num_kv_heads, seq_len, cfg.head_dim), dtype=torch.bfloat16, device="cuda")
+        V = torch.randn((cfg.num_kv_heads, seq_len, cfg.head_dim), dtype=torch.bfloat16, device="cuda")
+        Q_b = Q.unsqueeze(0)
+        K_b = K.unsqueeze(0)
+        V_b = V.unsqueeze(0)
+
+        # SDPA reference used for correctness deltas.
+        with torch.no_grad():
+            ref_out = F.scaled_dot_product_attention(Q_b, K_b, V_b, is_causal=True, enable_gqa=True).squeeze(0)
+
+        seq_res = {}
+
+        for kernel_name in kernels:
+            print(f"  -> {kernel_name}")
+
+            ctx = nullcontext()
+            if kernel_name == "sdpa_math":
+                ctx = _sdpa_math_context()
+
+            def _run_once():
+                if kernel_name == "fa4":
+                    if fa4_attention is None:
+                        raise RuntimeError("fa4 module not built")
+                    return fa4_attention.forward(Q, K, V, scale, True, False, 0, 0)[0]
+                if kernel_name == "fa4_lse":
+                    if fa4_attention is None:
+                        raise RuntimeError("fa4 module not built")
+                    return fa4_attention.forward(Q, K, V, scale, True, True, 0, 0)[0]
+                if kernel_name == "sdpa":
+                    return F.scaled_dot_product_attention(Q_b, K_b, V_b, is_causal=True, enable_gqa=True).squeeze(0)
+                if kernel_name == "sdpa_math":
+                    return F.scaled_dot_product_attention(Q_b, K_b, V_b, is_causal=True, enable_gqa=True).squeeze(0)
+                if kernel_name == "zigzag_local":
+                    if zigzag_attention is None:
+                        raise RuntimeError("zigzag module not built")
+                    return zigzag_attention.zigzag_attention_local(Q_b, K_b, V_b, scale, True).squeeze(0)
+                raise RuntimeError(f"Unhandled kernel: {kernel_name}")
+
+            with ctx:
+                for _ in range(warmup_iters):
+                    _run_once()
+                torch.cuda.synchronize()
+
+                times_ms = []
+                out = None
+                for _ in range(bench_iters):
+                    start_evt = torch.cuda.Event(enable_timing=True)
+                    end_evt = torch.cuda.Event(enable_timing=True)
+                    start_evt.record()
+                    out = _run_once()
+                    end_evt.record()
+                    torch.cuda.synchronize()
+                    times_ms.append(start_evt.elapsed_time(end_evt))
+
+            times_ms_sorted = sorted(times_ms)
+            trim = max(1, len(times_ms_sorted) // 10)
+            trimmed = times_ms_sorted[trim:-trim] if len(times_ms_sorted) > 2 * trim else times_ms_sorted
+            mean_ms = sum(trimmed) / len(trimmed)
+            median_ms = times_ms_sorted[len(times_ms_sorted) // 2]
+            min_ms = times_ms_sorted[0]
+
+            theory = _attention_theoretical_metrics(cfg, seq_len)
+            achieved_tflops = theory["flops"] / (mean_ms / 1000.0) / 1e12
+            achieved_bw_gb_s = theory["bytes"] / (mean_ms / 1000.0) / 1e9
+            qps = (cfg.num_q_heads * seq_len) / (mean_ms / 1000.0)
+
+            max_abs = None
+            mean_abs = None
+            if kernel_name != "sdpa" and out is not None:
+                diff = (out.float() - ref_out.float()).abs()
+                max_abs = diff.max().item()
+                mean_abs = diff.mean().item()
+
+            seq_res[kernel_name] = {
+                "mean_ms": mean_ms,
+                "median_ms": median_ms,
+                "min_ms": min_ms,
+                "q_rows_per_sec": qps,
+                "achieved_tflops": achieved_tflops,
+                "achieved_bw_gb_s": achieved_bw_gb_s,
+                "max_abs_err_vs_sdpa": max_abs,
+                "mean_abs_err_vs_sdpa": mean_abs,
+                "all_times_ms": times_ms,
+            }
+
+            err_info = ""
+            if max_abs is not None and mean_abs is not None:
+                err_info = f" | max_err={max_abs:.4e}, mean_err={mean_abs:.4e}"
+            print(
+                f"     mean={mean_ms:.3f} ms, median={median_ms:.3f} ms, "
+                f"TFLOPS={achieved_tflops:.2f}, BW={achieved_bw_gb_s:.1f} GB/s{err_info}"
+            )
+
+        results[seq_len] = seq_res
+
+    return {
+        "device": device_name,
+        "model": cfg.name,
+        "model_id": cfg.hf_id,
+        "warmup_iters": warmup_iters,
+        "bench_iters": bench_iters,
+        "kernels": kernels,
+        "results": results,
+    }
+
+
 @app.function(
     image=bench_image,
     gpu=GPU_CONFIGS[_target_gpu]["modal_gpu"],
@@ -428,6 +670,22 @@ def run_megakernel_benchmark(
         "bench_iters": bench_iters,
         "results": {},
     }
+
+
+@app.function(
+    image=bench_image,
+    gpu=GPU_CONFIGS[_target_gpu]["modal_gpu"],
+    timeout=3600,
+)
+def run_attention_kernels_benchmark(
+    model_cfg: dict,
+    seq_lens: list[int],
+    kernels: list[str],
+    gpu: str,
+    warmup_iters: int = WARMUP_ITERS,
+    bench_iters: int = BENCH_ITERS,
+) -> dict:
+    return _run_attention_kernels_benchmark(model_cfg, seq_lens, kernels, gpu, warmup_iters, bench_iters)
 
 
 def _print_comparison_table(
@@ -509,6 +767,48 @@ def _print_comparison_table(
                 print(f"  -> Latency-bound {hf_mfu:.1f}% MFU.\n Fixed overhead dominates")
             else:
                 print("  -> Underutilized")
+
+
+def _print_kernel_table(
+    model_cfg: ModelConfig,
+    gpu_name: str,
+    gpu_config: dict,
+    kernel_results: dict,
+    seq_lens: list[int],
+):
+    peak_tflops = gpu_config["peak_tflops_bf16"]
+    peak_bw_gb_s = gpu_config["peak_bandwidth_tb_s"] * 1000
+    data = kernel_results.get("results", {})
+    kernels = kernel_results.get("kernels", list(KERNEL_DEFAULTS))
+
+    print(f"\n{'='*90}")
+    print(f"KERNEL MICROBENCH RESULTS ({model_cfg.name} on {gpu_name})")
+    print(f"{'='*90}")
+    print(f"Kernels: {kernels}")
+    for seq_len in seq_lens:
+        rows = data.get(seq_len) or data.get(str(seq_len))
+        if not rows:
+            continue
+        print(f"\nseq_len={seq_len}")
+        print("-" * 90)
+        print(
+            f"{'Kernel':<14} {'Mean ms':>9} {'Median ms':>10} {'Q-rows/s':>12} "
+            f"{'TFLOPS':>9} {'MFU':>8} {'BW GB/s':>10} {'BW Util':>9} {'Max Abs Err':>12}"
+        )
+        print("-" * 90)
+        for k in kernels:
+            r = rows.get(k)
+            if not r:
+                continue
+            mfu = (r["achieved_tflops"] / peak_tflops * 100) if r["achieved_tflops"] else 0.0
+            bw_util = (r["achieved_bw_gb_s"] / peak_bw_gb_s * 100) if r["achieved_bw_gb_s"] else 0.0
+            max_abs = r["max_abs_err_vs_sdpa"]
+            max_abs_str = "N/A" if max_abs is None else f"{max_abs:.2e}"
+            print(
+                f"{k:<14} {r['mean_ms']:>9.3f} {r['median_ms']:>10.3f} {r['q_rows_per_sec']:>12.0f} "
+                f"{r['achieved_tflops']:>9.2f} {mfu:>7.1f}% {r['achieved_bw_gb_s']:>10.1f} {bw_util:>8.1f}% \
+                    {max_abs_str:>12}"
+            )
 
 
 def _generate_roofline_plot(
@@ -670,7 +970,12 @@ def _generate_roofline_plot(
 
 
 @app.local_entrypoint()
-def main(gpu: str = "h100", model: str = "qwen3-1.7b"):
+def main(
+    gpu: str = "h100",
+    model: str = "qwen3-1.7b",
+    mode: str = "model",
+    kernels: str = ",".join(KERNEL_DEFAULTS),
+):
     import json
     import time
     from dataclasses import asdict
@@ -685,15 +990,64 @@ def main(gpu: str = "h100", model: str = "qwen3-1.7b"):
         print(f"Unknown model '{model}'. Choose from: {', '.join(MODEL_CONFIGS)}")
         return
 
+    mode = mode.lower()
+    if mode not in ("model", "kernels"):
+        print("Unknown mode. Use 'model' or 'kernels'.")
+        return
+
+    requested_kernels = [k.strip() for k in kernels.split(",") if k.strip()]
+    if not requested_kernels:
+        requested_kernels = list(KERNEL_DEFAULTS)
+
     model_cfg = MODEL_CONFIGS[model]
     gpu_config = GPU_CONFIGS[gpu]
     gpu_name = gpu.upper()
 
-    print(f"Running MFU & bandwidth benchmark: {model_cfg.name} on {gpu_name}")
+    print(f"Running benchmark mode='{mode}': {model_cfg.name} on {gpu_name}")
     print(f"  Peak BF16 TFLOPS: {gpu_config['peak_tflops_bf16']}")
     print(f"  Peak HBM BW: {gpu_config['peak_bandwidth_tb_s']} TB/s")
-    print(f"  Sequence lengths: {BENCH_SEQ_LENS}")
+    if mode == "kernels":
+        print(f"  Kernels: {requested_kernels}")
+        print(f"  Sequence lengths: {KERNEL_BENCH_SEQ_LENS}")
+    else:
+        print(f"  Sequence lengths: {BENCH_SEQ_LENS}")
     print(f"  Warmup: {WARMUP_ITERS}, Bench: {BENCH_ITERS} iterations")
+
+    ref_dir = PROJECT_ROOT / "modal_tests" / "reference_data"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    model_slug = model.replace("-", "_").replace(".", "_")
+
+    if mode == "kernels":
+        print(f"\n{'='*70}")
+        print("Running Attention Kernel Microbenchmarks...")
+        print(f"{'='*70}")
+        kernel_results = run_attention_kernels_benchmark.remote(
+            asdict(model_cfg),
+            KERNEL_BENCH_SEQ_LENS,
+            requested_kernels,
+            gpu,
+            WARMUP_ITERS,
+            BENCH_ITERS,
+        )
+        _print_kernel_table(model_cfg, gpu_name, gpu_config, kernel_results, KERNEL_BENCH_SEQ_LENS)
+
+        results_path = ref_dir / f"kernel_benchmark_{model_slug}_{gpu}_{timestamp}.json"
+        save_data = {
+            "gpu": gpu_name,
+            "mode": mode,
+            "model": model_cfg.name,
+            "model_config": asdict(model_cfg),
+            "gpu_config": {
+                "peak_bandwidth_tb_s": gpu_config["peak_bandwidth_tb_s"],
+                "peak_tflops_bf16": gpu_config["peak_tflops_bf16"],
+            },
+            "kernel_results": kernel_results,
+        }
+        with open(results_path, "w") as f:
+            json.dump(save_data, f, indent=2, default=str)
+        print(f"\nKernel benchmark results saved to {results_path}")
+        return
 
     print(f"\n{'='*70}")
     print(f"Theoretical Analysis: {model_cfg.name} (per decode step, batch=1, bf16)")
@@ -737,10 +1091,6 @@ def main(gpu: str = "h100", model: str = "qwen3-1.7b"):
     else:
         print("No benchmark results to display.")
 
-    ref_dir = PROJECT_ROOT / "modal_tests" / "reference_data"
-    ref_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    model_slug = model.replace("-", "_").replace(".", "_")
     results_path = ref_dir / f"benchmark_{model_slug}_{gpu}_{timestamp}.json"
 
     save_data = {
