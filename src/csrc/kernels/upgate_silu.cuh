@@ -67,25 +67,42 @@ __device__ void upgate_silu_device(
     if (tid == 0 && has_profiler) prof->record(EV_RMSNORM_END);
 
     // ===== Phase 2+3: Gate + Up MatVec, then fused SiLU * up =====
+    // Optimized with float4 vectorized loads + ILP (4 rows per iteration)
     if (tid == 0 && has_profiler) prof->record(EV_MATVEC);
     if (tid == 0 && has_profiler) prof->record(EV_MATVEC_END);
     if (tid == 0 && has_profiler) prof->record(EV_SILU);
 
-    for (int out_idx = tid; out_idx < INTERMEDIATE_DIM; out_idx += num_threads) {
-        const float* gate_row = gate_w + (long long)out_idx * HIDDEN_DIM;
-        const float* up_row   = up_w   + (long long)out_idx * HIDDEN_DIM;
-
-        float gate_acc = 0.0f;
-        float up_acc = 0.0f;
-
-        for (int j = 0; j < HIDDEN_DIM; j++) {
-            float post_ln_j = s_post_ln[j];
-            gate_acc += gate_row[j] * post_ln_j;
-            up_acc   += up_row[j]   * post_ln_j;
+    {
+        constexpr int ILP = 4;
+        const float4* input4 = reinterpret_cast<const float4*>(s_post_ln);
+        for (int out_base = tid * ILP; out_base < INTERMEDIATE_DIM; out_base += num_threads * ILP) {
+            float gate_acc0 = 0.0f, gate_acc1 = 0.0f, gate_acc2 = 0.0f, gate_acc3 = 0.0f;
+            float up_acc0 = 0.0f, up_acc1 = 0.0f, up_acc2 = 0.0f, up_acc3 = 0.0f;
+            const float4* gr0 = reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 0) * HIDDEN_DIM);
+            const float4* gr1 = reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 1) * HIDDEN_DIM);
+            const float4* gr2 = reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 2) * HIDDEN_DIM);
+            const float4* gr3 = reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 3) * HIDDEN_DIM);
+            const float4* ur0 = reinterpret_cast<const float4*>(up_w + (long long)(out_base + 0) * HIDDEN_DIM);
+            const float4* ur1 = reinterpret_cast<const float4*>(up_w + (long long)(out_base + 1) * HIDDEN_DIM);
+            const float4* ur2 = reinterpret_cast<const float4*>(up_w + (long long)(out_base + 2) * HIDDEN_DIM);
+            const float4* ur3 = reinterpret_cast<const float4*>(up_w + (long long)(out_base + 3) * HIDDEN_DIM);
+            for (int j = 0; j < HIDDEN_DIM / 4; j++) {
+                float4 x = input4[j];
+                float4 gw0 = gr0[j]; gate_acc0 += gw0.x * x.x + gw0.y * x.y + gw0.z * x.z + gw0.w * x.w;
+                float4 gw1 = gr1[j]; gate_acc1 += gw1.x * x.x + gw1.y * x.y + gw1.z * x.z + gw1.w * x.w;
+                float4 gw2 = gr2[j]; gate_acc2 += gw2.x * x.x + gw2.y * x.y + gw2.z * x.z + gw2.w * x.w;
+                float4 gw3 = gr3[j]; gate_acc3 += gw3.x * x.x + gw3.y * x.y + gw3.z * x.z + gw3.w * x.w;
+                float4 uw0 = ur0[j]; up_acc0 += uw0.x * x.x + uw0.y * x.y + uw0.z * x.z + uw0.w * x.w;
+                float4 uw1 = ur1[j]; up_acc1 += uw1.x * x.x + uw1.y * x.y + uw1.z * x.z + uw1.w * x.w;
+                float4 uw2 = ur2[j]; up_acc2 += uw2.x * x.x + uw2.y * x.y + uw2.z * x.z + uw2.w * x.w;
+                float4 uw3 = ur3[j]; up_acc3 += uw3.x * x.x + uw3.y * x.y + uw3.z * x.z + uw3.w * x.w;
+            }
+            // Fused SiLU(gate) * up using Rishu's scalar implementation
+            silu_out[out_base + 0] = kernels::silu_multiply_scalar(gate_acc0, up_acc0);
+            silu_out[out_base + 1] = kernels::silu_multiply_scalar(gate_acc1, up_acc1);
+            silu_out[out_base + 2] = kernels::silu_multiply_scalar(gate_acc2, up_acc2);
+            silu_out[out_base + 3] = kernels::silu_multiply_scalar(gate_acc3, up_acc3);
         }
-
-        // Fused SiLU(gate) * up using Rishu's scalar implementation
-        silu_out[out_idx] = kernels::silu_multiply_scalar(gate_acc, up_acc);
     }
 
     if (tid == 0 && has_profiler) prof->record(EV_SILU_END);
