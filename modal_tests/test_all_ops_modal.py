@@ -82,7 +82,26 @@ else:
     b200_image = _build_image("b200")
 
 
+def _jit_compile_unified(arch):
+    """Compile the unified qwen3_kernels.cu driver."""
+    from torch.utils.cpp_extension import load
+    print("\n  Compiling unified qwen3_kernels...")
+    mod = load(
+        name="qwen3_kernels",
+        sources=["/workspace/src/csrc/kernels/qwen3_kernels.cu"],
+        extra_include_paths=[
+            "/workspace/src/csrc/kernels",
+            "/workspace/src/csrc/profiler",
+        ],
+        extra_cuda_cflags=["-std=c++20", "-O2", f"-arch={arch}"],
+        verbose=False,
+    )
+    print("  qwen3_kernels compiled OK.")
+    return mod
+
+
 def _jit_compile(name, source_file, arch):
+    """Compile a standalone kernel (for attention ops that haven't been refactored)."""
     from torch.utils.cpp_extension import load
     print(f"\n  Compiling {name}...")
     mod = load(
@@ -106,30 +125,23 @@ def _run_all_ops(arch: str) -> dict:
 
     results = {}
 
-    # ============================
-    # Op 1: RMSNorm (already tested)
-    # ============================
-    rmsnorm = _jit_compile("rmsnorm_cuda", "/workspace/src/csrc/rmsnorm_forward.cu", arch)
+    # Compile the unified driver (Ops 2, 5, 6, 7, 8 + SiLU)
+    kernels = _jit_compile_unified(arch)
 
-    B, T, C = 1, 1, 2048
-    torch.manual_seed(42)
-    x = torch.randn(B, T, C, device="cuda", dtype=torch.float32)
-    w = torch.ones(C, device="cuda", dtype=torch.float32)
-    ref = w * x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
-    out = rmsnorm.rmsnorm_forward(x, w, B, T, C)
-    diff = (out - ref).abs().max().item()
-    results["rmsnorm"] = {"max_diff": diff, "pass": diff < 1e-3}
-    print(f"\n[Op 1] RMSNorm: max_diff={diff:.8f} {'PASS' if diff < 1e-3 else 'FAIL'}")
+    HIDDEN = 2048; NQ = 16; NKV = 8; HD = 128
+    Q_DIM = NQ * HD; K_DIM = NKV * HD; V_DIM = NKV * HD; QKV_DIM = Q_DIM + K_DIM + V_DIM
+    EPS = 1e-6; MAX_SEQ = 128; POS = 5; INTER = 6144
+
+    def rmsnorm_fn(x, w, eps=1e-6):
+        return w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+    def rotate_half(x):
+        h = x.shape[-1] // 2
+        return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
 
     # ============================
     # Op 2: QKV + Q/K Norm + RoPE
     # ============================
-    qkv_cuda = _jit_compile("qkv_rope_cuda", "/workspace/src/csrc/qkv_rope_append.cu", arch)
-
-    HIDDEN = 2048; NQ = 16; NKV = 8; HD = 128
-    Q_DIM = NQ * HD; K_DIM = NKV * HD; V_DIM = NKV * HD; QKV_DIM = Q_DIM + K_DIM + V_DIM
-    EPS = 1e-6; MAX_SEQ = 128; POS = 5
-
     torch.manual_seed(42)
     hidden = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
     attn_ln_w = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
@@ -144,13 +156,6 @@ def _run_all_ops(arch: str) -> dict:
     emb = torch.cat((freqs, freqs), dim=-1)
     cos_c, sin_c = emb.cos(), emb.sin()
 
-    def rmsnorm_fn(x, w, eps=1e-6):
-        return w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-
-    def rotate_half(x):
-        h = x.shape[-1] // 2
-        return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
-
     ref_pln = rmsnorm_fn(hidden, attn_ln_w, EPS)
     ref_qkv = qkv_w @ ref_pln
     ref_q = ref_qkv[:Q_DIM].view(NQ, HD)
@@ -163,7 +168,7 @@ def _run_all_ops(arch: str) -> dict:
     ref_q = ref_q * cos_c + rotate_half(ref_q) * sin_c
     ref_k = ref_k * cos_c + rotate_half(ref_k) * sin_c
 
-    q_out, k_out, v_out = qkv_cuda.qkv_rope_append_forward(
+    q_out, k_out, v_out = kernels.qkv_rope_append_forward(
         hidden, attn_ln_w, qkv_w, q_norm_w, k_norm_w, cos_c, sin_c, k_cache, v_cache, POS
     )
 
@@ -175,7 +180,7 @@ def _run_all_ops(arch: str) -> dict:
     print(f"[Op 2] QKV+Norm+RoPE: q={q_diff:.6f} k={k_diff:.6f} v={v_diff:.6f} {'PASS' if max_diff < 1e-2 else 'FAIL'}")
 
     # ============================
-    # Op 3: Partial Attention
+    # Op 3: Partial Attention (still compiled standalone — not our responsibility)
     # ============================
     attn_cuda = _jit_compile("attn_partial_cuda", "/workspace/src/csrc/attention_partial.cu", arch)
 
@@ -187,10 +192,9 @@ def _run_all_ops(arch: str) -> dict:
     v_c = torch.randn(SEQ_LEN, HD, device="cuda", dtype=torch.float32)
     scale = 1.0 / math.sqrt(HD)
 
-    # PyTorch reference: standard attention
-    scores = (q_attn @ k_c.T) * scale  # [GQA, SEQ_LEN]
+    scores = (q_attn @ k_c.T) * scale
     probs = torch.softmax(scores, dim=-1)
-    ref_attn_out = probs @ v_c  # [GQA, HD]
+    ref_attn_out = probs @ v_c
 
     attn_out, lse = attn_cuda.attention_partial_forward(q_attn, k_c, v_c, SEQ_LEN, scale)
     attn_diff = (attn_out - ref_attn_out).abs().max().item()
@@ -198,7 +202,7 @@ def _run_all_ops(arch: str) -> dict:
     print(f"[Op 3] Attention: max_diff={attn_diff:.8f} {'PASS' if attn_diff < 1e-3 else 'FAIL'}")
 
     # ============================
-    # Op 4: Attention Reduction
+    # Op 4: Attention Reduction (still compiled standalone — not our responsibility)
     # ============================
     attn_red = _jit_compile("attn_red_cuda", "/workspace/src/csrc/attention_reduction.cu", arch)
 
@@ -207,7 +211,6 @@ def _run_all_ops(arch: str) -> dict:
     p_outs = torch.randn(N_PARTS, GQA, HD, device="cuda", dtype=torch.float32)
     p_lses = torch.randn(N_PARTS, GQA, device="cuda", dtype=torch.float32)
 
-    # Reference reduction
     ref_reduced = torch.zeros(GQA, HD, device="cuda", dtype=torch.float32)
     for h in range(GQA):
         max_lse = p_lses[:, h].max()
@@ -225,15 +228,13 @@ def _run_all_ops(arch: str) -> dict:
     # ============================
     # Op 5: O-Proj + Residual
     # ============================
-    oproj = _jit_compile("oproj_cuda", "/workspace/src/csrc/oproj_residual.cu", arch)
-
     torch.manual_seed(42)
     hidden_op = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
     attn_o = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
     o_w = torch.randn(HIDDEN, HIDDEN, device="cuda", dtype=torch.float32) * 0.01
 
     ref_oproj = hidden_op + o_w @ attn_o
-    out_oproj = oproj.oproj_residual_forward(hidden_op, attn_o, o_w)
+    out_oproj = kernels.oproj_residual_forward(hidden_op, attn_o, o_w)
     oproj_diff = (out_oproj - ref_oproj).abs().max().item()
     results["oproj"] = {"max_diff": oproj_diff, "pass": oproj_diff < 1e-2}
     print(f"[Op 5] O-Proj+Residual: max_diff={oproj_diff:.8f} {'PASS' if oproj_diff < 1e-2 else 'FAIL'}")
@@ -241,9 +242,6 @@ def _run_all_ops(arch: str) -> dict:
     # ============================
     # Op 6: Upgate + SiLU
     # ============================
-    upgate = _jit_compile("upgate_cuda", "/workspace/src/csrc/upgate_silu.cu", arch)
-
-    INTER = 6144
     torch.manual_seed(42)
     hidden_mlp = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
     mlp_ln = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
@@ -255,7 +253,7 @@ def _run_all_ops(arch: str) -> dict:
     ref_up = up_w @ ref_pln2
     ref_silu = torch.nn.functional.silu(ref_gate) * ref_up
 
-    out_silu = upgate.upgate_silu_forward(hidden_mlp, mlp_ln, gate_w, up_w)
+    out_silu = kernels.upgate_silu_forward(hidden_mlp, mlp_ln, gate_w, up_w)
     silu_diff = (out_silu - ref_silu).abs().max().item()
     results["upgate_silu"] = {"max_diff": silu_diff, "pass": silu_diff < 1e-2}
     print(f"[Op 6] Upgate+SiLU: max_diff={silu_diff:.8f} {'PASS' if silu_diff < 1e-2 else 'FAIL'}")
@@ -263,15 +261,13 @@ def _run_all_ops(arch: str) -> dict:
     # ============================
     # Op 7: Down Proj + Residual
     # ============================
-    downproj = _jit_compile("downproj_cuda", "/workspace/src/csrc/downproj_residual.cu", arch)
-
     torch.manual_seed(42)
     hidden_dp = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
     silu_in = torch.randn(INTER, device="cuda", dtype=torch.float32)
     down_w = torch.randn(HIDDEN, INTER, device="cuda", dtype=torch.float32) * 0.01
 
     ref_dp = hidden_dp + down_w @ silu_in
-    out_dp = downproj.downproj_residual_forward(hidden_dp, silu_in, down_w)
+    out_dp = kernels.downproj_residual_forward(hidden_dp, silu_in, down_w)
     dp_diff = (out_dp - ref_dp).abs().max().item()
     results["downproj"] = {"max_diff": dp_diff, "pass": dp_diff < 1e-2}
     print(f"[Op 7] DownProj+Residual: max_diff={dp_diff:.8f} {'PASS' if dp_diff < 1e-2 else 'FAIL'}")
@@ -279,9 +275,6 @@ def _run_all_ops(arch: str) -> dict:
     # ============================
     # Op 8: RMS + LM Head
     # ============================
-    lmhead = _jit_compile("lmhead_cuda", "/workspace/src/csrc/rms_lm_head.cu", arch)
-
-    # Use smaller vocab for test speed (full 151936 would be very slow with single block)
     TEST_VOCAB = 1024
     torch.manual_seed(42)
     hidden_lm = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
@@ -290,10 +283,22 @@ def _run_all_ops(arch: str) -> dict:
 
     ref_pln3 = rmsnorm_fn(hidden_lm, norm_w, EPS)
     ref_logits = lm_w @ ref_pln3
-    out_logits = lmhead.rms_lm_head_forward(hidden_lm, norm_w, lm_w, TEST_VOCAB)
+    out_logits = kernels.rms_lm_head_forward(hidden_lm, norm_w, lm_w, TEST_VOCAB)
     lm_diff = (out_logits - ref_logits).abs().max().item()
     results["rms_lm_head"] = {"max_diff": lm_diff, "pass": lm_diff < 1e-2}
     print(f"[Op 8] RMS+LMHead: max_diff={lm_diff:.8f} {'PASS' if lm_diff < 1e-2 else 'FAIL'}")
+
+    # ============================
+    # Standalone SiLU-Multiply test (Rishu's vectorized)
+    # ============================
+    torch.manual_seed(42)
+    gate_test = torch.randn(INTER, device="cuda", dtype=torch.float32)
+    up_test = torch.randn(INTER, device="cuda", dtype=torch.float32)
+    ref_silu_standalone = torch.nn.functional.silu(gate_test) * up_test
+    out_silu_standalone = kernels.silu_multiply(gate_test, up_test)
+    silu_standalone_diff = (out_silu_standalone - ref_silu_standalone).abs().max().item()
+    results["silu_multiply"] = {"max_diff": silu_standalone_diff, "pass": silu_standalone_diff < 1e-3}
+    print(f"[SiLU] Standalone SiLU*Up: max_diff={silu_standalone_diff:.8f} {'PASS' if silu_standalone_diff < 1e-3 else 'FAIL'}")
 
     # ============================
     # Summary
