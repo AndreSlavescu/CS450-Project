@@ -5,6 +5,7 @@
 #include <torch/extension.h>
 #include "gpu_profiler.cuh"
 #include "qwen3_dims.cuh"
+#include "utils.cuh"
 
 // Profiler event IDs
 enum : int {

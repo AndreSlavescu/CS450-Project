@@ -79,10 +79,10 @@ __device__ void rms_lm_head_device(
             const float4* row3 = reinterpret_cast<const float4*>(lm_head_w + (long long)(out_base + 3) * HIDDEN_DIM);
             for (int j = 0; j < HIDDEN_DIM / 4; j++) {
                 float4 x = input4[j];
-                float4 w0 = row0[j]; acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                float4 w1 = row1[j]; acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
-                float4 w2 = row2[j]; acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
-                float4 w3 = row3[j]; acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
+                float4 w0 = __ldcg(row0 + j); acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
+                float4 w1 = __ldcg(row1 + j); acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
+                float4 w2 = __ldcg(row2 + j); acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
+                float4 w3 = __ldcg(row3 + j); acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
             }
             logits[out_base + 0] = acc0;
             logits[out_base + 1] = acc1;
@@ -95,7 +95,7 @@ __device__ void rms_lm_head_device(
             const float4* row = reinterpret_cast<const float4*>(lm_head_w + (long long)out_idx * HIDDEN_DIM);
             for (int j = 0; j < HIDDEN_DIM / 4; j++) {
                 float4 x = input4[j];
-                float4 w = row[j];
+                float4 w = __ldcg(row + j);
                 acc += w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
             }
             logits[out_idx] = acc;

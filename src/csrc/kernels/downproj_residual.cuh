@@ -54,10 +54,10 @@ __device__ void downproj_residual_device(
             const float4* row3 = reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 3) * INTERMEDIATE_DIM);
             for (int j = 0; j < INTERMEDIATE_DIM / 4; j++) {
                 float4 x = input4[j];
-                float4 w0 = row0[j]; acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                float4 w1 = row1[j]; acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
-                float4 w2 = row2[j]; acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
-                float4 w3 = row3[j]; acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
+                float4 w0 = __ldcg(row0 + j); acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
+                float4 w1 = __ldcg(row1 + j); acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
+                float4 w2 = __ldcg(row2 + j); acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
+                float4 w3 = __ldcg(row3 + j); acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
             }
             hidden_states[out_base + 0] += acc0;
             hidden_states[out_base + 1] += acc1;

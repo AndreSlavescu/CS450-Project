@@ -88,14 +88,14 @@ __device__ void upgate_silu_device(
             const float4* ur3 = reinterpret_cast<const float4*>(up_w + (long long)(out_base + 3) * HIDDEN_DIM);
             for (int j = 0; j < HIDDEN_DIM / 4; j++) {
                 float4 x = input4[j];
-                float4 gw0 = gr0[j]; gate_acc0 += gw0.x * x.x + gw0.y * x.y + gw0.z * x.z + gw0.w * x.w;
-                float4 gw1 = gr1[j]; gate_acc1 += gw1.x * x.x + gw1.y * x.y + gw1.z * x.z + gw1.w * x.w;
-                float4 gw2 = gr2[j]; gate_acc2 += gw2.x * x.x + gw2.y * x.y + gw2.z * x.z + gw2.w * x.w;
-                float4 gw3 = gr3[j]; gate_acc3 += gw3.x * x.x + gw3.y * x.y + gw3.z * x.z + gw3.w * x.w;
-                float4 uw0 = ur0[j]; up_acc0 += uw0.x * x.x + uw0.y * x.y + uw0.z * x.z + uw0.w * x.w;
-                float4 uw1 = ur1[j]; up_acc1 += uw1.x * x.x + uw1.y * x.y + uw1.z * x.z + uw1.w * x.w;
-                float4 uw2 = ur2[j]; up_acc2 += uw2.x * x.x + uw2.y * x.y + uw2.z * x.z + uw2.w * x.w;
-                float4 uw3 = ur3[j]; up_acc3 += uw3.x * x.x + uw3.y * x.y + uw3.z * x.z + uw3.w * x.w;
+                float4 gw0 = __ldcg(gr0 + j); gate_acc0 += gw0.x * x.x + gw0.y * x.y + gw0.z * x.z + gw0.w * x.w;
+                float4 gw1 = __ldcg(gr1 + j); gate_acc1 += gw1.x * x.x + gw1.y * x.y + gw1.z * x.z + gw1.w * x.w;
+                float4 gw2 = __ldcg(gr2 + j); gate_acc2 += gw2.x * x.x + gw2.y * x.y + gw2.z * x.z + gw2.w * x.w;
+                float4 gw3 = __ldcg(gr3 + j); gate_acc3 += gw3.x * x.x + gw3.y * x.y + gw3.z * x.z + gw3.w * x.w;
+                float4 uw0 = __ldcg(ur0 + j); up_acc0 += uw0.x * x.x + uw0.y * x.y + uw0.z * x.z + uw0.w * x.w;
+                float4 uw1 = __ldcg(ur1 + j); up_acc1 += uw1.x * x.x + uw1.y * x.y + uw1.z * x.z + uw1.w * x.w;
+                float4 uw2 = __ldcg(ur2 + j); up_acc2 += uw2.x * x.x + uw2.y * x.y + uw2.z * x.z + uw2.w * x.w;
+                float4 uw3 = __ldcg(ur3 + j); up_acc3 += uw3.x * x.x + uw3.y * x.y + uw3.z * x.z + uw3.w * x.w;
             }
             // Fused SiLU(gate) * up using Rishu's scalar implementation
             silu_out[out_base + 0] = kernels::silu_multiply_scalar(gate_acc0, up_acc0);

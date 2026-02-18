@@ -107,7 +107,10 @@ def _jit_compile(name, source_file, arch):
     mod = load(
         name=name,
         sources=[source_file],
-        extra_include_paths=["/workspace/src/csrc/profiler"],
+        extra_include_paths=[
+            "/workspace/src/csrc/profiler",
+            "/workspace/src/csrc/kernels",
+        ],
         extra_cuda_cflags=["-std=c++20", "-O2", f"-arch={arch}"],
         verbose=False,
     )

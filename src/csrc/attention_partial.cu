@@ -7,6 +7,8 @@
 #include <torch/extension.h>
 #include "gpu_profiler.cuh"
 #include "qwen3_dims.cuh"
+#include "utils.cuh"
+using kernels::WARP_SIZE;
 
 // Profiler event IDs
 enum : int {
