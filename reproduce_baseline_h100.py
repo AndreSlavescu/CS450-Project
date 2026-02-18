@@ -6,11 +6,27 @@ import modal
 
 app = modal.App("cs450-reproduction")
 
-image = modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.h100").pip_install(
-    "vllm",
+
+def _base_image():
+    return modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.b200").run_commands(
+        "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
+    )
+
+
+# Shared deps for megakernel (and bench_engines.py when used with vllm/sglang)
+image = _base_image().pip_install("pandas", "tabulate")
+
+# vLLM and SGLang use incompatible triton/torch stacks → separate images
+image_vllm = _base_image().pip_install(
+    "vllm==0.15.1",
     "pandas",
     "tabulate",
-)  # add vllm and other dependencies
+)
+image_sglang = _base_image().pip_install(
+    "sglang[all]",
+    "pandas",
+    "tabulate",
+)
 
 PROJECT_ROOT = "/workspace/Megakernels"
 
@@ -41,7 +57,7 @@ def benchmark_megakernel_h100():
 
 
 @app.function(
-    image=image,
+    image=image_vllm,
     gpu="H100",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
@@ -120,6 +136,79 @@ def benchmark_vllm_baseline():
 
 
 @app.function(
+    image=image_sglang,
+    gpu="H100",
+    timeout=3600,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def benchmark_sglang_baseline():
+    """
+    Reproduces the SGLang baseline bar graph as per Figure 1.
+    """
+    import requests
+
+    print("=== Benchmarking SGLang Baseline (H100) ===")
+
+    # 1. Start the SGLang server in the background
+    server_cmd = [
+        "python",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "--port",
+        "10210",
+        "--mem-fraction-static",
+        "0.9",
+    ]
+
+    print(f"Launching server: {' '.join(server_cmd)}")
+    server_process = subprocess.Popen(server_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    try:
+        # 2. Wait for the server to start (health check)
+        print("Waiting for SGLang to load model weights (this takes time)...")
+        health_url = "http://localhost:10210/v1/models"
+        start_time = time.time()
+        server_ready = False
+
+        while time.time() - start_time < 600:  # 10 minute timeout
+            if server_process.poll() is not None:
+                print("\nCRITICAL: Server crashed during startup!")
+                print("Server Logs:")
+                print(server_process.stdout.read())
+                raise RuntimeError("SGLang server exited unexpectedly.")
+
+            try:
+                requests.get(health_url)
+                print("\nServer is ready! Starting benchmark...")
+                server_ready = True
+                break
+            except requests.exceptions.ConnectionError:
+                time.sleep(5)
+                print(".", end="", flush=True)
+
+        if not server_ready:
+            raise RuntimeError("Timed out waiting for SGLang to start.")
+
+        # 3. Run the same benchmarking script (OpenAI-compatible API)
+        bench_cmd = (
+            f"python {PROJECT_ROOT}/megakernels/scripts/bench_engines.py "
+            "port=10210 "
+            "prompt_len=32 "
+            "output_len=128 "
+            "model='meta-llama/Llama-3.2-1B-Instruct'"
+        )
+
+        subprocess.run(bench_cmd, shell=True, cwd=PROJECT_ROOT, check=True)
+
+    finally:
+        print("\nTerminating SGLang server...")
+        server_process.terminate()
+        server_process.wait()
+
+
+@app.function(
     image=image,
     gpu="H100",
     timeout=3600,
@@ -155,6 +244,8 @@ def main(action: str = "megakernel"):
         benchmark_megakernel_h100.remote()
     elif action == "vllm":
         benchmark_vllm_baseline.remote()
+    elif action == "sglang":
+        benchmark_sglang_baseline.remote()
     elif action == "profile":
         print("Running profiler... (this may take a few minutes)")
         trace_bytes = generate_profiler_trace.remote()
@@ -164,4 +255,4 @@ def main(action: str = "megakernel"):
             f.write(trace_bytes)
         print(f"Trace saved to {local_filename}. Open in chrome://tracing to see the bubbles (or lack thereof).")
     else:
-        print("Invalid action. Choose from: megakernel, vllm, profile")
+        print("Invalid action. Choose from: megakernel, vllm, sglang, profile")
