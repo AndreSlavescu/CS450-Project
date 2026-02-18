@@ -1,0 +1,50 @@
+{
+  "traceEvents": [
+    {
+      "name": "process_name",
+      "ph": "M",
+      "pid": 0,
+      "tid": 0,
+      "args": {
+        "name": "GPU"
+      }
+    },
+    {
+      "name": "thread_name",
+      "ph": "M",
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "name": "SM 142"
+      }
+    },
+    {
+      "name": "oproj_matvec_residual",
+      "cat": "gpu",
+      "ph": "B",
+      "ts": 0,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 0,
+        "block": 0,
+        "sm_cycles": 2378004671623,
+        "global_ns": 1771374700851201952
+      }
+    },
+    {
+      "name": "oproj_matvec_residual",
+      "cat": "gpu",
+      "ph": "E",
+      "ts": 624,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 1,
+        "block": 0,
+        "sm_cycles": 2378005895489,
+        "global_ns": 1771374700851826080
+      }
+    }
+  ]
+}

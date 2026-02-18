@@ -1,0 +1,106 @@
+{
+  "traceEvents": [
+    {
+      "name": "process_name",
+      "ph": "M",
+      "pid": 0,
+      "tid": 0,
+      "args": {
+        "name": "GPU"
+      }
+    },
+    {
+      "name": "thread_name",
+      "ph": "M",
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "name": "SM 142"
+      }
+    },
+    {
+      "name": "rmsnorm",
+      "cat": "gpu",
+      "ph": "B",
+      "ts": 0,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 0,
+        "block": 0,
+        "sm_cycles": 2502034545198,
+        "global_ns": 1771375097500191776
+      }
+    },
+    {
+      "name": "rmsnorm",
+      "cat": "gpu",
+      "ph": "E",
+      "ts": 3,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 1,
+        "block": 0,
+        "sm_cycles": 2502034551328,
+        "global_ns": 1771375097500194880
+      }
+    },
+    {
+      "name": "upgate_matvec",
+      "cat": "gpu",
+      "ph": "B",
+      "ts": 3,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 2,
+        "block": 0,
+        "sm_cycles": 2502034551442,
+        "global_ns": 1771375097500194944
+      }
+    },
+    {
+      "name": "upgate_matvec",
+      "cat": "gpu",
+      "ph": "E",
+      "ts": 3,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 3,
+        "block": 0,
+        "sm_cycles": 2502034551881,
+        "global_ns": 1771375097500195168
+      }
+    },
+    {
+      "name": "silu_mul",
+      "cat": "gpu",
+      "ph": "B",
+      "ts": 3,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 4,
+        "block": 0,
+        "sm_cycles": 2502034552008,
+        "global_ns": 1771375097500195232
+      }
+    },
+    {
+      "name": "silu_mul",
+      "cat": "gpu",
+      "ph": "E",
+      "ts": 3980,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 5,
+        "block": 0,
+        "sm_cycles": 2502042362714,
+        "global_ns": 1771375097504171776
+      }
+    }
+  ]
+}

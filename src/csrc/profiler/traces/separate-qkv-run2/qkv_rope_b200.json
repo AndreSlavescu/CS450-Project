@@ -1,0 +1,162 @@
+{
+  "traceEvents": [
+    {
+      "name": "process_name",
+      "ph": "M",
+      "pid": 0,
+      "tid": 0,
+      "args": {
+        "name": "GPU"
+      }
+    },
+    {
+      "name": "thread_name",
+      "ph": "M",
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "name": "SM 142"
+      }
+    },
+    {
+      "name": "rmsnorm",
+      "cat": "gpu",
+      "ph": "B",
+      "ts": 0,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 0,
+        "block": 0,
+        "sm_cycles": 2502019877663,
+        "global_ns": 1771375097492721792
+      }
+    },
+    {
+      "name": "rmsnorm",
+      "cat": "gpu",
+      "ph": "E",
+      "ts": 1,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 1,
+        "block": 0,
+        "sm_cycles": 2502019880619,
+        "global_ns": 1771375097492723296
+      }
+    },
+    {
+      "name": "matvec",
+      "cat": "gpu",
+      "ph": "B",
+      "ts": 1,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 2,
+        "block": 0,
+        "sm_cycles": 2502019881301,
+        "global_ns": 1771375097492723616
+      }
+    },
+    {
+      "name": "matvec",
+      "cat": "gpu",
+      "ph": "E",
+      "ts": 1253,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 3,
+        "block": 0,
+        "sm_cycles": 2502022340177,
+        "global_ns": 1771375097493975488
+      }
+    },
+    {
+      "name": "qk_norm",
+      "cat": "gpu",
+      "ph": "B",
+      "ts": 1253,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 4,
+        "block": 0,
+        "sm_cycles": 2502022340287,
+        "global_ns": 1771375097493975520
+      }
+    },
+    {
+      "name": "qk_norm",
+      "cat": "gpu",
+      "ph": "E",
+      "ts": 1262,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 5,
+        "block": 0,
+        "sm_cycles": 2502022357077,
+        "global_ns": 1771375097493984096
+      }
+    },
+    {
+      "name": "rope",
+      "cat": "gpu",
+      "ph": "B",
+      "ts": 1262,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 6,
+        "block": 0,
+        "sm_cycles": 2502022357199,
+        "global_ns": 1771375097493984160
+      }
+    },
+    {
+      "name": "rope",
+      "cat": "gpu",
+      "ph": "E",
+      "ts": 1264,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 7,
+        "block": 0,
+        "sm_cycles": 2502022362376,
+        "global_ns": 1771375097493986784
+      }
+    },
+    {
+      "name": "kv_cache",
+      "cat": "gpu",
+      "ph": "B",
+      "ts": 1265,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 8,
+        "block": 0,
+        "sm_cycles": 2502022362505,
+        "global_ns": 1771375097493986848
+      }
+    },
+    {
+      "name": "kv_cache",
+      "cat": "gpu",
+      "ph": "E",
+      "ts": 1265,
+      "pid": 0,
+      "tid": 142,
+      "args": {
+        "event_id": 9,
+        "block": 0,
+        "sm_cycles": 2502022363591,
+        "global_ns": 1771375097493987392
+      }
+    }
+  ]
+}

@@ -26,9 +26,11 @@ enum : int {
  *
  * All operations run in a single block for BS=1 single-token decode.
  *
- * Shared memory layout:
+ * Shared memory layout (separate Q/K/V buffers):
  *   s_post_ln[HIDDEN_DIM]  = 2048 floats = 8 KB
- *   s_qkv[QKV_DIM]         = 4096 floats = 16 KB
+ *   s_q[Q_DIM]             = 2048 floats = 8 KB
+ *   s_k[K_DIM]             = 1024 floats = 4 KB
+ *   s_v[V_DIM]             = 1024 floats = 4 KB
  *   s_reduce[WARP_SIZE]    = 32 floats   = 128 B
  *   prof                   = profiler state
  */
@@ -55,8 +57,10 @@ __device__ void qkv_rope_append_device(
 
     extern __shared__ char smem[];
     float* s_post_ln = (float*)smem;
-    float* s_qkv     = s_post_ln + HIDDEN_DIM;
-    float* s_reduce  = s_qkv + QKV_DIM;
+    float* s_q       = s_post_ln + HIDDEN_DIM;
+    float* s_k       = s_q + Q_DIM;
+    float* s_v       = s_k + K_DIM;
+    float* s_reduce  = s_v + V_DIM;
     profiler::block_state* prof = (profiler::block_state*)(s_reduce + kernels::WARP_SIZE);
 
     int tid = threadIdx.x;
@@ -77,19 +81,22 @@ __device__ void qkv_rope_append_device(
 
     if (tid == 0 && has_profiler) prof->record(EV_RMSNORM_END);
 
-    // ===== Phase 2: QKV MatVec: qkv = qkv_weight[4096, 2048] @ post_ln[2048] =====
+    // ===== Phase 2: Q/K/V MatVec with separate output buffers =====
     // Optimized with float4 vectorized loads + ILP (4 rows per iteration)
     if (tid == 0 && has_profiler) prof->record(EV_MATVEC);
 
     {
         constexpr int ILP = 4;
         const float4* input4 = reinterpret_cast<const float4*>(s_post_ln);
-        for (int out_base = tid * ILP; out_base < QKV_DIM; out_base += num_threads * ILP) {
+
+        // Q matvec: q_weight[Q_DIM, HIDDEN_DIM] @ post_ln → s_q
+        const float* q_weight = qkv_weight;
+        for (int out_base = tid * ILP; out_base < Q_DIM; out_base += num_threads * ILP) {
             float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-            const float4* row0 = reinterpret_cast<const float4*>(qkv_weight + (long long)(out_base + 0) * HIDDEN_DIM);
-            const float4* row1 = reinterpret_cast<const float4*>(qkv_weight + (long long)(out_base + 1) * HIDDEN_DIM);
-            const float4* row2 = reinterpret_cast<const float4*>(qkv_weight + (long long)(out_base + 2) * HIDDEN_DIM);
-            const float4* row3 = reinterpret_cast<const float4*>(qkv_weight + (long long)(out_base + 3) * HIDDEN_DIM);
+            const float4* row0 = reinterpret_cast<const float4*>(q_weight + (long long)(out_base + 0) * HIDDEN_DIM);
+            const float4* row1 = reinterpret_cast<const float4*>(q_weight + (long long)(out_base + 1) * HIDDEN_DIM);
+            const float4* row2 = reinterpret_cast<const float4*>(q_weight + (long long)(out_base + 2) * HIDDEN_DIM);
+            const float4* row3 = reinterpret_cast<const float4*>(q_weight + (long long)(out_base + 3) * HIDDEN_DIM);
             for (int j = 0; j < HIDDEN_DIM / 4; j++) {
                 float4 x = input4[j];
                 float4 w0 = __ldcg(row0 + j); acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
@@ -97,10 +104,52 @@ __device__ void qkv_rope_append_device(
                 float4 w2 = __ldcg(row2 + j); acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
                 float4 w3 = __ldcg(row3 + j); acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
             }
-            s_qkv[out_base + 0] = acc0;
-            s_qkv[out_base + 1] = acc1;
-            s_qkv[out_base + 2] = acc2;
-            s_qkv[out_base + 3] = acc3;
+            s_q[out_base + 0] = acc0;
+            s_q[out_base + 1] = acc1;
+            s_q[out_base + 2] = acc2;
+            s_q[out_base + 3] = acc3;
+        }
+
+        // K matvec: k_weight[K_DIM, HIDDEN_DIM] @ post_ln → s_k
+        const float* k_weight = qkv_weight + (long long)Q_DIM * HIDDEN_DIM;
+        for (int out_base = tid * ILP; out_base < K_DIM; out_base += num_threads * ILP) {
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            const float4* row0 = reinterpret_cast<const float4*>(k_weight + (long long)(out_base + 0) * HIDDEN_DIM);
+            const float4* row1 = reinterpret_cast<const float4*>(k_weight + (long long)(out_base + 1) * HIDDEN_DIM);
+            const float4* row2 = reinterpret_cast<const float4*>(k_weight + (long long)(out_base + 2) * HIDDEN_DIM);
+            const float4* row3 = reinterpret_cast<const float4*>(k_weight + (long long)(out_base + 3) * HIDDEN_DIM);
+            for (int j = 0; j < HIDDEN_DIM / 4; j++) {
+                float4 x = input4[j];
+                float4 w0 = __ldcg(row0 + j); acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
+                float4 w1 = __ldcg(row1 + j); acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
+                float4 w2 = __ldcg(row2 + j); acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
+                float4 w3 = __ldcg(row3 + j); acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
+            }
+            s_k[out_base + 0] = acc0;
+            s_k[out_base + 1] = acc1;
+            s_k[out_base + 2] = acc2;
+            s_k[out_base + 3] = acc3;
+        }
+
+        // V matvec: v_weight[V_DIM, HIDDEN_DIM] @ post_ln → s_v
+        const float* v_weight = qkv_weight + (long long)(Q_DIM + K_DIM) * HIDDEN_DIM;
+        for (int out_base = tid * ILP; out_base < V_DIM; out_base += num_threads * ILP) {
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            const float4* row0 = reinterpret_cast<const float4*>(v_weight + (long long)(out_base + 0) * HIDDEN_DIM);
+            const float4* row1 = reinterpret_cast<const float4*>(v_weight + (long long)(out_base + 1) * HIDDEN_DIM);
+            const float4* row2 = reinterpret_cast<const float4*>(v_weight + (long long)(out_base + 2) * HIDDEN_DIM);
+            const float4* row3 = reinterpret_cast<const float4*>(v_weight + (long long)(out_base + 3) * HIDDEN_DIM);
+            for (int j = 0; j < HIDDEN_DIM / 4; j++) {
+                float4 x = input4[j];
+                float4 w0 = __ldcg(row0 + j); acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
+                float4 w1 = __ldcg(row1 + j); acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
+                float4 w2 = __ldcg(row2 + j); acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
+                float4 w3 = __ldcg(row3 + j); acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
+            }
+            s_v[out_base + 0] = acc0;
+            s_v[out_base + 1] = acc1;
+            s_v[out_base + 2] = acc2;
+            s_v[out_base + 3] = acc3;
         }
     }
     __syncthreads();
@@ -110,12 +159,10 @@ __device__ void qkv_rope_append_device(
     // ===== Phase 3: Q/K per-head RMSNorm =====
     if (tid == 0 && has_profiler) prof->record(EV_QKNORM);
 
-    // Normalize Q heads
-    kernels::rmsnorm_per_head(s_qkv, q_norm_w, NUM_Q_HEADS, HEAD_DIM,
+    kernels::rmsnorm_per_head(s_q, q_norm_w, NUM_Q_HEADS, HEAD_DIM,
                               s_reduce, tid, num_threads, lane_id, warp_id, num_warps);
 
-    // Normalize K heads
-    kernels::rmsnorm_per_head(s_qkv + Q_DIM, k_norm_w, NUM_KV_HEADS, HEAD_DIM,
+    kernels::rmsnorm_per_head(s_k, k_norm_w, NUM_KV_HEADS, HEAD_DIM,
                               s_reduce, tid, num_threads, lane_id, warp_id, num_warps);
 
     if (tid == 0 && has_profiler) prof->record(EV_QKNORM_END);
@@ -123,29 +170,27 @@ __device__ void qkv_rope_append_device(
     // ===== Phase 4: RoPE on Q and K =====
     if (tid == 0 && has_profiler) prof->record(EV_ROPE);
 
-    // RoPE on all Q heads
     for (int h = 0; h < NUM_Q_HEADS; h++) {
         int offset = h * HEAD_DIM;
         for (int i = tid; i < HALF_HEAD_DIM; i += num_threads) {
-            float x_first  = s_qkv[offset + i];
-            float x_second = s_qkv[offset + i + HALF_HEAD_DIM];
+            float x_first  = s_q[offset + i];
+            float x_second = s_q[offset + i + HALF_HEAD_DIM];
             float c = cos_cached[i];
             float s = sin_cached[i];
-            s_qkv[offset + i]                 = x_first * c - x_second * s;
-            s_qkv[offset + i + HALF_HEAD_DIM] = x_second * c + x_first * s;
+            s_q[offset + i]                 = x_first * c - x_second * s;
+            s_q[offset + i + HALF_HEAD_DIM] = x_second * c + x_first * s;
         }
     }
 
-    // RoPE on all K heads
     for (int h = 0; h < NUM_KV_HEADS; h++) {
-        int offset = Q_DIM + h * HEAD_DIM;
+        int offset = h * HEAD_DIM;
         for (int i = tid; i < HALF_HEAD_DIM; i += num_threads) {
-            float x_first  = s_qkv[offset + i];
-            float x_second = s_qkv[offset + i + HALF_HEAD_DIM];
+            float x_first  = s_k[offset + i];
+            float x_second = s_k[offset + i + HALF_HEAD_DIM];
             float c = cos_cached[i];
             float s = sin_cached[i];
-            s_qkv[offset + i]                 = x_first * c - x_second * s;
-            s_qkv[offset + i + HALF_HEAD_DIM] = x_second * c + x_first * s;
+            s_k[offset + i]                 = x_first * c - x_second * s;
+            s_k[offset + i + HALF_HEAD_DIM] = x_second * c + x_first * s;
         }
     }
     __syncthreads();
@@ -156,17 +201,17 @@ __device__ void qkv_rope_append_device(
     if (tid == 0 && has_profiler) prof->record(EV_CACHE);
 
     for (int i = tid; i < Q_DIM; i += num_threads) {
-        q_out[i] = s_qkv[i];
+        q_out[i] = s_q[i];
     }
 
     for (int i = tid; i < K_DIM; i += num_threads) {
-        float k_val = s_qkv[Q_DIM + i];
+        float k_val = s_k[i];
         k_out[i] = k_val;
         k_cache[pos_id * K_DIM + i] = k_val;
     }
 
     for (int i = tid; i < V_DIM; i += num_threads) {
-        float v_val = s_qkv[Q_DIM + K_DIM + i];
+        float v_val = s_v[i];
         v_out[i] = v_val;
         v_cache[pos_id * V_DIM + i] = v_val;
     }
