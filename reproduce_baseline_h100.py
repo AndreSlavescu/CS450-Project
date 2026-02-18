@@ -6,12 +6,10 @@ import modal
 
 app = modal.App("cs450-reproduction")
 
+
 def _base_image():
-    return (
-        modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.b200")
-        .run_commands(
-            "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
-        )
+    return modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.b200").run_commands(
+        "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
     )
 
 

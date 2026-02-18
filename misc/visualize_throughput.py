@@ -2,6 +2,7 @@
 """Grouped bar graph comparing vLLM, SgLang, and Megakernels throughput (tokens/s) across GPUs."""
 
 import matplotlib
+
 matplotlib.use("Agg")  # headless; no display required
 import matplotlib.pyplot as plt
 import numpy as np

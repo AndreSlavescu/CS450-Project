@@ -6,12 +6,10 @@ import modal
 
 app = modal.App("cs450-reproduction")
 
+
 def _base_image():
-    return (
-        modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.b200")
-        .run_commands(
-            "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
-        )
+    return modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.b200").run_commands(
+        "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
     )
 
 
@@ -44,10 +42,10 @@ def benchmark_megakernel_B200():
     Reproduces the Megakernel bar graph as per Figure 1.
     """
     print("=== Benchmarking Megakernel (B200) ===")
-    
+
     import os
     import torch
-    
+
     # Diagnostic info
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -55,7 +53,7 @@ def benchmark_megakernel_B200():
         print(f"PyTorch version: {torch.__version__}")
         print(f"Device name: {torch.cuda.get_device_name(0)}")
         print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
-    
+
     # B200-specific: Set CUDA compute capability if needed
     # B200 is SM100 (compute capability 10.0)
     os.environ.setdefault("CUDA_ARCH", "100")
@@ -89,7 +87,7 @@ def benchmark_vllm_baseline():
     import torch
 
     print("=== Benchmarking vLLM Baseline (B200) ===")
-    
+
     # Diagnostic info
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -97,7 +95,7 @@ def benchmark_vllm_baseline():
         print(f"PyTorch version: {torch.__version__}")
         print(f"Device name: {torch.cuda.get_device_name(0)}")
         print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
-    
+
     # B200-specific: Set CUDA compute capability if needed
     # B200 is SM100 (compute capability 10.0)
     os.environ.setdefault("CUDA_ARCH", "100")
@@ -183,7 +181,7 @@ def benchmark_sglang_baseline():
     import torch
 
     print("=== Benchmarking SGLang Baseline (B200) ===")
-    
+
     # Diagnostic info
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -191,7 +189,7 @@ def benchmark_sglang_baseline():
         print(f"PyTorch version: {torch.__version__}")
         print(f"Device name: {torch.cuda.get_device_name(0)}")
         print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
-    
+
     # B200-specific: Set CUDA compute capability if needed
     os.environ.setdefault("CUDA_ARCH", "100")
 
