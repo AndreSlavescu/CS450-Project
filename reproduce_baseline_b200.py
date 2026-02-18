@@ -44,6 +44,7 @@ def benchmark_megakernel_B200():
     print("=== Benchmarking Megakernel (B200) ===")
 
     import os
+
     import torch
 
     # Diagnostic info
@@ -83,6 +84,7 @@ def benchmark_vllm_baseline():
     """
 
     import os
+
     import requests
     import torch
 
@@ -177,6 +179,7 @@ def benchmark_sglang_baseline():
     Reproduces the SGLang baseline bar graph as per Figure 1.
     """
     import os
+
     import requests
     import torch
 
