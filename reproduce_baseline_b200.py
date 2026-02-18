@@ -8,7 +8,7 @@ app = modal.App("cs450-reproduction")
 
 def _base_image():
     return (
-        modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.h100")
+        modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.b200")
         .run_commands(
             "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
         )
@@ -35,15 +35,30 @@ PROJECT_ROOT = "/workspace/Megakernels"
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="B200",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def benchmark_megakernel_h100():
+def benchmark_megakernel_B200():
     """
     Reproduces the Megakernel bar graph as per Figure 1.
     """
-    print("=== Benchmarking Megakernel (H100) ===")
+    print("=== Benchmarking Megakernel (B200) ===")
+    
+    import os
+    import torch
+    
+    # Diagnostic info
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"Device name: {torch.cuda.get_device_name(0)}")
+        print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
+    
+    # B200-specific: Set CUDA compute capability if needed
+    # B200 is SM100 (compute capability 10.0)
+    os.environ.setdefault("CUDA_ARCH", "100")
 
     # Using the same parameters as the paper (approx 32 token prompt, 128 gen)
     cmd = (
@@ -60,7 +75,7 @@ def benchmark_megakernel_h100():
 
 @app.function(
     image=image_vllm,
-    gpu="H100",
+    gpu="B200",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
@@ -69,9 +84,23 @@ def benchmark_vllm_baseline():
     Reproduces the VLLM baseline bar graph as per Figure 1.
     """
 
+    import os
     import requests
+    import torch
 
-    print("=== Benchmarking vLLM Baseline (H100) ===")
+    print("=== Benchmarking vLLM Baseline (B200) ===")
+    
+    # Diagnostic info
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"Device name: {torch.cuda.get_device_name(0)}")
+        print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
+    
+    # B200-specific: Set CUDA compute capability if needed
+    # B200 is SM100 (compute capability 10.0)
+    os.environ.setdefault("CUDA_ARCH", "100")
 
     # 1. Start the vLLM server in the background
     server_cmd = [
@@ -84,6 +113,8 @@ def benchmark_vllm_baseline():
         "bfloat16",
         "--gpu-memory-utilization",
         "0.9",
+        # B200-specific: may need tensor parallelism or other flags
+        # "--tensor-parallel-size", "1",  # Uncomment if needed
     ]
 
     print(f"Launching server: {' '.join(server_cmd)}")
@@ -139,7 +170,7 @@ def benchmark_vllm_baseline():
 
 @app.function(
     image=image_sglang,
-    gpu="H100",
+    gpu="B200",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
@@ -147,9 +178,22 @@ def benchmark_sglang_baseline():
     """
     Reproduces the SGLang baseline bar graph as per Figure 1.
     """
+    import os
     import requests
+    import torch
 
-    print("=== Benchmarking SGLang Baseline (H100) ===")
+    print("=== Benchmarking SGLang Baseline (B200) ===")
+    
+    # Diagnostic info
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"Device name: {torch.cuda.get_device_name(0)}")
+        print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
+    
+    # B200-specific: Set CUDA compute capability if needed
+    os.environ.setdefault("CUDA_ARCH", "100")
 
     # 1. Start the SGLang server in the background
     server_cmd = [
@@ -162,6 +206,8 @@ def benchmark_sglang_baseline():
         "10210",
         "--mem-fraction-static",
         "0.9",
+        # B200 may need additional flags - check SGLang docs
+        # "--enable-torch-compile",  # Uncomment if needed
     ]
 
     print(f"Launching server: {' '.join(server_cmd)}")
@@ -212,7 +258,7 @@ def benchmark_sglang_baseline():
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="B200",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
@@ -243,7 +289,7 @@ def generate_profiler_trace():
 @app.local_entrypoint()
 def main(action: str = "megakernel"):
     if action == "megakernel":
-        benchmark_megakernel_h100.remote()
+        benchmark_megakernel_B200.remote()
     elif action == "vllm":
         benchmark_vllm_baseline.remote()
     elif action == "sglang":
