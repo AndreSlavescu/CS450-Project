@@ -15,7 +15,7 @@ format:
 	@$(MAKE) --no-print-directory -j2 format-python format-cpp
 
 lint-python:
-	$(FIND_PY) | xargs ruff check
+	$(FIND_PY) | xargs ruff check --fix
 
 format-python:
 	$(FIND_PY) | xargs black
