@@ -31,6 +31,9 @@ RUN pip install numpy ninja pytest uv "setuptools>=64.0.0" && \
 
 WORKDIR /workspace
 
+# Clone CUTLASS for Blackwell SM100 FMHA kernel headers
+RUN git clone --depth 1 https://github.com/NVIDIA/cutlass.git /workspace/cutlass
+
 COPY Megakernels /workspace/Megakernels
 
 ENV THUNDERKITTENS_ROOT=/workspace/Megakernels/ThunderKittens

@@ -1,9 +1,14 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
+#include <string>
 
 #include "fa4_attention.cuh"
 #include "qwen3.cuh"
+
+#ifndef FA4_PROFILE_DEFAULT
+#define FA4_PROFILE_DEFAULT 0
+#endif
 
 // ---------------------------------------------------------------------------
 // PyTorch extension for FA4 Forward Attention
@@ -33,14 +38,22 @@
 //   O:   [num_q_heads, seq_q, head_dim] bf16
 //   lse: [num_q_heads, seq_q]           fp32
 // ---------------------------------------------------------------------------
-std::vector<torch::Tensor> fa4_attention_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale,
-                                                 bool causal, bool return_lse, int64_t q_offset, int64_t kv_offset) {
+namespace {
+void fa4_check_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V) {
     TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be CUDA tensors");
     TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bfloat16");
     TORCH_CHECK(K.dtype() == torch::kBFloat16, "K must be bfloat16");
     TORCH_CHECK(V.dtype() == torch::kBFloat16, "V must be bfloat16");
     TORCH_CHECK(Q.dim() == 3 && K.dim() == 3 && V.dim() == 3, "Q, K, V must be 3-dimensional [heads, seq, head_dim]");
     TORCH_CHECK(Q.is_contiguous() && K.is_contiguous() && V.is_contiguous(), "Q, K, V must be contiguous");
+}
+} // namespace
+
+std::vector<torch::Tensor> fa4_attention_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale,
+                                                 bool causal, bool return_lse, int64_t q_offset, int64_t kv_offset,
+                                                 bool profile = static_cast<bool>(FA4_PROFILE_DEFAULT),
+                                                 const std::string& trace_path = "trace.json") {
+    fa4_check_inputs(Q, K, V);
 
     int num_q_heads = Q.size(0);
     int seq_q = Q.size(1);
@@ -66,11 +79,34 @@ std::vector<torch::Tensor> fa4_attention_forward(torch::Tensor Q, torch::Tensor 
 
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
 
-    fa4_forward(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
-                reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()),
-                reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
-                reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()), num_q_heads, num_kv_heads, seq_q, seq_kv,
-                static_cast<float>(scale), causal, static_cast<int>(q_offset), static_cast<int>(kv_offset), stream);
+    if (profile) {
+        const int num_blocks = fa4_profile_block_count(num_q_heads, seq_q, seq_kv);
+        TORCH_CHECK(num_blocks > 0, "FA4 profiler launch computed zero blocks");
+
+        profiler::host_buffer profile_buf;
+        profile_buf.allocate(num_blocks);
+
+        fa4_forward_profile(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
+                            reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()),
+                            reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
+                            reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()), num_q_heads, num_kv_heads, seq_q,
+                            seq_kv, static_cast<float>(scale), causal, static_cast<int>(q_offset),
+                            static_cast<int>(kv_offset), stream, profile_buf.d_events, profile_buf.d_counts);
+
+        cudaError_t sync_err = cudaStreamSynchronize(stream);
+        TORCH_CHECK(sync_err == cudaSuccess, "cudaStreamSynchronize failed: ", cudaGetErrorString(sync_err));
+
+        profiler::event_names names;
+        fa4_register_profile_event_names(names);
+        profile_buf.export_perfetto_json(trace_path.c_str(), &names, /*paired=*/true);
+        profile_buf.free();
+    } else {
+        fa4_forward(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
+                    reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()),
+                    reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
+                    reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()), num_q_heads, num_kv_heads, seq_q, seq_kv,
+                    static_cast<float>(scale), causal, static_cast<int>(q_offset), static_cast<int>(kv_offset), stream);
+    }
 
     if (return_lse) {
         return {O, lse};
@@ -86,5 +122,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("forward", &fa4_attention_forward, "FA4 forward attention (GQA, causal, optional LSE)", py::arg("Q"),
           py::arg("K"), py::arg("V"), py::arg("scale"), py::arg("causal") = true, py::arg("return_lse") = false,
-          py::arg("q_offset") = 0, py::arg("kv_offset") = 0);
+          py::arg("q_offset") = 0, py::arg("kv_offset") = 0,
+          py::arg("profile") = static_cast<bool>(FA4_PROFILE_DEFAULT), py::arg("trace_path") = "trace.json");
 }

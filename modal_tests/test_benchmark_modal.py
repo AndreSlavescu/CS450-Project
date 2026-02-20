@@ -21,6 +21,9 @@ Usage:
 
     # Attention kernel microbenchmarks (FA4 / SDPA / ZigZag local)
     modal run modal_tests/test_benchmark_modal.py --gpu b200 --mode kernels
+
+    # Attention microbench + FA4 pipeline trace export
+    modal run modal_tests/test_benchmark_modal.py --gpu b200 --mode kernels --kernels fa4,fa4_profile
 """
 
 from __future__ import annotations
@@ -140,8 +143,9 @@ WARMUP_ITERS = 5
 BENCH_ITERS = 20
 BENCH_SEQ_LENS = [1, 32, 128, 512, 1024]
 BENCH_PROMPT = "The quick brown fox jumps over the lazy dog"
-KERNEL_BENCH_SEQ_LENS = [1, 32, 128, 512, 1024, 2048]
+KERNEL_BENCH_SEQ_LENS = [1024, 2048, 4096, 8192, 16384, 32768]
 KERNEL_DEFAULTS = ("fa4", "fa4_lse", "sdpa", "sdpa_math", "zigzag_local")
+# fa4_nocausal: non-causal FA4 for measuring raw throughput ceiling
 
 
 class TheoreticalPerf:
@@ -377,7 +381,7 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
     from torch.utils.cpp_extension import load
 
     kernels_dir = "/workspace/src/csrc/kernels"
-    need_fa4 = any(k in kernels for k in ("fa4", "fa4_lse"))
+    need_fa4 = any(k in kernels for k in ("fa4", "fa4_lse", "fa4_profile", "fa4_nocausal"))
     need_zigzag = "zigzag_local" in kernels
 
     if not (need_fa4 or need_zigzag):
@@ -389,10 +393,19 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
         "--use_fast_math",
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
+        "-std=c++17",
         "-lineinfo",
     ] + arch_flags
     common_cflags = ["-O3", "-std=c++20"]
     include_paths = [kernels_dir]
+    if gpu.lower() == "b200":
+        include_paths.extend(
+            [
+                "/workspace/cutlass/include",
+                "/workspace/cutlass/examples/77_blackwell_fmha",
+                "/workspace/cutlass/tools/util/include",
+            ]
+        )
 
     print(f"Building attention kernels with torch cpp_extension.load (GPU={gpu.upper()})")
     print(f"PyTorch version: {torch.__version__}")
@@ -409,6 +422,7 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
             extra_include_paths=include_paths,
             extra_cflags=common_cflags,
             extra_cuda_cflags=common_cuda_flags,
+            extra_ldflags=["-lcuda"],
             verbose=True,
             with_cuda=True,
             build_directory=fa4_build_dir,
@@ -432,9 +446,9 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
     return fa4_attention, zigzag_attention
 
 
-def _attention_theoretical_metrics(cfg: ModelConfig, seq_len: int) -> dict:
-    # Causal attention uses triangular score matrix.
-    pairs = seq_len * (seq_len + 1) // 2
+def _attention_theoretical_metrics(cfg: ModelConfig, seq_len: int, causal: bool = True) -> dict:
+    # Causal attention uses triangular score matrix; non-causal uses full matrix.
+    pairs = seq_len * (seq_len + 1) // 2 if causal else seq_len * seq_len
     flops_qk = 2 * cfg.num_q_heads * cfg.head_dim * pairs
     flops_pv = 2 * cfg.num_q_heads * cfg.head_dim * pairs
     total_flops = flops_qk + flops_pv
@@ -458,7 +472,12 @@ def _run_attention_kernels_benchmark(
     gpu: str,
     warmup_iters: int,
     bench_iters: int,
+    fa4_block_q: int = 0,
+    fa4_dual_cta: bool = False,
 ) -> dict:
+    import json
+    import os
+
     import torch
     import torch.nn.functional as F
 
@@ -471,10 +490,15 @@ def _run_attention_kernels_benchmark(
     torch.manual_seed(0)
     scale = 1.0 / (cfg.head_dim**0.5)
 
-    valid_kernels = set(KERNEL_DEFAULTS)
+    valid_kernels = set(KERNEL_DEFAULTS) | {"fa4_profile", "fa4_nocausal"}
     invalid = [k for k in kernels if k not in valid_kernels]
     if invalid:
         raise ValueError(f"Unknown kernels requested: {invalid}. Valid: {sorted(valid_kernels)}")
+    if any(k in kernels for k in ("fa4", "fa4_lse", "fa4_profile", "fa4_nocausal")):
+        if fa4_block_q not in (0, 64, 128):
+            raise ValueError(f"fa4_block_q must be 0 (auto), 64, or 128, got {fa4_block_q}")
+        os.environ["FA4_BLOCK_Q"] = str(fa4_block_q)
+        os.environ["FA4_DUAL_CTA"] = "1" if fa4_dual_cta else "0"
 
     fa4_attention, zigzag_attention = _build_attention_kernel_modules(gpu, kernels)
 
@@ -516,15 +540,31 @@ def _run_attention_kernels_benchmark(
             if kernel_name == "sdpa_math":
                 ctx = _sdpa_math_context()
 
+            trace_path = None
+            local_warmup_iters = warmup_iters
+            local_bench_iters = bench_iters
+            if kernel_name == "fa4_profile":
+                trace_path = f"/tmp/fa4_profile_{gpu.lower()}_seq{seq_len}.json"
+                local_warmup_iters = 0
+                local_bench_iters = 1
+
             def _run_once():
                 if kernel_name == "fa4":
                     if fa4_attention is None:
                         raise RuntimeError("fa4 module not built")
-                    return fa4_attention.forward(Q, K, V, scale, True, False, 0, 0)[0]
+                    return fa4_attention.forward(Q, K, V, scale, True, False, 0, 0, False, "")[0]
                 if kernel_name == "fa4_lse":
                     if fa4_attention is None:
                         raise RuntimeError("fa4 module not built")
-                    return fa4_attention.forward(Q, K, V, scale, True, True, 0, 0)[0]
+                    return fa4_attention.forward(Q, K, V, scale, True, True, 0, 0, False, "")[0]
+                if kernel_name == "fa4_nocausal":
+                    if fa4_attention is None:
+                        raise RuntimeError("fa4 module not built")
+                    return fa4_attention.forward(Q, K, V, scale, False, False, 0, 0, False, "")[0]
+                if kernel_name == "fa4_profile":
+                    if fa4_attention is None:
+                        raise RuntimeError("fa4 module not built")
+                    return fa4_attention.forward(Q, K, V, scale, True, True, 0, 0, True, trace_path)[0]
                 if kernel_name == "sdpa":
                     return F.scaled_dot_product_attention(Q_b, K_b, V_b, is_causal=True, enable_gqa=True).squeeze(0)
                 if kernel_name == "sdpa_math":
@@ -536,13 +576,13 @@ def _run_attention_kernels_benchmark(
                 raise RuntimeError(f"Unhandled kernel: {kernel_name}")
 
             with ctx:
-                for _ in range(warmup_iters):
+                for _ in range(local_warmup_iters):
                     _run_once()
                 torch.cuda.synchronize()
 
                 times_ms = []
                 out = None
-                for _ in range(bench_iters):
+                for _ in range(local_bench_iters):
                     start_evt = torch.cuda.Event(enable_timing=True)
                     end_evt = torch.cuda.Event(enable_timing=True)
                     start_evt.record()
@@ -558,17 +598,25 @@ def _run_attention_kernels_benchmark(
             median_ms = times_ms_sorted[len(times_ms_sorted) // 2]
             min_ms = times_ms_sorted[0]
 
-            theory = _attention_theoretical_metrics(cfg, seq_len)
+            is_causal_kernel = kernel_name not in ("fa4_nocausal",)
+            theory = _attention_theoretical_metrics(cfg, seq_len, causal=is_causal_kernel)
             achieved_tflops = theory["flops"] / (mean_ms / 1000.0) / 1e12
             achieved_bw_gb_s = theory["bytes"] / (mean_ms / 1000.0) / 1e9
             qps = (cfg.num_q_heads * seq_len) / (mean_ms / 1000.0)
 
             max_abs = None
             mean_abs = None
-            if kernel_name != "sdpa" and out is not None:
+            if kernel_name not in ("sdpa", "fa4_nocausal") and out is not None:
                 diff = (out.float() - ref_out.float()).abs()
                 max_abs = diff.max().item()
                 mean_abs = diff.mean().item()
+
+            trace_json = None
+            trace_event_count = None
+            if kernel_name == "fa4_profile" and trace_path and os.path.exists(trace_path):
+                with open(trace_path) as f:
+                    trace_json = json.load(f)
+                trace_event_count = len(trace_json.get("traceEvents", []))
 
             seq_res[kernel_name] = {
                 "mean_ms": mean_ms,
@@ -580,14 +628,19 @@ def _run_attention_kernels_benchmark(
                 "max_abs_err_vs_sdpa": max_abs,
                 "mean_abs_err_vs_sdpa": mean_abs,
                 "all_times_ms": times_ms,
+                "trace_event_count": trace_event_count,
+                "trace_json": trace_json,
             }
 
             err_info = ""
             if max_abs is not None and mean_abs is not None:
                 err_info = f" | max_err={max_abs:.4e}, mean_err={mean_abs:.4e}"
+            trace_info = ""
+            if trace_event_count is not None:
+                trace_info = f" | trace_events={trace_event_count}"
             print(
                 f"     mean={mean_ms:.3f} ms, median={median_ms:.3f} ms, "
-                f"TFLOPS={achieved_tflops:.2f}, BW={achieved_bw_gb_s:.1f} GB/s{err_info}"
+                f"TFLOPS={achieved_tflops:.2f}, BW={achieved_bw_gb_s:.1f} GB/s{err_info}{trace_info}"
             )
 
         results[seq_len] = seq_res
@@ -684,8 +737,12 @@ def run_attention_kernels_benchmark(
     gpu: str,
     warmup_iters: int = WARMUP_ITERS,
     bench_iters: int = BENCH_ITERS,
+    fa4_block_q: int = 0,
+    fa4_dual_cta: bool = False,
 ) -> dict:
-    return _run_attention_kernels_benchmark(model_cfg, seq_lens, kernels, gpu, warmup_iters, bench_iters)
+    return _run_attention_kernels_benchmark(
+        model_cfg, seq_lens, kernels, gpu, warmup_iters, bench_iters, fa4_block_q, fa4_dual_cta
+    )
 
 
 def _print_comparison_table(
@@ -975,6 +1032,11 @@ def main(
     model: str = "qwen3-1.7b",
     mode: str = "model",
     kernels: str = ",".join(KERNEL_DEFAULTS),
+    warmup_iters: int = WARMUP_ITERS,
+    bench_iters: int = BENCH_ITERS,
+    kernel_seq_lens: str = "",
+    fa4_block_q: int = 0,
+    fa4_dual_cta: bool = False,
 ):
     import json
     import time
@@ -999,6 +1061,17 @@ def main(
     if not requested_kernels:
         requested_kernels = list(KERNEL_DEFAULTS)
 
+    selected_kernel_seq_lens = KERNEL_BENCH_SEQ_LENS
+    if kernel_seq_lens.strip():
+        selected_kernel_seq_lens = [int(x.strip()) for x in kernel_seq_lens.split(",") if x.strip()]
+        if not selected_kernel_seq_lens:
+            raise ValueError("kernel_seq_lens was provided but no valid lengths were parsed")
+        if any(sl <= 0 for sl in selected_kernel_seq_lens):
+            raise ValueError("kernel_seq_lens must contain positive integers")
+
+    if warmup_iters < 0 or bench_iters <= 0:
+        raise ValueError("warmup_iters must be >= 0 and bench_iters must be > 0")
+
     model_cfg = MODEL_CONFIGS[model]
     gpu_config = GPU_CONFIGS[gpu]
     gpu_name = gpu.upper()
@@ -1008,10 +1081,14 @@ def main(
     print(f"  Peak HBM BW: {gpu_config['peak_bandwidth_tb_s']} TB/s")
     if mode == "kernels":
         print(f"  Kernels: {requested_kernels}")
-        print(f"  Sequence lengths: {KERNEL_BENCH_SEQ_LENS}")
+        print(f"  Sequence lengths: {selected_kernel_seq_lens}")
+        if any(k in requested_kernels for k in ("fa4", "fa4_lse", "fa4_profile")):
+            block_q_label = "auto" if fa4_block_q == 0 else str(fa4_block_q)
+            print(f"  FA4 block_q: {block_q_label}")
+            print(f"  FA4 dual_cta: {fa4_dual_cta}")
     else:
         print(f"  Sequence lengths: {BENCH_SEQ_LENS}")
-    print(f"  Warmup: {WARMUP_ITERS}, Bench: {BENCH_ITERS} iterations")
+    print(f"  Warmup: {warmup_iters}, Bench: {bench_iters} iterations")
 
     ref_dir = PROJECT_ROOT / "modal_tests" / "reference_data"
     ref_dir.mkdir(parents=True, exist_ok=True)
@@ -1024,13 +1101,26 @@ def main(
         print(f"{'='*70}")
         kernel_results = run_attention_kernels_benchmark.remote(
             asdict(model_cfg),
-            KERNEL_BENCH_SEQ_LENS,
+            selected_kernel_seq_lens,
             requested_kernels,
             gpu,
-            WARMUP_ITERS,
-            BENCH_ITERS,
+            warmup_iters,
+            bench_iters,
+            fa4_block_q,
+            fa4_dual_cta,
         )
-        _print_kernel_table(model_cfg, gpu_name, gpu_config, kernel_results, KERNEL_BENCH_SEQ_LENS)
+        _print_kernel_table(model_cfg, gpu_name, gpu_config, kernel_results, selected_kernel_seq_lens)
+
+        kernel_results_for_save = dict(kernel_results)
+        kernel_results_for_save["results"] = {}
+        for seq_len, seq_rows in kernel_results.get("results", {}).items():
+            cleaned_rows = {}
+            for kernel_name, row in seq_rows.items():
+                cleaned = dict(row)
+                if "trace_json" in cleaned:
+                    cleaned["trace_json"] = None
+                cleaned_rows[kernel_name] = cleaned
+            kernel_results_for_save["results"][seq_len] = cleaned_rows
 
         results_path = ref_dir / f"kernel_benchmark_{model_slug}_{gpu}_{timestamp}.json"
         save_data = {
@@ -1042,11 +1132,27 @@ def main(
                 "peak_bandwidth_tb_s": gpu_config["peak_bandwidth_tb_s"],
                 "peak_tflops_bf16": gpu_config["peak_tflops_bf16"],
             },
-            "kernel_results": kernel_results,
+            "kernel_results": kernel_results_for_save,
         }
         with open(results_path, "w") as f:
             json.dump(save_data, f, indent=2, default=str)
         print(f"\nKernel benchmark results saved to {results_path}")
+
+        trace_dir = PROJECT_ROOT / "src" / "csrc" / "profiler" / "traces"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        for seq_len, seq_rows in kernel_results.get("results", {}).items():
+            row = seq_rows.get("fa4_profile")
+            if not row:
+                continue
+            trace_json = row.get("trace_json")
+            if not trace_json:
+                continue
+            trace_path = trace_dir / f"trace_fa4_{gpu}_seq{seq_len}.json"
+            with open(trace_path, "w") as f:
+                json.dump(trace_json, f, indent=2)
+            n_events = len(trace_json.get("traceEvents", []))
+            print(f"Saved FA4 pipeline trace ({n_events} events) to {trace_path}")
+
         return
 
     print(f"\n{'='*70}")
