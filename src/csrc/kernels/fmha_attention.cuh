@@ -17,7 +17,7 @@
 //   - GQA support via stride broadcasting
 // ---------------------------------------------------------------------------
 
-// Profiler events (retained for API compatibility with fa4_attention.cu)
+// Profiler events (retained for API compatibility with fmha_attention.cu)
 enum Fa4ProfileEvent : int {
     FA4_EV_SETUP_BEGIN = 0,
     FA4_EV_SETUP_END = 1,
@@ -220,7 +220,7 @@ inline void run_fmha(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, const
 #endif // __has_include("device/fmha.hpp")
 
 // ---------------------------------------------------------------------------
-// Public API (called from fa4_attention.cu)
+// Public API (called from fmha_attention.cu)
 // ---------------------------------------------------------------------------
 
 inline int fa4_profile_block_count(int num_q_heads, int seq_q, int /*seq_kv*/) {

@@ -36,15 +36,15 @@ endif
 ALL_NVCCFLAGS = $(BASE_NVCCFLAGS) $(NVCCFLAGS)
 
 EXT_SUFFIX = $(shell python3-config --extension-suffix)
-TARGETS = tp_sp$(EXT_SUFFIX) fa4_attention$(EXT_SUFFIX) zigzag_attention$(EXT_SUFFIX)
+TARGETS = tp_sp$(EXT_SUFFIX) fmha_attention$(EXT_SUFFIX) zigzag_attention$(EXT_SUFFIX)
 
 all: $(TARGETS)
 
 tp_sp$(EXT_SUFFIX): tp_sp.cu tp_sp.cuh qwen3.cuh
 	$(NVCC) tp_sp.cu $(ALL_NVCCFLAGS) -o $@
 
-fa4_attention$(EXT_SUFFIX): fa4_attention.cu fa4_attention.cuh qwen3.cuh
-	$(NVCC) fa4_attention.cu $(ALL_NVCCFLAGS) -o $@
+fmha_attention$(EXT_SUFFIX): fmha_attention.cu fmha_attention.cuh qwen3.cuh
+	$(NVCC) fmha_attention.cu $(ALL_NVCCFLAGS) -o $@
 
 zigzag_attention$(EXT_SUFFIX): zigzag_attention.cu zigzag_attention.cuh qwen3.cuh
 	$(NVCC) zigzag_attention.cu $(ALL_NVCCFLAGS) -lnccl -o $@

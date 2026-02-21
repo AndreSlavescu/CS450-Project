@@ -16,7 +16,7 @@
 //   1. NCCL communicator management (init/destroy) for legacy C++ callers
 //   2. A local single-GPU reference implementation for correctness testing
 //
-// The FA4 attention kernel is in fa4_attention.cuh / fa4_attention.cu.
+// The FMHA attention kernel is in fmha_attention.cuh / fmha_attention.cu.
 // ---------------------------------------------------------------------------
 
 static ncclComm_t g_zigzag_comm = nullptr;

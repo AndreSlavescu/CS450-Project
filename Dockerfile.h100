@@ -32,6 +32,7 @@ RUN pip install numpy ninja pytest uv "setuptools>=64.0.0" && \
 WORKDIR /workspace
 
 COPY Megakernels /workspace/Megakernels
+COPY src /workspace/src
 
 ENV THUNDERKITTENS_ROOT=/workspace/Megakernels/ThunderKittens
 ENV MEGAKERNELS_ROOT=/workspace/Megakernels
