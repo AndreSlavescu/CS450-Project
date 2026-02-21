@@ -45,7 +45,7 @@ GPU_CONFIGS = {
 
 def _build_image(gpu: str) -> modal.Image:
     cfg = GPU_CONFIGS[gpu]
-    return (
+    img = (
         modal.Image.from_registry(cfg["cuda_image"], force_build=force_rebuild)
         .env({"DEBIAN_FRONTEND": "noninteractive"})
         .apt_install(
@@ -66,9 +66,14 @@ def _build_image(gpu: str) -> modal.Image:
             "pip install numpy ninja setuptools>=64.0.0",
             f"pip install --pre torch --index-url {cfg['torch_index']}",
         )
-        .add_local_dir(
-            str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc"
+    )
+    if gpu == "b200":
+        # Clone CUTLASS for Blackwell SM100 FMHA kernel headers (FA4 attention)
+        img = img.run_commands(
+            "git clone --depth 1 https://github.com/NVIDIA/cutlass.git /workspace/cutlass"
         )
+    return img.add_local_dir(
+        str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc"
     )
 
 
@@ -115,6 +120,27 @@ def _jit_compile(name, source_file, arch):
         verbose=False,
     )
     print(f"  {name} compiled OK.")
+    return mod
+
+
+def _jit_compile_fa4(arch):
+    """Compile FA4 attention kernel with CUTLASS SM100 FMHA headers (B200 only)."""
+    from torch.utils.cpp_extension import load
+    print("\n  Compiling fa4_attention (CUTLASS FMHA)...")
+    mod = load(
+        name="fa4_attention",
+        sources=["/workspace/src/csrc/kernels/fa4_attention.cu"],
+        extra_include_paths=[
+            "/workspace/src/csrc/profiler",
+            "/workspace/src/csrc/kernels",
+            "/workspace/cutlass/include",
+            "/workspace/cutlass/examples/77_blackwell_fmha",
+            "/workspace/cutlass/tools/util/include",
+        ],
+        extra_cuda_cflags=["-std=c++17", "-O2", f"-arch={arch}"],
+        verbose=False,
+    )
+    print("  fa4_attention compiled OK.")
     return mod
 
 
@@ -302,6 +328,34 @@ def _run_all_ops(arch: str) -> dict:
     silu_standalone_diff = (out_silu_standalone - ref_silu_standalone).abs().max().item()
     results["silu_multiply"] = {"max_diff": silu_standalone_diff, "pass": silu_standalone_diff < 1e-3}
     print(f"[SiLU] Standalone SiLU*Up: max_diff={silu_standalone_diff:.8f} {'PASS' if silu_standalone_diff < 1e-3 else 'FAIL'}")
+
+    # ============================
+    # FA4 Attention (B200 / CUTLASS SM100 FMHA only)
+    # ============================
+    if arch == "sm_100a":
+        fa4 = _jit_compile_fa4(arch)
+
+        FA4_SEQ = 1024
+        FA4_NQ = 16; FA4_NKV = 8; FA4_HD = 128
+        FA4_SCALE = 1.0 / math.sqrt(FA4_HD)
+        torch.manual_seed(42)
+        Q_fa4 = torch.randn(FA4_NQ, FA4_SEQ, FA4_HD, device="cuda", dtype=torch.bfloat16)
+        K_fa4 = torch.randn(FA4_NKV, FA4_SEQ, FA4_HD, device="cuda", dtype=torch.bfloat16)
+        V_fa4 = torch.randn(FA4_NKV, FA4_SEQ, FA4_HD, device="cuda", dtype=torch.bfloat16)
+
+        # Reference: PyTorch scaled_dot_product_attention (GQA, causal)
+        # sdpa expects [batch, heads, seq, head_dim] — use batch=1
+        Q_sdpa = Q_fa4.unsqueeze(0)  # [1, NQ, SEQ, HD]
+        K_sdpa = K_fa4.unsqueeze(0)  # [1, NKV, SEQ, HD]
+        V_sdpa = V_fa4.unsqueeze(0)  # [1, NKV, SEQ, HD]
+        ref_out = torch.nn.functional.scaled_dot_product_attention(
+            Q_sdpa, K_sdpa, V_sdpa, is_causal=True
+        ).squeeze(0)  # [NQ, SEQ, HD]
+
+        fa4_out = fa4.forward(Q_fa4, K_fa4, V_fa4, FA4_SCALE, True, False)[0]
+        fa4_diff = (fa4_out.float() - ref_out.float()).abs().max().item()
+        results["fa4_attention"] = {"max_diff": fa4_diff, "pass": fa4_diff < 0.01}
+        print(f"[FA4] CUTLASS FMHA: max_diff={fa4_diff:.8f} {'PASS' if fa4_diff < 0.01 else 'FAIL'}")
 
     # ============================
     # Summary
