@@ -14,12 +14,8 @@
 namespace kernels {
 
 // Vectorized kernel: processes 4 elements at a time via float4
-__global__ void silu_multiply_kernel(
-    float*       output,
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    int N
-) {
+__global__ void silu_multiply_kernel(float* output, const float* __restrict__ gate, const float* __restrict__ up,
+                                     int N) {
     int vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int idx = vec_idx * 4;
 
@@ -38,13 +34,8 @@ __global__ void silu_multiply_kernel(
 }
 
 // Scalar tail kernel: handles remaining elements not divisible by 4
-__global__ void silu_multiply_kernel_tail(
-    float*       output,
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    int start,
-    int N
-) {
+__global__ void silu_multiply_kernel_tail(float* output, const float* __restrict__ gate, const float* __restrict__ up,
+                                          int start, int N) {
     int idx = start + blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
         float g = gate[idx];

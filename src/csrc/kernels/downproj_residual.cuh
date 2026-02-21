@@ -1,6 +1,6 @@
 #pragma once
 
-#include "qwen3_dims.cuh"
+#include "qwen3.cuh"
 #include "utils.cuh"
 #include "../profiler/gpu_profiler.cuh"
 
@@ -15,16 +15,17 @@ enum : int {
 /*
  * Down Projection + Residual Add
  *
- * proj = down_proj_w @ silu_out   (matvec: [HIDDEN_DIM, INTERMEDIATE_DIM] @ [INTERMEDIATE_DIM])
- * hidden_states += proj           (residual)
+ * proj = down_proj_w @ silu_out   (matvec: [QWEN3_1_7B.hidden_size, QWEN3_1_7B.intermediate_size] @
+ * [QWEN3_1_7B.intermediate_size]) hidden_states += proj           (residual)
  *
  * Shared memory layout:
  *   prof = profiler state only
  */
-__device__ void downproj_residual_device(float* hidden_states,                  // [HIDDEN_DIM] — in/out
-                                         const float* __restrict__ silu_out,    // [INTERMEDIATE_DIM]
-                                         const float* __restrict__ down_proj_w, // [HIDDEN_DIM, INTERMEDIATE_DIM]
-                                         profiler::event_record* g_events, int* g_counts) {
+__device__ void downproj_residual_device(
+    float* hidden_states,                  // [QWEN3_1_7B.hidden_size] — in/out
+    const float* __restrict__ silu_out,    // [QWEN3_1_7B.intermediate_size]
+    const float* __restrict__ down_proj_w, // [QWEN3_1_7B.hidden_size, QWEN3_1_7B.intermediate_size]
+    profiler::event_record* g_events, int* g_counts) {
     using namespace downproj_events;
     bool has_profiler = (g_events != nullptr);
 
@@ -45,17 +46,17 @@ __device__ void downproj_residual_device(float* hidden_states,                  
     {
         constexpr int ILP = 4;
         const float4* input4 = reinterpret_cast<const float4*>(silu_out);
-        for (int out_base = tid * ILP; out_base < HIDDEN_DIM; out_base += num_threads * ILP) {
+        for (int out_base = tid * ILP; out_base < QWEN3_1_7B.hidden_size; out_base += num_threads * ILP) {
             float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
             const float4* row0 =
-                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 0) * INTERMEDIATE_DIM);
+                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 0) * QWEN3_1_7B.intermediate_size);
             const float4* row1 =
-                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 1) * INTERMEDIATE_DIM);
+                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 1) * QWEN3_1_7B.intermediate_size);
             const float4* row2 =
-                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 2) * INTERMEDIATE_DIM);
+                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 2) * QWEN3_1_7B.intermediate_size);
             const float4* row3 =
-                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 3) * INTERMEDIATE_DIM);
-            for (int j = 0; j < INTERMEDIATE_DIM / 4; j++) {
+                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 3) * QWEN3_1_7B.intermediate_size);
+            for (int j = 0; j < QWEN3_1_7B.intermediate_size / 4; j++) {
                 float4 x = input4[j];
                 float4 w0 = __ldcg(row0 + j);
                 acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;

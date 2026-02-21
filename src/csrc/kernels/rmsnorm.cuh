@@ -1,6 +1,6 @@
 #pragma once
 
-#include "qwen3_dims.cuh"
+#include "qwen3.cuh"
 #include "utils.cuh"
 
 namespace kernels {
@@ -16,18 +16,9 @@ namespace kernels {
  * Requires `shared_reduce` to have at least WARP_SIZE floats of shared memory.
  * Caller must __syncthreads() after this returns before reading `output`.
  */
-__device__ __forceinline__ void rmsnorm(
-    float*       output,
-    const float* input,
-    const float* weight,
-    int          dim,
-    float*       shared_reduce,
-    int          tid,
-    int          num_threads,
-    int          lane_id,
-    int          warp_id,
-    int          num_warps
-) {
+__device__ __forceinline__ void rmsnorm(float* output, const float* input, const float* weight, int dim,
+                                        float* shared_reduce, int tid, int num_threads, int lane_id, int warp_id,
+                                        int num_warps) {
     float thread_ss = 0.0f;
     for (int i = tid; i < dim; i += num_threads) {
         float xi = input[i];
@@ -35,7 +26,7 @@ __device__ __forceinline__ void rmsnorm(
     }
 
     float total_ss = block_reduce_sum(thread_ss, shared_reduce, lane_id, warp_id, num_warps);
-    float rms = rsqrtf(total_ss / dim + EPS);
+    float rms = rsqrtf(total_ss / dim + QWEN3_1_7B.rms_norm_eps);
 
     for (int i = tid; i < dim; i += num_threads) {
         output[i] = input[i] * rms * weight[i];
@@ -51,18 +42,9 @@ __device__ __forceinline__ void rmsnorm(
  *
  * Caller must __syncthreads() between successive calls.
  */
-__device__ __forceinline__ void rmsnorm_per_head(
-    float*       data,
-    const float* weight,
-    int          num_heads,
-    int          head_dim,
-    float*       shared_reduce,
-    int          tid,
-    int          num_threads,
-    int          lane_id,
-    int          warp_id,
-    int          num_warps
-) {
+__device__ __forceinline__ void rmsnorm_per_head(float* data, const float* weight, int num_heads, int head_dim,
+                                                 float* shared_reduce, int tid, int num_threads, int lane_id,
+                                                 int warp_id, int num_warps) {
     for (int h = 0; h < num_heads; h++) {
         int offset = h * head_dim;
 
@@ -73,7 +55,7 @@ __device__ __forceinline__ void rmsnorm_per_head(
         }
 
         float total_head_ss = block_reduce_sum(head_ss, shared_reduce, lane_id, warp_id, num_warps);
-        float head_rms = rsqrtf(total_head_ss / head_dim + EPS);
+        float head_rms = rsqrtf(total_head_ss / head_dim + QWEN3_1_7B.rms_norm_eps);
 
         for (int i = tid; i < head_dim; i += num_threads) {
             data[offset + i] *= head_rms * weight[i];

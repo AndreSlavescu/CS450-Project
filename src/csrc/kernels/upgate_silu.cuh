@@ -1,6 +1,6 @@
 #pragma once
 
-#include "qwen3_dims.cuh"
+#include "qwen3.cuh"
 #include "utils.cuh"
 #include "rmsnorm.cuh"
 #include "silu.cuh"
@@ -22,27 +22,28 @@ enum : int {
  * RMSNorm + Gate/Up double MatVec + SiLU
  *
  * post_ln = RMSNorm(hidden_states, mlp_ln_w)
- * gate = gate_w @ post_ln          [INTERMEDIATE_DIM]
- * up   = up_w   @ post_ln          [INTERMEDIATE_DIM]
- * silu_out = SiLU(gate) * up        [INTERMEDIATE_DIM]
+ * gate = gate_w @ post_ln          [QWEN3_1_7B.intermediate_size]
+ * up   = up_w   @ post_ln          [QWEN3_1_7B.intermediate_size]
+ * silu_out = SiLU(gate) * up        [QWEN3_1_7B.intermediate_size]
  *
  * Shared memory layout:
- *   s_post_ln[HIDDEN_DIM]  = 2048 floats = 8 KB
+ *   s_post_ln[QWEN3_1_7B.hidden_size]  = 2048 floats = 8 KB
  *   s_reduce[WARP_SIZE]    = 32 floats   = 128 B
  *   prof                   = profiler state
  */
-__device__ void upgate_silu_device(float* silu_out,                    // [INTERMEDIATE_DIM] output
-                                   const float* __restrict__ hidden,   // [HIDDEN_DIM]
-                                   const float* __restrict__ mlp_ln_w, // [HIDDEN_DIM]
-                                   const float* __restrict__ gate_w,   // [INTERMEDIATE_DIM, HIDDEN_DIM]
-                                   const float* __restrict__ up_w,     // [INTERMEDIATE_DIM, HIDDEN_DIM]
-                                   profiler::event_record* g_events, int* g_counts) {
+__device__ void
+upgate_silu_device(float* silu_out,                    // [QWEN3_1_7B.intermediate_size] output
+                   const float* __restrict__ hidden,   // [QWEN3_1_7B.hidden_size]
+                   const float* __restrict__ mlp_ln_w, // [QWEN3_1_7B.hidden_size]
+                   const float* __restrict__ gate_w,   // [QWEN3_1_7B.intermediate_size, QWEN3_1_7B.hidden_size]
+                   const float* __restrict__ up_w,     // [QWEN3_1_7B.intermediate_size, QWEN3_1_7B.hidden_size]
+                   profiler::event_record* g_events, int* g_counts) {
     using namespace upgate_events;
     bool has_profiler = (g_events != nullptr);
 
     extern __shared__ char smem[];
     float* s_post_ln = reinterpret_cast<float*>(smem);
-    float* s_reduce = s_post_ln + HIDDEN_DIM;
+    float* s_reduce = s_post_ln + QWEN3_1_7B.hidden_size;
     profiler::block_state* prof = reinterpret_cast<profiler::block_state*>(s_reduce + kernels::WARP_SIZE);
 
     int tid = threadIdx.x;
@@ -59,7 +60,8 @@ __device__ void upgate_silu_device(float* silu_out,                    // [INTER
     if (tid == 0 && has_profiler)
         prof->record(EV_RMSNORM);
 
-    kernels::rmsnorm(s_post_ln, hidden, mlp_ln_w, HIDDEN_DIM, s_reduce, tid, num_threads, lane_id, warp_id, num_warps);
+    kernels::rmsnorm(s_post_ln, hidden, mlp_ln_w, QWEN3_1_7B.hidden_size, s_reduce, tid, num_threads, lane_id, warp_id,
+                     num_warps);
     __syncthreads();
 
     if (tid == 0 && has_profiler)
@@ -77,18 +79,26 @@ __device__ void upgate_silu_device(float* silu_out,                    // [INTER
     {
         constexpr int ILP = 4;
         const float4* input4 = reinterpret_cast<const float4*>(s_post_ln);
-        for (int out_base = tid * ILP; out_base < INTERMEDIATE_DIM; out_base += num_threads * ILP) {
+        for (int out_base = tid * ILP; out_base < QWEN3_1_7B.intermediate_size; out_base += num_threads * ILP) {
             float gate_acc0 = 0.0f, gate_acc1 = 0.0f, gate_acc2 = 0.0f, gate_acc3 = 0.0f;
             float up_acc0 = 0.0f, up_acc1 = 0.0f, up_acc2 = 0.0f, up_acc3 = 0.0f;
-            const float4* gr0 = reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 0) * HIDDEN_DIM);
-            const float4* gr1 = reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 1) * HIDDEN_DIM);
-            const float4* gr2 = reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 2) * HIDDEN_DIM);
-            const float4* gr3 = reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 3) * HIDDEN_DIM);
-            const float4* ur0 = reinterpret_cast<const float4*>(up_w + (long long)(out_base + 0) * HIDDEN_DIM);
-            const float4* ur1 = reinterpret_cast<const float4*>(up_w + (long long)(out_base + 1) * HIDDEN_DIM);
-            const float4* ur2 = reinterpret_cast<const float4*>(up_w + (long long)(out_base + 2) * HIDDEN_DIM);
-            const float4* ur3 = reinterpret_cast<const float4*>(up_w + (long long)(out_base + 3) * HIDDEN_DIM);
-            for (int j = 0; j < HIDDEN_DIM / 4; j++) {
+            const float4* gr0 =
+                reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 0) * QWEN3_1_7B.hidden_size);
+            const float4* gr1 =
+                reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 1) * QWEN3_1_7B.hidden_size);
+            const float4* gr2 =
+                reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 2) * QWEN3_1_7B.hidden_size);
+            const float4* gr3 =
+                reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 3) * QWEN3_1_7B.hidden_size);
+            const float4* ur0 =
+                reinterpret_cast<const float4*>(up_w + (long long)(out_base + 0) * QWEN3_1_7B.hidden_size);
+            const float4* ur1 =
+                reinterpret_cast<const float4*>(up_w + (long long)(out_base + 1) * QWEN3_1_7B.hidden_size);
+            const float4* ur2 =
+                reinterpret_cast<const float4*>(up_w + (long long)(out_base + 2) * QWEN3_1_7B.hidden_size);
+            const float4* ur3 =
+                reinterpret_cast<const float4*>(up_w + (long long)(out_base + 3) * QWEN3_1_7B.hidden_size);
+            for (int j = 0; j < QWEN3_1_7B.hidden_size / 4; j++) {
                 float4 x = input4[j];
                 float4 gw0 = __ldcg(gr0 + j);
                 gate_acc0 += gw0.x * x.x + gw0.y * x.y + gw0.z * x.z + gw0.w * x.w;

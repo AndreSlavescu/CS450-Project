@@ -1,9 +1,15 @@
 /*
- * qwen3_kernels.cu — Single compilation unit for all Qwen3-1.7B CUDA kernels.
+ * qwen3_kernels.cu — Persistent megakernel for Qwen3-1.7B single-token decode.
  *
- * This file contains:
- *   1. __global__ kernel wrappers that call __device__ functions from .cuh headers
- *   2. PyTorch C++ extension bindings (standard + profiled variants)
+ * Architecture follows the AlpinDale qwen_megakernel pattern:
+ *   - Qwen3LayerWeights struct (like LDGLayerWeights) bundles all per-layer ptrs
+ *   - AtomicGridSync replaces cooperative grid barriers
+ *   - qwen3_decode_persistent loops over all 28 layers in one launch:
+ *       per layer: QKV+RoPE → GQA attention → O-proj+MLP
+ *   - rms_lm_head at the end of the persistent kernel
+ *
+ * All per-op logic lives in __device__ functions (no additional __global__ wrappers
+ * except the one persistent kernel entry point).
  *
  * Compile via torch.utils.cpp_extension.load() with:
  *   extra_include_paths=["path/to/kernels", "path/to/profiler"]
@@ -17,9 +23,10 @@
 #include <cooperative_groups/reduce.h>
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <vector>
 
 // Device function headers
-#include "qwen3_dims.cuh"
+#include "qwen3.cuh"
 #include "utils.cuh"
 #include "rmsnorm.cuh"
 #include "silu.cuh"
@@ -30,313 +37,271 @@
 #include "rms_lm_head.cuh"
 
 // ============================================================
-// __global__ kernel wrappers
+// AtomicGridSync — atomic barrier for persistent kernels
+// (mirrors the AlpinDale qwen_megakernel pattern exactly)
 // ============================================================
 
-__global__ void qkv_rope_append_kernel(float* q_out, float* k_out, float* v_out, float* k_cache, float* v_cache,
-                                       const float* __restrict__ hidden, const float* __restrict__ attn_ln_w,
-                                       const float* __restrict__ qkv_weight, const float* __restrict__ q_norm_w,
-                                       const float* __restrict__ k_norm_w, const float* __restrict__ cos_cached,
-                                       const float* __restrict__ sin_cached, int pos_id, int max_seq_len,
-                                       profiler::event_record* g_events, int* g_counts) {
-    qkv_rope_append_device(q_out, k_out, v_out, k_cache, v_cache, hidden, attn_ln_w, qkv_weight, q_norm_w, k_norm_w,
-                           cos_cached, sin_cached, pos_id, max_seq_len, g_events, g_counts);
-}
+struct AtomicGridSync {
+    unsigned int* counter;
+    unsigned int* generation;
+    unsigned int nblocks;
+    unsigned int local_gen;
 
-__global__ void oproj_residual_kernel(float* hidden_states, const float* __restrict__ attn_out,
-                                      const float* __restrict__ o_proj_w, profiler::event_record* g_events,
-                                      int* g_counts) {
-    oproj_residual_device(hidden_states, attn_out, o_proj_w, g_events, g_counts);
-}
+    __device__ void sync() {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned int my_gen = local_gen;
+            asm volatile("fence.acq_rel.gpu;" ::: "memory");
+            unsigned int arrived = atomicAdd(counter, 1);
+            if (arrived == nblocks - 1) {
+                *counter = 0;
+                asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                atomicAdd(generation, 1);
+            } else {
+                volatile unsigned int* vgen = reinterpret_cast<volatile unsigned int*>(generation);
+                while (*vgen <= my_gen) {
+                }
+            }
+            local_gen = my_gen + 1;
+        }
+        __syncthreads();
+    }
+};
 
-__global__ void upgate_silu_kernel(float* silu_out, const float* __restrict__ hidden,
-                                   const float* __restrict__ mlp_ln_w, const float* __restrict__ gate_w,
-                                   const float* __restrict__ up_w, profiler::event_record* g_events, int* g_counts) {
-    upgate_silu_device(silu_out, hidden, mlp_ln_w, gate_w, up_w, g_events, g_counts);
-}
+// ============================================================
+// Qwen3LayerWeights — per-layer weight bundle (like LDGLayerWeights)
+// ============================================================
 
-__global__ void downproj_residual_kernel(float* hidden_states, const float* __restrict__ silu_out,
-                                         const float* __restrict__ down_proj_w, profiler::event_record* g_events,
-                                         int* g_counts) {
-    downproj_residual_device(hidden_states, silu_out, down_proj_w, g_events, g_counts);
-}
+struct Qwen3LayerWeights {
+    const float* attn_ln_w;   // [hidden_size]
+    const float* qkv_w;       // [qkv_dim, hidden_size]
+    const float* q_norm_w;    // [head_dim]
+    const float* k_norm_w;    // [head_dim]
+    const float* o_proj_w;    // [hidden_size, hidden_size]
+    const float* mlp_ln_w;    // [hidden_size]
+    const float* gate_w;      // [intermediate_size, hidden_size]
+    const float* up_w;        // [intermediate_size, hidden_size]
+    const float* down_proj_w; // [hidden_size, intermediate_size]
+    float* k_cache;           // [max_seq, kv_dim]
+    float* v_cache;           // [max_seq, kv_dim]
+};
 
-__global__ void rms_lm_head_kernel(float* logits, const float* __restrict__ hidden, const float* __restrict__ norm_w,
-                                   const float* __restrict__ lm_head_w, int vocab_size,
-                                   profiler::event_record* g_events, int* g_counts) {
-    rms_lm_head_device(logits, hidden, norm_w, lm_head_w, vocab_size, g_events, g_counts);
-}
-
-// ---------------------------------------------------------------------------
-// Megakernel: fuses post-attention + FFN ops into a single launch per layer.
+// ============================================================
+// GQA attention device function for single-token decode
 //
-// Execution order (all in one block, shared memory reused between phases):
-//   1. oproj_residual  — O-projection + residual add into hidden_states
-//   2. upgate_silu     — RMSNorm + gate/up MatVec + fused SiLU*up
-//   3. downproj_residual — Down-projection + residual add into hidden_states
-//
-// Replaces 3 separate kernel launches with 1, saving ~2 launches per layer
-// (56 launches across all 28 Qwen3-1.7B layers).
-//
-// Shared memory: max of the three devices = upgate layout
-//   = (HIDDEN_DIM + WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state)
-// ---------------------------------------------------------------------------
-__global__ void megakernel_layer_kernel(float* hidden_states,                   // [HIDDEN_DIM] in/out
-                                        float* silu_buf,                        // [INTERMEDIATE_DIM] scratch
-                                        const float* __restrict__ attn_out,     // [HIDDEN_DIM] from attention
-                                        const float* __restrict__ o_proj_w,     // [HIDDEN_DIM, HIDDEN_DIM]
-                                        const float* __restrict__ mlp_ln_w,     // [HIDDEN_DIM]
-                                        const float* __restrict__ gate_w,       // [INTERMEDIATE_DIM, HIDDEN_DIM]
-                                        const float* __restrict__ up_w,         // [INTERMEDIATE_DIM, HIDDEN_DIM]
-                                        const float* __restrict__ down_proj_w) {// [HIDDEN_DIM, INTERMEDIATE_DIM]
-    // Phase 1: O-proj + residual (ends with __syncthreads internally)
-    oproj_residual_device(hidden_states, attn_out, o_proj_w, nullptr, nullptr);
+// Reads Q from global g_q [q_dim] and K/V from the KV cache
+// [seq_len, kv_dim], writes result to attn_out [q_dim].
+// Uses smem[0..WARP_SIZE) as scratch for block reductions.
+// ============================================================
 
-    // Phase 2: RMSNorm + gate/up MatVec + SiLU (ends with __syncthreads internally)
-    upgate_silu_device(silu_buf, hidden_states, mlp_ln_w, gate_w, up_w, nullptr, nullptr);
+__device__ void attention_gqa_device(float* attn_out,      // [q_dim]
+                                     const float* g_q,     // [q_dim]
+                                     const float* k_cache, // [seq_len, kv_dim]
+                                     const float* v_cache, // [seq_len, kv_dim]
+                                     int seq_len, float scale) {
+    constexpr int num_q_heads = QWEN3_1_7B.num_attention_heads;
+    constexpr int num_kv_heads = QWEN3_1_7B.num_key_value_heads;
+    constexpr int head_dim = QWEN3_1_7B.head_dim;
+    constexpr int kv_dim = num_kv_heads * head_dim;
+    constexpr int gqa_ratio = QWEN3_1_7B.gqa_ratio();
 
-    // Phase 3: Down-proj + residual (ends with __syncthreads internally)
-    downproj_residual_device(hidden_states, silu_buf, down_proj_w, nullptr, nullptr);
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int lane_id = tid % kernels::WARP_SIZE;
+    int warp_id = tid / kernels::WARP_SIZE;
+    int num_warps = num_threads / kernels::WARP_SIZE;
+
+    using kernels::block_reduce_sum;
+
+    // Reuse smem[0..WARP_SIZE) as reduction scratch — safe since previous
+    // device function has completed and synced.
+    extern __shared__ char smem[];
+    float* s_reduce = reinterpret_cast<float*>(smem);
+
+    for (int kv_h = 0; kv_h < num_kv_heads; kv_h++) {
+        for (int g = 0; g < gqa_ratio; g++) {
+            int q_h = kv_h * gqa_ratio + g;
+            const float* q_head = g_q + q_h * head_dim;
+            float* out_head = attn_out + q_h * head_dim;
+
+            float m = -INFINITY; // running max
+            float denom = 0.0f;  // running denominator
+            int my_d = (tid < head_dim) ? tid : -1;
+            float acc = 0.0f;
+
+            for (int pos = 0; pos < seq_len; pos++) {
+                const float* k_pos = k_cache + (long long)pos * kv_dim + kv_h * head_dim;
+                const float* v_pos = v_cache + (long long)pos * kv_dim + kv_h * head_dim;
+
+                // Dot product over head_dim — threads stride, then block reduce
+                float thread_dot = 0.0f;
+                for (int d = tid; d < head_dim; d += num_threads) {
+                    thread_dot += q_head[d] * k_pos[d];
+                }
+                float score = block_reduce_sum(thread_dot, s_reduce, lane_id, warp_id, num_warps) * scale;
+
+                // Online softmax update
+                float m_new = fmaxf(m, score);
+                float alpha = expf(m - m_new);
+                float beta = expf(score - m_new);
+                denom = denom * alpha + beta;
+                m = m_new;
+
+                if (my_d >= 0) {
+                    acc = acc * alpha + beta * v_pos[my_d];
+                }
+                __syncthreads();
+            }
+
+            if (my_d >= 0) {
+                out_head[my_d] = acc / denom;
+            }
+            __syncthreads();
+        }
+    }
 }
 
 // ============================================================
-// PyTorch bindings — standard (no profiling)
+// Persistent decode kernel — one launch, all 28 layers
+//
+// Follows the AlpinDale ldg_decode_kernel_persistent pattern:
+//   for each layer: QKV+RoPE → attention → O-proj+MLP
+//   after all layers: RMSNorm + LM head
 // ============================================================
 
-std::vector<torch::Tensor> qkv_rope_append_forward(torch::Tensor hidden, torch::Tensor attn_ln_w,
-                                                   torch::Tensor qkv_weight, torch::Tensor q_norm_w,
-                                                   torch::Tensor k_norm_w, torch::Tensor cos_cached,
-                                                   torch::Tensor sin_cached, torch::Tensor k_cache,
-                                                   torch::Tensor v_cache, int pos_id) {
-    int max_seq_len = k_cache.size(0);
-    auto q_out = torch::empty({Q_DIM}, hidden.options());
-    auto k_out = torch::empty({K_DIM}, hidden.options());
-    auto v_out = torch::empty({V_DIM}, hidden.options());
+__global__ void qwen3_decode_persistent(float* hidden,     // [hidden_size] — token hidden state, updated in-place
+                                        float* g_q,        // [q_dim]       — scratch for Q (persists into attention)
+                                        float* g_k,        // [kv_dim]      — scratch for K output (redundant w/ cache)
+                                        float* g_v,        // [kv_dim]      — scratch for V output (redundant w/ cache)
+                                        float* g_attn_out, // [q_dim]       — scratch for attention output
+                                        float* g_silu,     // [intermediate_size] — scratch for SiLU*up
+                                        const Qwen3LayerWeights* __restrict__ layer_weights, // [num_layers]
+                                        const float* __restrict__ cos_cache,                 // [max_seq, head_dim]
+                                        const float* __restrict__ sin_cache,                 // [max_seq, head_dim]
+                                        int pos_id, int max_seq_len,
+                                        const float* __restrict__ norm_w,    // [hidden_size]  — final RMSNorm
+                                        const float* __restrict__ lm_head_w, // [vocab_size, hidden_size]
+                                        int vocab_size,
+                                        float* logits, // [vocab_size] — output
+                                        unsigned int* sync_counter, unsigned int* sync_generation) {
+    constexpr int num_layers = QWEN3_1_7B.num_hidden_layers;
+    constexpr float attn_scale = QWEN3_1_7B.attn_scale();
 
-    const int block_size = 256;
-    size_t smem_bytes = (HIDDEN_DIM + QKV_DIM + kernels::WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state);
+    AtomicGridSync grid_sync = {sync_counter, sync_generation, gridDim.x, 0};
 
-    qkv_rope_append_kernel<<<1, block_size, smem_bytes>>>(
-        q_out.data_ptr<float>(), k_out.data_ptr<float>(), v_out.data_ptr<float>(), k_cache.data_ptr<float>(),
-        v_cache.data_ptr<float>(), hidden.data_ptr<float>(), attn_ln_w.data_ptr<float>(), qkv_weight.data_ptr<float>(),
-        q_norm_w.data_ptr<float>(), k_norm_w.data_ptr<float>(), cos_cached.data_ptr<float>(),
-        sin_cached.data_ptr<float>(), pos_id, max_seq_len, nullptr, nullptr);
+    for (int layer = 0; layer < num_layers; layer++) {
+        const Qwen3LayerWeights& w = layer_weights[layer];
 
-    return {q_out, k_out, v_out};
+        const float* cos_pos = cos_cache + (long long)pos_id * QWEN3_1_7B.head_dim;
+        const float* sin_pos = sin_cache + (long long)pos_id * QWEN3_1_7B.head_dim;
+
+        // --- Phase 1: QKV projection + Q/K RMSNorm + RoPE + KV cache write ---
+        qkv_rope_append_device(g_q, g_k, g_v, w.k_cache, w.v_cache, hidden, w.attn_ln_w, w.qkv_w, w.q_norm_w,
+                               w.k_norm_w, cos_pos, sin_pos, pos_id, max_seq_len, nullptr, nullptr);
+        grid_sync.sync();
+
+        // --- Phase 2: GQA attention (reads g_q + KV cache, writes g_attn_out) ---
+        attention_gqa_device(g_attn_out, g_q, w.k_cache, w.v_cache, pos_id + 1, attn_scale);
+        grid_sync.sync();
+
+        // --- Phase 3: O-proj + residual + MLP ---
+        oproj_residual_device(hidden, g_attn_out, w.o_proj_w, nullptr, nullptr);
+        upgate_silu_device(g_silu, hidden, w.mlp_ln_w, w.gate_w, w.up_w, nullptr, nullptr);
+        downproj_residual_device(hidden, g_silu, w.down_proj_w, nullptr, nullptr);
+        grid_sync.sync();
+    }
+
+    // --- Final: RMSNorm + LM head projection ---
+    rms_lm_head_device(logits, hidden, norm_w, lm_head_w, vocab_size, nullptr, nullptr);
 }
 
-torch::Tensor oproj_residual_forward(torch::Tensor hidden_states, torch::Tensor attn_out, torch::Tensor o_proj_w) {
-    auto output = hidden_states.clone();
-    const int block_size = 256;
-    size_t smem_bytes = HIDDEN_DIM * sizeof(float) + sizeof(profiler::block_state);
+// ============================================================
+// PyTorch binding — persistent full-model decode
+// ============================================================
 
-    oproj_residual_kernel<<<1, block_size, smem_bytes>>>(output.data_ptr<float>(), attn_out.data_ptr<float>(),
-                                                         o_proj_w.data_ptr<float>(), nullptr, nullptr);
+torch::Tensor
+qwen3_decode_persistent_forward(torch::Tensor hidden,       // [hidden_size]
+                                torch::Tensor attn_ln_ws,   // [num_layers, hidden_size]
+                                torch::Tensor qkv_weights,  // [num_layers, qkv_dim * hidden_size] (contiguous)
+                                torch::Tensor q_norm_ws,    // [num_layers, head_dim]
+                                torch::Tensor k_norm_ws,    // [num_layers, head_dim]
+                                torch::Tensor cos_cache,    // [max_seq, head_dim]
+                                torch::Tensor sin_cache,    // [max_seq, head_dim]
+                                torch::Tensor k_caches,     // [num_layers, max_seq * kv_dim] (contiguous)
+                                torch::Tensor v_caches,     // [num_layers, max_seq * kv_dim] (contiguous)
+                                torch::Tensor o_proj_ws,    // [num_layers, hidden_size * hidden_size]
+                                torch::Tensor mlp_ln_ws,    // [num_layers, hidden_size]
+                                torch::Tensor gate_ws,      // [num_layers, intermediate_size * hidden_size]
+                                torch::Tensor up_ws,        // [num_layers, intermediate_size * hidden_size]
+                                torch::Tensor down_proj_ws, // [num_layers, hidden_size * intermediate_size]
+                                torch::Tensor norm_w,       // [hidden_size]
+                                torch::Tensor lm_head_w,    // [vocab_size, hidden_size]
+                                int pos_id) {
+    constexpr int hidden_size = QWEN3_1_7B.hidden_size;
+    constexpr int q_dim = QWEN3_1_7B.num_attention_heads * QWEN3_1_7B.head_dim;
+    constexpr int kv_dim = QWEN3_1_7B.num_key_value_heads * QWEN3_1_7B.head_dim;
+    constexpr int qkv_dim = QWEN3_1_7B.qkv_output_dim();
+    constexpr int intermediate_size = QWEN3_1_7B.intermediate_size;
+    constexpr int head_dim = QWEN3_1_7B.head_dim;
+    constexpr int num_layers = QWEN3_1_7B.num_hidden_layers;
 
-    return output;
-}
+    // k_caches shape is [num_layers, max_seq * kv_dim]; size(1) = max_seq * kv_dim
+    int max_seq_len = static_cast<int>(k_caches.size(1)) / kv_dim;
+    int vocab_size = static_cast<int>(lm_head_w.size(0));
 
-torch::Tensor upgate_silu_forward(torch::Tensor hidden, torch::Tensor mlp_ln_w, torch::Tensor gate_w,
-                                  torch::Tensor up_w) {
-    auto silu_out = torch::empty({INTERMEDIATE_DIM}, hidden.options());
-    const int block_size = 256;
-    size_t smem_bytes = (HIDDEN_DIM + kernels::WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state);
+    // Build Qwen3LayerWeights host array, then copy to device
+    std::vector<Qwen3LayerWeights> h_weights(num_layers);
+    for (int l = 0; l < num_layers; l++) {
+        h_weights[l].attn_ln_w = attn_ln_ws.data_ptr<float>() + (long long)l * hidden_size;
+        h_weights[l].qkv_w = qkv_weights.data_ptr<float>() + (long long)l * qkv_dim * hidden_size;
+        h_weights[l].q_norm_w = q_norm_ws.data_ptr<float>() + (long long)l * head_dim;
+        h_weights[l].k_norm_w = k_norm_ws.data_ptr<float>() + (long long)l * head_dim;
+        h_weights[l].o_proj_w = o_proj_ws.data_ptr<float>() + (long long)l * hidden_size * hidden_size;
+        h_weights[l].mlp_ln_w = mlp_ln_ws.data_ptr<float>() + (long long)l * hidden_size;
+        h_weights[l].gate_w = gate_ws.data_ptr<float>() + (long long)l * intermediate_size * hidden_size;
+        h_weights[l].up_w = up_ws.data_ptr<float>() + (long long)l * intermediate_size * hidden_size;
+        h_weights[l].down_proj_w = down_proj_ws.data_ptr<float>() + (long long)l * hidden_size * intermediate_size;
+        h_weights[l].k_cache = k_caches.data_ptr<float>() + (long long)l * max_seq_len * kv_dim;
+        h_weights[l].v_cache = v_caches.data_ptr<float>() + (long long)l * max_seq_len * kv_dim;
+    }
 
-    upgate_silu_kernel<<<1, block_size, smem_bytes>>>(silu_out.data_ptr<float>(), hidden.data_ptr<float>(),
-                                                      mlp_ln_w.data_ptr<float>(), gate_w.data_ptr<float>(),
-                                                      up_w.data_ptr<float>(), nullptr, nullptr);
+    Qwen3LayerWeights* d_weights;
+    cudaMalloc(&d_weights, num_layers * sizeof(Qwen3LayerWeights));
+    cudaMemcpy(d_weights, h_weights.data(), num_layers * sizeof(Qwen3LayerWeights), cudaMemcpyHostToDevice);
 
-    return silu_out;
-}
-
-torch::Tensor downproj_residual_forward(torch::Tensor hidden_states, torch::Tensor silu_out,
-                                        torch::Tensor down_proj_w) {
-    auto output = hidden_states.clone();
-    const int block_size = 256;
-    size_t smem_bytes = sizeof(profiler::block_state);
-
-    downproj_residual_kernel<<<1, block_size, smem_bytes>>>(output.data_ptr<float>(), silu_out.data_ptr<float>(),
-                                                            down_proj_w.data_ptr<float>(), nullptr, nullptr);
-
-    return output;
-}
-
-torch::Tensor rms_lm_head_forward(torch::Tensor hidden, torch::Tensor norm_w, torch::Tensor lm_head_w, int vocab_size) {
+    // Scratch buffers
+    auto output_hidden = hidden.clone();
+    auto g_q = torch::empty({q_dim}, hidden.options());
+    auto g_k = torch::empty({kv_dim}, hidden.options());
+    auto g_v = torch::empty({kv_dim}, hidden.options());
+    auto g_attn_out = torch::empty({q_dim}, hidden.options());
+    auto g_silu = torch::empty({intermediate_size}, hidden.options());
     auto logits = torch::empty({vocab_size}, hidden.options());
+
+    // AtomicGridSync state
+    auto sync_ctr = torch::zeros({1}, torch::dtype(torch::kInt32).device(hidden.device()));
+    auto sync_gen = torch::zeros({1}, torch::dtype(torch::kInt32).device(hidden.device()));
+
     const int block_size = 256;
-    size_t smem_bytes = (HIDDEN_DIM + kernels::WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state);
+    const int grid_size = 1; // single block; AtomicGridSync ready for multi-block expansion
+    // smem: max across all phases = QKV layout
+    size_t smem_bytes = (hidden_size + qkv_dim + kernels::WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state);
 
-    rms_lm_head_kernel<<<1, block_size, smem_bytes>>>(logits.data_ptr<float>(), hidden.data_ptr<float>(),
-                                                      norm_w.data_ptr<float>(), lm_head_w.data_ptr<float>(), vocab_size,
-                                                      nullptr, nullptr);
+    qwen3_decode_persistent<<<grid_size, block_size, smem_bytes>>>(
+        output_hidden.data_ptr<float>(), g_q.data_ptr<float>(), g_k.data_ptr<float>(), g_v.data_ptr<float>(),
+        g_attn_out.data_ptr<float>(), g_silu.data_ptr<float>(), d_weights, cos_cache.data_ptr<float>(),
+        sin_cache.data_ptr<float>(), pos_id, max_seq_len, norm_w.data_ptr<float>(), lm_head_w.data_ptr<float>(),
+        vocab_size, logits.data_ptr<float>(), reinterpret_cast<unsigned int*>(sync_ctr.data_ptr<int>()),
+        reinterpret_cast<unsigned int*>(sync_gen.data_ptr<int>()));
 
+    cudaFree(d_weights);
     return logits;
 }
 
-torch::Tensor megakernel_layer_forward(torch::Tensor hidden_states, torch::Tensor attn_out,
-                                       torch::Tensor o_proj_w, torch::Tensor mlp_ln_w, torch::Tensor gate_w,
-                                       torch::Tensor up_w, torch::Tensor down_proj_w) {
-    auto output = hidden_states.clone();
-    auto silu_buf = torch::empty({INTERMEDIATE_DIM}, hidden_states.options());
-    const int block_size = 256;
-    // Shared memory: max of the three device function layouts = upgate_silu's requirement
-    size_t smem_bytes = (HIDDEN_DIM + kernels::WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state);
-
-    megakernel_layer_kernel<<<1, block_size, smem_bytes>>>(
-        output.data_ptr<float>(), silu_buf.data_ptr<float>(), attn_out.data_ptr<float>(),
-        o_proj_w.data_ptr<float>(), mlp_ln_w.data_ptr<float>(), gate_w.data_ptr<float>(),
-        up_w.data_ptr<float>(), down_proj_w.data_ptr<float>());
-
-    return output;
-}
-
 // ============================================================
-// PyTorch bindings — profiled variants
-// ============================================================
-
-std::vector<torch::Tensor> qkv_rope_append_forward_profiled(torch::Tensor hidden, torch::Tensor attn_ln_w,
-                                                            torch::Tensor qkv_weight, torch::Tensor q_norm_w,
-                                                            torch::Tensor k_norm_w, torch::Tensor cos_cached,
-                                                            torch::Tensor sin_cached, torch::Tensor k_cache,
-                                                            torch::Tensor v_cache, int pos_id,
-                                                            const std::string& trace_path) {
-    int max_seq_len = k_cache.size(0);
-    auto q_out = torch::empty({Q_DIM}, hidden.options());
-    auto k_out = torch::empty({K_DIM}, hidden.options());
-    auto v_out = torch::empty({V_DIM}, hidden.options());
-
-    const int block_size = 256;
-    const int grid_size = 1;
-    size_t smem_bytes = (HIDDEN_DIM + QKV_DIM + kernels::WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state);
-
-    profiler::host_buffer prof_buf;
-    prof_buf.allocate(grid_size);
-
-    qkv_rope_append_kernel<<<grid_size, block_size, smem_bytes>>>(
-        q_out.data_ptr<float>(), k_out.data_ptr<float>(), v_out.data_ptr<float>(), k_cache.data_ptr<float>(),
-        v_cache.data_ptr<float>(), hidden.data_ptr<float>(), attn_ln_w.data_ptr<float>(), qkv_weight.data_ptr<float>(),
-        q_norm_w.data_ptr<float>(), k_norm_w.data_ptr<float>(), cos_cached.data_ptr<float>(),
-        sin_cached.data_ptr<float>(), pos_id, max_seq_len, prof_buf.d_events, prof_buf.d_counts);
-    cudaDeviceSynchronize();
-
-    profiler::event_names names;
-    names.set(qkv_rope_events::EV_RMSNORM, "rmsnorm");
-    names.set(qkv_rope_events::EV_MATVEC, "matvec");
-    names.set(qkv_rope_events::EV_QKNORM, "qk_norm");
-    names.set(qkv_rope_events::EV_ROPE, "rope");
-    names.set(qkv_rope_events::EV_CACHE, "kv_cache");
-
-    prof_buf.print_report(&names);
-    prof_buf.export_perfetto_json(trace_path.c_str(), &names, true);
-    prof_buf.free();
-
-    return {q_out, k_out, v_out};
-}
-
-torch::Tensor oproj_residual_forward_profiled(torch::Tensor hidden_states, torch::Tensor attn_out,
-                                              torch::Tensor o_proj_w, const std::string& trace_path) {
-    auto output = hidden_states.clone();
-    const int block_size = 256;
-    const int grid_size = 1;
-    size_t smem_bytes = HIDDEN_DIM * sizeof(float) + sizeof(profiler::block_state);
-
-    profiler::host_buffer prof_buf;
-    prof_buf.allocate(grid_size);
-
-    oproj_residual_kernel<<<grid_size, block_size, smem_bytes>>>(output.data_ptr<float>(), attn_out.data_ptr<float>(),
-                                                                 o_proj_w.data_ptr<float>(), prof_buf.d_events,
-                                                                 prof_buf.d_counts);
-    cudaDeviceSynchronize();
-
-    profiler::event_names names;
-    names.set(oproj_events::EV_MATVEC, "oproj_matvec_residual");
-
-    prof_buf.print_report(&names);
-    prof_buf.export_perfetto_json(trace_path.c_str(), &names, true);
-    prof_buf.free();
-
-    return output;
-}
-
-torch::Tensor upgate_silu_forward_profiled(torch::Tensor hidden, torch::Tensor mlp_ln_w, torch::Tensor gate_w,
-                                           torch::Tensor up_w, const std::string& trace_path) {
-    auto silu_out = torch::empty({INTERMEDIATE_DIM}, hidden.options());
-    const int block_size = 256;
-    const int grid_size = 1;
-    size_t smem_bytes = (HIDDEN_DIM + kernels::WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state);
-
-    profiler::host_buffer prof_buf;
-    prof_buf.allocate(grid_size);
-
-    upgate_silu_kernel<<<grid_size, block_size, smem_bytes>>>(
-        silu_out.data_ptr<float>(), hidden.data_ptr<float>(), mlp_ln_w.data_ptr<float>(), gate_w.data_ptr<float>(),
-        up_w.data_ptr<float>(), prof_buf.d_events, prof_buf.d_counts);
-    cudaDeviceSynchronize();
-
-    profiler::event_names names;
-    names.set(upgate_events::EV_RMSNORM, "rmsnorm");
-    names.set(upgate_events::EV_MATVEC, "upgate_matvec");
-    names.set(upgate_events::EV_SILU, "silu_mul");
-
-    prof_buf.print_report(&names);
-    prof_buf.export_perfetto_json(trace_path.c_str(), &names, true);
-    prof_buf.free();
-
-    return silu_out;
-}
-
-torch::Tensor downproj_residual_forward_profiled(torch::Tensor hidden_states, torch::Tensor silu_out,
-                                                 torch::Tensor down_proj_w, const std::string& trace_path) {
-    auto output = hidden_states.clone();
-    const int block_size = 256;
-    const int grid_size = 1;
-    size_t smem_bytes = sizeof(profiler::block_state);
-
-    profiler::host_buffer prof_buf;
-    prof_buf.allocate(grid_size);
-
-    downproj_residual_kernel<<<grid_size, block_size, smem_bytes>>>(
-        output.data_ptr<float>(), silu_out.data_ptr<float>(), down_proj_w.data_ptr<float>(), prof_buf.d_events,
-        prof_buf.d_counts);
-    cudaDeviceSynchronize();
-
-    profiler::event_names names;
-    names.set(downproj_events::EV_MATVEC, "downproj_matvec_residual");
-
-    prof_buf.print_report(&names);
-    prof_buf.export_perfetto_json(trace_path.c_str(), &names, true);
-    prof_buf.free();
-
-    return output;
-}
-
-torch::Tensor rms_lm_head_forward_profiled(torch::Tensor hidden, torch::Tensor norm_w, torch::Tensor lm_head_w,
-                                           int vocab_size, const std::string& trace_path) {
-    auto logits = torch::empty({vocab_size}, hidden.options());
-    const int block_size = 256;
-    const int grid_size = 1;
-    size_t smem_bytes = (HIDDEN_DIM + kernels::WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state);
-
-    profiler::host_buffer prof_buf;
-    prof_buf.allocate(grid_size);
-
-    rms_lm_head_kernel<<<grid_size, block_size, smem_bytes>>>(logits.data_ptr<float>(), hidden.data_ptr<float>(),
-                                                              norm_w.data_ptr<float>(), lm_head_w.data_ptr<float>(),
-                                                              vocab_size, prof_buf.d_events, prof_buf.d_counts);
-    cudaDeviceSynchronize();
-
-    profiler::event_names names;
-    names.set(lmhead_events::EV_RMSNORM, "rmsnorm");
-    names.set(lmhead_events::EV_MATVEC, "lm_head_matvec");
-
-    prof_buf.print_report(&names);
-    prof_buf.export_perfetto_json(trace_path.c_str(), &names, true);
-    prof_buf.free();
-
-    return logits;
-}
-
 // Standalone SiLU-Multiply (Rishu's vectorized implementation)
+// ============================================================
+
 torch::Tensor silu_multiply(torch::Tensor gate, torch::Tensor up) {
     TORCH_CHECK(gate.sizes() == up.sizes(), "gate and up must have same shape");
     auto output = torch::empty_like(gate);
@@ -364,34 +329,10 @@ torch::Tensor silu_multiply(torch::Tensor gate, torch::Tensor up) {
 // ============================================================
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // Op 2: QKV + Q/K Norm + RoPE + KV Cache Append
-    m.def("qkv_rope_append_forward", &qkv_rope_append_forward, "QKV + Q/K Norm + RoPE + KV Cache Append (CUDA)");
-    m.def("qkv_rope_append_forward_profiled", &qkv_rope_append_forward_profiled,
-          "QKV + Q/K Norm + RoPE + KV Cache Append with profiling (CUDA)");
-
-    // Op 5: O-Projection + Residual
-    m.def("oproj_residual_forward", &oproj_residual_forward, "O-Projection + Residual (CUDA)");
-    m.def("oproj_residual_forward_profiled", &oproj_residual_forward_profiled,
-          "O-Projection + Residual with profiling (CUDA)");
-
-    // Op 6: RMSNorm + Gate/Up + SiLU
-    m.def("upgate_silu_forward", &upgate_silu_forward, "RMSNorm + Gate/Up + SiLU (CUDA)");
-    m.def("upgate_silu_forward_profiled", &upgate_silu_forward_profiled,
-          "RMSNorm + Gate/Up + SiLU with profiling (CUDA)");
-
-    // Op 7: Down Projection + Residual
-    m.def("downproj_residual_forward", &downproj_residual_forward, "Down Projection + Residual (CUDA)");
-    m.def("downproj_residual_forward_profiled", &downproj_residual_forward_profiled,
-          "Down Projection + Residual with profiling (CUDA)");
-
-    // Op 8: RMSNorm + LM Head
-    m.def("rms_lm_head_forward", &rms_lm_head_forward, "RMSNorm + LM Head (CUDA)");
-    m.def("rms_lm_head_forward_profiled", &rms_lm_head_forward_profiled, "RMSNorm + LM Head with profiling (CUDA)");
+    // Persistent full-model decode: one launch per token across all 28 layers
+    m.def("qwen3_decode_persistent_forward", &qwen3_decode_persistent_forward,
+          "Persistent decode: all layers in one kernel launch (CUDA)");
 
     // Standalone SiLU-Multiply (vectorized)
     m.def("silu_multiply", &silu_multiply, "Fused SiLU-multiply: output = SiLU(gate) * up (vectorized)");
-
-    // Megakernel: fused post-attention + FFN in one launch
-    m.def("megakernel_layer_forward", &megakernel_layer_forward,
-          "Fused layer: oproj_residual + upgate_silu + downproj_residual (single kernel launch)");
 }
