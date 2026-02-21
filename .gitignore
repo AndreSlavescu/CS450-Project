@@ -1,2 +1,4 @@
 .vscode/*
 **/__pycache__/
+src/csrc/profiler/traces/
+!src/csrc/profiler/traces/README.md
