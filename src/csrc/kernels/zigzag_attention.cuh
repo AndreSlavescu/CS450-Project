@@ -28,7 +28,7 @@
 // Each GPU's combined causal work is equal, achieving near-perfect
 // load balance.
 //
-// The attention compute kernel is in fa4_attention.cuh.
+// The attention compute kernel is in fmha_attention.cuh.
 // The ring orchestration is in src/python/Qwen3/zigzag_ring.py.
 // This file provides the block assignment logic and NCCL ring helpers
 // used by the C++ zigzag_attention.cu reference path.

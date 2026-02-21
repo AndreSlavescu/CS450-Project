@@ -36,7 +36,7 @@ def zigzag_ring_attention(
     Returns:
         O:  [num_q_heads, local_seq_len, head_dim]  bf16
     """
-    import fa4_attention  # compiled CUDA module
+    import fmha_attention  # compiled CUDA module
 
     rank = dist.get_rank(comm_group)
     world_size = dist.get_world_size(comm_group)
@@ -79,9 +79,9 @@ def zigzag_ring_attention(
             recv_op = dist.irecv(next_kv, src=prev_rank, group=comm_group)
             ops = [send_op, recv_op]
 
-        # FA4 kernel: compute partial attention with LSE
+        # FMHA kernel: compute partial attention with LSE
         causal = step == 0  # causal only for self-block
-        result = fa4_attention.forward(
+        result = fmha_attention.forward(
             Q,
             K_tile,
             V_tile,

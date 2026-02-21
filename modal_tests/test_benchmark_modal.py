@@ -410,15 +410,15 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
     print(f"Building attention kernels with torch cpp_extension.load (GPU={gpu.upper()})")
     print(f"PyTorch version: {torch.__version__}")
 
-    fa4_attention = None
+    fmha_attention = None
     zigzag_attention = None
 
     if need_fa4:
-        fa4_build_dir = "/tmp/torch_ext_fa4_attention_bench"
+        fa4_build_dir = "/tmp/torch_ext_fmha_attention_bench"
         os.makedirs(fa4_build_dir, exist_ok=True)
-        fa4_attention = load(
-            name=f"fa4_attention_bench_{gpu.lower()}",
-            sources=[os.path.join(kernels_dir, "fa4_attention.cu")],
+        fmha_attention = load(
+            name=f"fmha_attention_bench_{gpu.lower()}",
+            sources=[os.path.join(kernels_dir, "fmha_attention.cu")],
             extra_include_paths=include_paths,
             extra_cflags=common_cflags,
             extra_cuda_cflags=common_cuda_flags,
@@ -443,7 +443,7 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
             build_directory=zigzag_build_dir,
         )
 
-    return fa4_attention, zigzag_attention
+    return fmha_attention, zigzag_attention
 
 
 def _attention_theoretical_metrics(cfg: ModelConfig, seq_len: int, causal: bool = True) -> dict:
@@ -500,7 +500,7 @@ def _run_attention_kernels_benchmark(
         os.environ["FA4_BLOCK_Q"] = str(fa4_block_q)
         os.environ["FA4_DUAL_CTA"] = "1" if fa4_dual_cta else "0"
 
-    fa4_attention, zigzag_attention = _build_attention_kernel_modules(gpu, kernels)
+    fmha_attention, zigzag_attention = _build_attention_kernel_modules(gpu, kernels)
 
     def _sdpa_math_context():
         # Prefer the newer API; fallback to legacy CUDA backend selector.
@@ -550,21 +550,21 @@ def _run_attention_kernels_benchmark(
 
             def _run_once():
                 if kernel_name == "fa4":
-                    if fa4_attention is None:
+                    if fmha_attention is None:
                         raise RuntimeError("fa4 module not built")
-                    return fa4_attention.forward(Q, K, V, scale, True, False, 0, 0, False, "")[0]
+                    return fmha_attention.forward(Q, K, V, scale, True, False, 0, 0, False, "")[0]
                 if kernel_name == "fa4_lse":
-                    if fa4_attention is None:
+                    if fmha_attention is None:
                         raise RuntimeError("fa4 module not built")
-                    return fa4_attention.forward(Q, K, V, scale, True, True, 0, 0, False, "")[0]
+                    return fmha_attention.forward(Q, K, V, scale, True, True, 0, 0, False, "")[0]
                 if kernel_name == "fa4_nocausal":
-                    if fa4_attention is None:
+                    if fmha_attention is None:
                         raise RuntimeError("fa4 module not built")
-                    return fa4_attention.forward(Q, K, V, scale, False, False, 0, 0, False, "")[0]
+                    return fmha_attention.forward(Q, K, V, scale, False, False, 0, 0, False, "")[0]
                 if kernel_name == "fa4_profile":
-                    if fa4_attention is None:
+                    if fmha_attention is None:
                         raise RuntimeError("fa4 module not built")
-                    return fa4_attention.forward(Q, K, V, scale, True, True, 0, 0, True, trace_path)[0]
+                    return fmha_attention.forward(Q, K, V, scale, True, True, 0, 0, True, trace_path)[0]
                 if kernel_name == "sdpa":
                     return F.scaled_dot_product_attention(Q_b, K_b, V_b, is_causal=True, enable_gqa=True).squeeze(0)
                 if kernel_name == "sdpa_math":

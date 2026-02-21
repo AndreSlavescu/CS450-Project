@@ -5,7 +5,7 @@
  *   - Qwen3LayerWeights struct (like LDGLayerWeights) bundles all per-layer ptrs
  *   - AtomicGridSync replaces cooperative grid barriers
  *   - qwen3_decode_persistent loops over all 28 layers in one launch:
- *       per layer: QKV+RoPE → GQA attention → O-proj+MLP
+ *       per layer: QKV+RoPE → flash-decode GQA attention → O-proj+MLP
  *   - rms_lm_head at the end of the persistent kernel
  *
  * All per-op logic lives in __device__ functions (no additional __global__ wrappers
@@ -87,77 +87,134 @@ struct Qwen3LayerWeights {
 };
 
 // ============================================================
-// GQA attention device function for single-token decode
+// Flash-decoding GQA attention — single-token decode
 //
-// Reads Q from global g_q [q_dim] and K/V from the KV cache
-// [seq_len, kv_dim], writes result to attn_out [q_dim].
-// Uses smem[0..WARP_SIZE) as scratch for block reductions.
+// Splits KV positions across num_warps warp groups. Each warp
+// independently computes partial (m, d, O) with warp-local online
+// softmax (warp shuffle reduces, zero cross-warp syncs in the hot
+// loop). After all KV positions are processed, warp 0 merges the
+// num_warps partial results via the standard log-sum-exp trick.
+//
+// Complexity: O(NUM_Q_HEADS) __syncthreads()
+//   vs        O(NUM_Q_HEADS * seq_len) for the naive block-reduce.
+//
+// smem layout (reuses the block's existing allocation):
+//   s_o: [num_warps][HEAD_DIM] float   — partial output
+//   s_m: [num_warps]           float   — partial row-max
+//   s_d: [num_warps]           float   — partial denominator
+//   Total: 8 * (128+2) * 4 = 4160 bytes  (<< QKV-phase smem ~24 KB)
 // ============================================================
 
-__device__ void attention_gqa_device(float* attn_out,      // [q_dim]
-                                     const float* g_q,     // [q_dim]
-                                     const float* k_cache, // [seq_len, kv_dim]
-                                     const float* v_cache, // [seq_len, kv_dim]
-                                     int seq_len, float scale) {
-    constexpr int num_q_heads = QWEN3_1_7B.num_attention_heads;
-    constexpr int num_kv_heads = QWEN3_1_7B.num_key_value_heads;
-    constexpr int head_dim = QWEN3_1_7B.head_dim;
-    constexpr int kv_dim = num_kv_heads * head_dim;
-    constexpr int gqa_ratio = QWEN3_1_7B.gqa_ratio();
+__device__ void flash_decode_gqa_device(float* attn_out,      // [q_dim]
+                                        const float* g_q,     // [q_dim]
+                                        const float* k_cache, // [max_seq, kv_dim]
+                                        const float* v_cache, // [max_seq, kv_dim]
+                                        int seq_len, float scale) {
+    constexpr int NUM_Q_HEADS = QWEN3_1_7B.num_attention_heads;   // 16
+    constexpr int NUM_KV_HEADS = QWEN3_1_7B.num_key_value_heads;  // 8
+    constexpr int HEAD_DIM = QWEN3_1_7B.head_dim;                 // 128
+    constexpr int KV_DIM = NUM_KV_HEADS * HEAD_DIM;               // 1024
+    constexpr int GQA_RATIO = QWEN3_1_7B.gqa_ratio();             // 2
+    constexpr int ELEMS_PER_LANE = HEAD_DIM / kernels::WARP_SIZE; // 4
 
-    int tid = threadIdx.x;
-    int num_threads = blockDim.x;
-    int lane_id = tid % kernels::WARP_SIZE;
-    int warp_id = tid / kernels::WARP_SIZE;
-    int num_warps = num_threads / kernels::WARP_SIZE;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int num_warps = blockDim.x >> 5; // 8
 
-    using kernels::block_reduce_sum;
+    extern __shared__ char smem_raw[];
+    float* s_o = reinterpret_cast<float*>(smem_raw); // [num_warps * HEAD_DIM]
+    float* s_m = s_o + num_warps * HEAD_DIM;         // [num_warps]
+    float* s_d = s_m + num_warps;                    // [num_warps]
 
-    // Reuse smem[0..WARP_SIZE) as reduction scratch — safe since previous
-    // device function has completed and synced.
-    extern __shared__ char smem[];
-    float* s_reduce = reinterpret_cast<float*>(smem);
+    // Split KV sequence evenly across warps
+    const int chunk = (seq_len + num_warps - 1) / num_warps;
+    const int kv_start = warp * chunk;
+    const int kv_end = min(kv_start + chunk, seq_len);
 
-    for (int kv_h = 0; kv_h < num_kv_heads; kv_h++) {
-        for (int g = 0; g < gqa_ratio; g++) {
-            int q_h = kv_h * gqa_ratio + g;
-            const float* q_head = g_q + q_h * head_dim;
-            float* out_head = attn_out + q_h * head_dim;
+    for (int q_h = 0; q_h < NUM_Q_HEADS; q_h++) {
+        const int kv_h = q_h / GQA_RATIO;
+        const float* q_head = g_q + q_h * HEAD_DIM;
 
-            float m = -INFINITY; // running max
-            float denom = 0.0f;  // running denominator
-            int my_d = (tid < head_dim) ? tid : -1;
-            float acc = 0.0f;
+        // Warp-local softmax state
+        float m_w = -INFINITY;
+        float d_w = 0.0f;
+        float o_w[ELEMS_PER_LANE] = {};
 
-            for (int pos = 0; pos < seq_len; pos++) {
-                const float* k_pos = k_cache + (long long)pos * kv_dim + kv_h * head_dim;
-                const float* v_pos = v_cache + (long long)pos * kv_dim + kv_h * head_dim;
+        // Hot loop: no cross-warp syncs — warp-internal shuffle only
+        for (int pos = kv_start; pos < kv_end; pos++) {
+            const float* k = k_cache + (long long)pos * KV_DIM + kv_h * HEAD_DIM;
+            const float* v = v_cache + (long long)pos * KV_DIM + kv_h * HEAD_DIM;
 
-                // Dot product over head_dim — threads stride, then block reduce
-                float thread_dot = 0.0f;
-                for (int d = tid; d < head_dim; d += num_threads) {
-                    thread_dot += q_head[d] * k_pos[d];
-                }
-                float score = block_reduce_sum(thread_dot, s_reduce, lane_id, warp_id, num_warps) * scale;
-
-                // Online softmax update
-                float m_new = fmaxf(m, score);
-                float alpha = expf(m - m_new);
-                float beta = expf(score - m_new);
-                denom = denom * alpha + beta;
-                m = m_new;
-
-                if (my_d >= 0) {
-                    acc = acc * alpha + beta * v_pos[my_d];
-                }
-                __syncthreads();
+            // QK dot: each lane sums ELEMS_PER_LANE terms, then warp-reduce
+            float dot = 0.0f;
+#pragma unroll
+            for (int d = lane; d < HEAD_DIM; d += kernels::WARP_SIZE) {
+                dot += q_head[d] * k[d];
             }
-
-            if (my_d >= 0) {
-                out_head[my_d] = acc / denom;
+#pragma unroll
+            for (int s = 16; s > 0; s >>= 1) {
+                dot += __shfl_down_sync(0xffffffff, dot, s);
             }
-            __syncthreads();
+            const float score = __shfl_sync(0xffffffff, dot, 0) * scale;
+
+            // Warp-local online softmax update
+            const float m_new = fmaxf(m_w, score);
+            const float alpha = expf(m_w - m_new);
+            const float beta = expf(score - m_new);
+            d_w = d_w * alpha + beta;
+            m_w = m_new;
+
+            // Accumulate V: lane l owns dims [l*4 .. l*4+3] (coalesced load)
+#pragma unroll
+            for (int i = 0; i < ELEMS_PER_LANE; i++) {
+                o_w[i] = o_w[i] * alpha + beta * v[lane * ELEMS_PER_LANE + i];
+            }
         }
+
+        // Store warp partial to smem (coalesced: lane l writes dims [l*4..l*4+3])
+#pragma unroll
+        for (int i = 0; i < ELEMS_PER_LANE; i++) {
+            s_o[warp * HEAD_DIM + lane * ELEMS_PER_LANE + i] = o_w[i];
+        }
+        if (lane == 0) {
+            s_m[warp] = m_w;
+            s_d[warp] = d_w;
+        }
+        __syncthreads();
+
+        // Warp 0: merge all partial (m, d, O) results via log-sum-exp
+        if (warp == 0) {
+            float m_acc = s_m[0];
+            float d_acc = s_d[0];
+            float o_acc[ELEMS_PER_LANE];
+#pragma unroll
+            for (int i = 0; i < ELEMS_PER_LANE; i++) {
+                o_acc[i] = s_o[lane * ELEMS_PER_LANE + i];
+            }
+
+            for (int w = 1; w < num_warps; w++) {
+                const float m_w2 = s_m[w];
+                const float d_w2 = s_d[w];
+                const float m_new2 = fmaxf(m_acc, m_w2);
+                const float a1 = expf(m_acc - m_new2);
+                const float a2 = expf(m_w2 - m_new2);
+                d_acc = d_acc * a1 + d_w2 * a2;
+                m_acc = m_new2;
+#pragma unroll
+                for (int i = 0; i < ELEMS_PER_LANE; i++) {
+                    o_acc[i] = o_acc[i] * a1 + s_o[w * HEAD_DIM + lane * ELEMS_PER_LANE + i] * a2;
+                }
+            }
+
+            // Normalize and write output (coalesced: lane l writes dims [l*4..l*4+3])
+            const float inv_d = 1.0f / d_acc;
+            float* out = attn_out + q_h * HEAD_DIM;
+#pragma unroll
+            for (int i = 0; i < ELEMS_PER_LANE; i++) {
+                out[lane * ELEMS_PER_LANE + i] = o_acc[i] * inv_d;
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -200,8 +257,8 @@ __global__ void qwen3_decode_persistent(float* hidden,     // [hidden_size] — 
                                w.k_norm_w, cos_pos, sin_pos, pos_id, max_seq_len, nullptr, nullptr);
         grid_sync.sync();
 
-        // --- Phase 2: GQA attention (reads g_q + KV cache, writes g_attn_out) ---
-        attention_gqa_device(g_attn_out, g_q, w.k_cache, w.v_cache, pos_id + 1, attn_scale);
+        // --- Phase 2: Flash-decode GQA attention (reads g_q + KV cache, writes g_attn_out) ---
+        flash_decode_gqa_device(g_attn_out, g_q, w.k_cache, w.v_cache, pos_id + 1, attn_scale);
         grid_sync.sync();
 
         // --- Phase 3: O-proj + residual + MLP ---
@@ -284,7 +341,8 @@ qwen3_decode_persistent_forward(torch::Tensor hidden,       // [hidden_size]
 
     const int block_size = 256;
     const int grid_size = 1; // single block; AtomicGridSync ready for multi-block expansion
-    // smem: max across all phases = QKV layout
+    // smem: max across all phases = QKV layout (~24 KB)
+    // flash-decode attention needs num_warps * (head_dim + 2) * 4 = 4160 B — well within budget
     size_t smem_bytes = (hidden_size + qkv_dim + kernels::WARP_SIZE) * sizeof(float) + sizeof(profiler::block_state);
 
     qwen3_decode_persistent<<<grid_size, block_size, smem_bytes>>>(
@@ -299,8 +357,29 @@ qwen3_decode_persistent_forward(torch::Tensor hidden,       // [hidden_size]
 }
 
 // ============================================================
-// Standalone SiLU-Multiply (Rishu's vectorized implementation)
+// SiLU-Multiply global kernels (private to this TU)
+// Call the device-function overloads in silu.cuh.
 // ============================================================
+
+namespace {
+__global__ void silu_multiply_vec_kernel(float* out, const float* __restrict__ gate, const float* __restrict__ up,
+                                         int N) {
+    int vi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vi * 4 + 3 < N) {
+        float4 g = reinterpret_cast<const float4*>(gate)[vi];
+        float4 u = reinterpret_cast<const float4*>(up)[vi];
+        reinterpret_cast<float4*>(out)[vi] = kernels::silu_multiply(g, u);
+    }
+}
+
+__global__ void silu_multiply_tail_kernel(float* out, const float* __restrict__ gate, const float* __restrict__ up,
+                                          int start, int N) {
+    int idx = start + blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        out[idx] = kernels::silu_multiply(gate[idx], up[idx]);
+    }
+}
+} // namespace
 
 torch::Tensor silu_multiply(torch::Tensor gate, torch::Tensor up) {
     TORCH_CHECK(gate.sizes() == up.sizes(), "gate and up must have same shape");
@@ -313,13 +392,13 @@ torch::Tensor silu_multiply(torch::Tensor gate, torch::Tensor up) {
 
     if (N_vec > 0) {
         int numBlocks = (N_vec + blockSize - 1) / blockSize;
-        kernels::silu_multiply_kernel<<<numBlocks, blockSize, 0, stream>>>(
-            output.data_ptr<float>(), gate.data_ptr<float>(), up.data_ptr<float>(), N);
+        silu_multiply_vec_kernel<<<numBlocks, blockSize, 0, stream>>>(output.data_ptr<float>(), gate.data_ptr<float>(),
+                                                                      up.data_ptr<float>(), N);
     }
     if (N_tail > 0) {
         int numBlocks = (N_tail + blockSize - 1) / blockSize;
-        kernels::silu_multiply_kernel_tail<<<numBlocks, blockSize, 0, stream>>>(
-            output.data_ptr<float>(), gate.data_ptr<float>(), up.data_ptr<float>(), N_vec * 4, N);
+        silu_multiply_tail_kernel<<<numBlocks, blockSize, 0, stream>>>(output.data_ptr<float>(), gate.data_ptr<float>(),
+                                                                       up.data_ptr<float>(), N_vec * 4, N);
     }
     return output;
 }

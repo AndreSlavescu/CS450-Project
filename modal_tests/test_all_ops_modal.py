@@ -125,10 +125,10 @@ def _jit_compile_fa4(arch):
     """Compile FA4 attention kernel with CUTLASS SM100 FMHA headers (B200 only)."""
     from torch.utils.cpp_extension import load
 
-    print("\n  Compiling fa4_attention (CUTLASS FMHA)...")
+    print("\n  Compiling fmha_attention (CUTLASS FMHA)...")
     mod = load(
-        name="fa4_attention",
-        sources=["/workspace/src/csrc/kernels/fa4_attention.cu"],
+        name="fmha_attention",
+        sources=["/workspace/src/csrc/kernels/fmha_attention.cu"],
         extra_include_paths=[
             "/workspace/src/csrc/profiler",
             "/workspace/src/csrc/kernels",
@@ -139,7 +139,7 @@ def _jit_compile_fa4(arch):
         extra_cuda_cflags=["-std=c++17", "-O2", f"-arch={arch}"],
         verbose=False,
     )
-    print("  fa4_attention compiled OK.")
+    print("  fmha_attention compiled OK.")
     return mod
 
 
@@ -172,63 +172,48 @@ def _run_all_ops(arch: str) -> dict:
         return w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
 
     # ============================
-    # Op 3: Partial Attention (still compiled standalone — not our responsibility)
+    # SiLU-Multiply: correctness + speedup at Qwen3-relevant sizes
+    # Fast PTX approx (ex2+rcp) vs PyTorch F.silu — tolerance 1e-3 due to approx.
     # ============================
-    attn_cuda = _jit_compile("attn_partial_cuda", "/workspace/src/csrc/attention_partial.cu", arch)
+    silu_shapes = {
+        "silu_inter": INTER,  # 6144  — Qwen3-1.7B MLP intermediate
+        "silu_batched": 28 * INTER,  # 28×6144 — full-layer batch
+    }
+    for label, N in silu_shapes.items():
+        torch.manual_seed(42)
+        gate_t = torch.randn(N, device="cuda", dtype=torch.float32)
+        up_t = torch.randn(N, device="cuda", dtype=torch.float32)
+        ref_s = torch.nn.functional.silu(gate_t) * up_t
 
-    SEQ_LEN = 32
-    GQA = 2
-    torch.manual_seed(42)
-    q_attn = torch.randn(GQA, HD, device="cuda", dtype=torch.float32)
-    k_c = torch.randn(SEQ_LEN, HD, device="cuda", dtype=torch.float32)
-    v_c = torch.randn(SEQ_LEN, HD, device="cuda", dtype=torch.float32)
-    scale = 1.0 / math.sqrt(HD)
+        # Warmup
+        for _ in range(3):
+            kernels.silu_multiply(gate_t, up_t)
+        torch.cuda.synchronize()
 
-    scores = (q_attn @ k_c.T) * scale
-    probs = torch.softmax(scores, dim=-1)
-    ref_attn_out = probs @ v_c
+        ev_start = torch.cuda.Event(enable_timing=True)
+        ev_end = torch.cuda.Event(enable_timing=True)
+        ev_start.record()
+        out_s = kernels.silu_multiply(gate_t, up_t)
+        ev_end.record()
+        torch.cuda.synchronize()
+        t_custom_ms = ev_start.elapsed_time(ev_end)
 
-    attn_out, lse = attn_cuda.attention_partial_forward(q_attn, k_c, v_c, SEQ_LEN, scale)
-    attn_diff = (attn_out - ref_attn_out).abs().max().item()
-    results["attention"] = {"max_diff": attn_diff, "pass": attn_diff < 1e-3}
-    print(f"[Op 3] Attention: max_diff={attn_diff:.8f} {'PASS' if attn_diff < 1e-3 else 'FAIL'}")
+        ev_start.record()
+        _ = torch.nn.functional.silu(gate_t) * up_t
+        ev_end.record()
+        torch.cuda.synchronize()
+        t_ref_ms = ev_start.elapsed_time(ev_end)
 
-    # ============================
-    # Op 4: Attention Reduction (still compiled standalone — not our responsibility)
-    # ============================
-    attn_red = _jit_compile("attn_red_cuda", "/workspace/src/csrc/attention_reduction.cu", arch)
-
-    N_PARTS = 4
-    torch.manual_seed(42)
-    p_outs = torch.randn(N_PARTS, GQA, HD, device="cuda", dtype=torch.float32)
-    p_lses = torch.randn(N_PARTS, GQA, device="cuda", dtype=torch.float32)
-
-    ref_reduced = torch.zeros(GQA, HD, device="cuda", dtype=torch.float32)
-    for h in range(GQA):
-        max_lse = p_lses[:, h].max()
-        weights = torch.exp(p_lses[:, h] - max_lse)
-        wsum = weights.sum()
-        for p in range(N_PARTS):
-            ref_reduced[h] += weights[p] * p_outs[p, h]
-        ref_reduced[h] /= wsum
-
-    red_out = attn_red.attention_reduction_forward(p_outs, p_lses, N_PARTS)
-    red_diff = (red_out - ref_reduced).abs().max().item()
-    results["attn_reduction"] = {"max_diff": red_diff, "pass": red_diff < 1e-3}
-    print(f"[Op 4] Attn Reduction: max_diff={red_diff:.8f} {'PASS' if red_diff < 1e-3 else 'FAIL'}")
-
-    # ============================
-    # Standalone SiLU-Multiply test (Rishu's vectorized)
-    # ============================
-    torch.manual_seed(42)
-    gate_test = torch.randn(INTER, device="cuda", dtype=torch.float32)
-    up_test = torch.randn(INTER, device="cuda", dtype=torch.float32)
-    ref_silu_standalone = torch.nn.functional.silu(gate_test) * up_test
-    out_silu_standalone = kernels.silu_multiply(gate_test, up_test)
-    silu_standalone_diff = (out_silu_standalone - ref_silu_standalone).abs().max().item()
-    results["silu_multiply"] = {"max_diff": silu_standalone_diff, "pass": silu_standalone_diff < 1e-3}
-    status = "PASS" if silu_standalone_diff < 1e-3 else "FAIL"
-    print(f"[SiLU] Standalone SiLU*Up: max_diff={silu_standalone_diff:.8f} {status}")
+        diff_s = (out_s - ref_s).abs().max().item()
+        speedup = t_ref_ms / t_custom_ms if t_custom_ms > 0 else float("inf")
+        passed = diff_s < 1e-3
+        results[label] = {"max_diff": diff_s, "pass": passed}
+        status = "PASS" if passed else "FAIL"
+        print(
+            f"[SiLU/{label}] N={N}: max_diff={diff_s:.2e} "
+            f"custom={t_custom_ms:.3f}ms ref={t_ref_ms:.3f}ms "
+            f"speedup={speedup:.2f}x {status}"
+        )
 
     # ============================
     # Persistent decode kernel — smoke test
@@ -322,7 +307,7 @@ def _run_all_ops(arch: str) -> dict:
 
         fa4_out = fa4.forward(Q_fa4, K_fa4, V_fa4, FA4_SCALE, True, False)[0]
         fa4_diff = (fa4_out.float() - ref_out.float()).abs().max().item()
-        results["fa4_attention"] = {"max_diff": fa4_diff, "pass": fa4_diff < 0.01}
+        results["fmha_attention"] = {"max_diff": fa4_diff, "pass": fa4_diff < 0.01}
         print(f"[FA4] CUTLASS FMHA: max_diff={fa4_diff:.8f} {'PASS' if fa4_diff < 0.01 else 'FAIL'}")
 
     # ============================

@@ -117,11 +117,11 @@ upgate_silu_device(float* silu_out,                    // [QWEN3_1_7B.intermedia
                 float4 uw3 = __ldcg(ur3 + j);
                 up_acc3 += uw3.x * x.x + uw3.y * x.y + uw3.z * x.z + uw3.w * x.w;
             }
-            // Fused SiLU(gate) * up using Rishu's scalar implementation
-            silu_out[out_base + 0] = kernels::silu_multiply_scalar(gate_acc0, up_acc0);
-            silu_out[out_base + 1] = kernels::silu_multiply_scalar(gate_acc1, up_acc1);
-            silu_out[out_base + 2] = kernels::silu_multiply_scalar(gate_acc2, up_acc2);
-            silu_out[out_base + 3] = kernels::silu_multiply_scalar(gate_acc3, up_acc3);
+            // Fused SiLU(gate) * up via fast PTX approx (rcp + ex2)
+            silu_out[out_base + 0] = kernels::silu_multiply(gate_acc0, up_acc0);
+            silu_out[out_base + 1] = kernels::silu_multiply(gate_acc1, up_acc1);
+            silu_out[out_base + 2] = kernels::silu_multiply(gate_acc2, up_acc2);
+            silu_out[out_base + 3] = kernels::silu_multiply(gate_acc3, up_acc3);
         }
     }
 

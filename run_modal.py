@@ -59,6 +59,7 @@ def run_hazy_h100():
 def run_hazy_b200():
     import os
     import sys
+
     import torch
 
     if "HF_TOKEN" not in os.environ:
@@ -75,15 +76,14 @@ def run_hazy_b200():
     print("Running Hazy megakernel demo...")
 
     os.chdir("/workspace/Megakernels")
-    os.system(
-        'python megakernels/scripts/generate.py mode=mk prompt="tell me a funny joke about cookies" ntok=100'
-    )
+    os.system('python megakernels/scripts/generate.py mode=mk prompt="tell me a funny joke about cookies" ntok=100')
     return "Hazy B200 job completed"
 
 
 @app.function(image=h100_image, gpu="H100", timeout=3600)
 def run_waterloo_h100():
     import sys
+
     import torch
 
     print("Running Waterloo SiLU implementation on H100.")
@@ -94,13 +94,13 @@ def run_waterloo_h100():
 
     # Add kernel directory to path
     sys.path.insert(0, "/workspace/src/csrc/kernels")
-    
+
     from silu_torch import test_against_pytorch
-    
+
     print("\nTesting SiLU kernel on H100...")
     results = test_against_pytorch(shape=(28, 6144), verbose=True)
-    
-    if results['pass_fused']:
+
+    if results["pass_fused"]:
         print("\n✓ Waterloo SiLU kernel test PASSED on H100")
         return "Waterloo H100 test passed"
     else:
@@ -111,6 +111,7 @@ def run_waterloo_h100():
 @app.function(image=b200_image, gpu="B200", timeout=3600)
 def run_waterloo_b200():
     import sys
+
     import torch
 
     print("Running Waterloo SiLU implementation on B200.")
@@ -121,13 +122,13 @@ def run_waterloo_b200():
 
     # Add kernel directory to path
     sys.path.insert(0, "/workspace/src/csrc/kernels")
-    
+
     from silu_torch import test_against_pytorch
-    
+
     print("\nTesting SiLU kernel on B200...")
     results = test_against_pytorch(shape=(28, 6144), verbose=True)
-    
-    if results['pass_fused']:
+
+    if results["pass_fused"]:
         print("\n✓ Waterloo SiLU kernel test PASSED on B200")
         return "Waterloo B200 test passed"
     else:

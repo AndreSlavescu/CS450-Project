@@ -3,7 +3,7 @@
 #include <cuda_bf16.h>
 #include <string>
 
-#include "fa4_attention.cuh"
+#include "fmha_attention.cuh"
 #include "qwen3.cuh"
 
 #ifndef FA4_PROFILE_DEFAULT
@@ -49,10 +49,10 @@ void fa4_check_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torc
 }
 } // namespace
 
-std::vector<torch::Tensor> fa4_attention_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale,
-                                                 bool causal, bool return_lse, int64_t q_offset, int64_t kv_offset,
-                                                 bool profile = static_cast<bool>(FA4_PROFILE_DEFAULT),
-                                                 const std::string& trace_path = "trace.json") {
+std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale,
+                                                  bool causal, bool return_lse, int64_t q_offset, int64_t kv_offset,
+                                                  bool profile = static_cast<bool>(FA4_PROFILE_DEFAULT),
+                                                  const std::string& trace_path = "trace.json") {
     fa4_check_inputs(Q, K, V);
 
     int num_q_heads = Q.size(0);
@@ -120,7 +120,7 @@ std::vector<torch::Tensor> fa4_attention_forward(torch::Tensor Q, torch::Tensor 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FA4 Forward Attention for Qwen3";
 
-    m.def("forward", &fa4_attention_forward, "FA4 forward attention (GQA, causal, optional LSE)", py::arg("Q"),
+    m.def("forward", &fmha_attention_forward, "FMHA forward attention (GQA, causal, optional LSE)", py::arg("Q"),
           py::arg("K"), py::arg("V"), py::arg("scale"), py::arg("causal") = true, py::arg("return_lse") = false,
           py::arg("q_offset") = 0, py::arg("kv_offset") = 0,
           py::arg("profile") = static_cast<bool>(FA4_PROFILE_DEFAULT), py::arg("trace_path") = "trace.json");
