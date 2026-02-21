@@ -69,12 +69,8 @@ def _build_image(gpu: str) -> modal.Image:
     )
     if gpu == "b200":
         # Clone CUTLASS for Blackwell SM100 FMHA kernel headers (FA4 attention)
-        img = img.run_commands(
-            "git clone --depth 1 https://github.com/NVIDIA/cutlass.git /workspace/cutlass"
-        )
-    return img.add_local_dir(
-        str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc"
-    )
+        img = img.run_commands("git clone --depth 1 https://github.com/NVIDIA/cutlass.git /workspace/cutlass")
+    return img.add_local_dir(str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc")
 
 
 _placeholder = modal.Image.debian_slim()
@@ -90,6 +86,7 @@ else:
 def _jit_compile_unified(arch):
     """Compile the unified qwen3_kernels.cu driver."""
     from torch.utils.cpp_extension import load
+
     print("\n  Compiling unified qwen3_kernels...")
     mod = load(
         name="qwen3_kernels",
@@ -108,6 +105,7 @@ def _jit_compile_unified(arch):
 def _jit_compile(name, source_file, arch):
     """Compile a standalone kernel (for attention ops that haven't been refactored)."""
     from torch.utils.cpp_extension import load
+
     print(f"\n  Compiling {name}...")
     mod = load(
         name=name,
@@ -126,6 +124,7 @@ def _jit_compile(name, source_file, arch):
 def _jit_compile_fa4(arch):
     """Compile FA4 attention kernel with CUTLASS SM100 FMHA headers (B200 only)."""
     from torch.utils.cpp_extension import load
+
     print("\n  Compiling fa4_attention (CUTLASS FMHA)...")
     mod = load(
         name="fa4_attention",
@@ -146,6 +145,7 @@ def _jit_compile_fa4(arch):
 
 def _run_all_ops(arch: str) -> dict:
     import math
+
     import torch
 
     os.chdir("/workspace")
@@ -157,9 +157,18 @@ def _run_all_ops(arch: str) -> dict:
     # Compile the unified driver (Ops 2, 5, 6, 7, 8 + SiLU)
     kernels = _jit_compile_unified(arch)
 
-    HIDDEN = 2048; NQ = 16; NKV = 8; HD = 128
-    Q_DIM = NQ * HD; K_DIM = NKV * HD; V_DIM = NKV * HD; QKV_DIM = Q_DIM + K_DIM + V_DIM
-    EPS = 1e-6; MAX_SEQ = 128; POS = 5; INTER = 6144
+    HIDDEN = 2048
+    NQ = 16
+    NKV = 8
+    HD = 128
+    Q_DIM = NQ * HD
+    K_DIM = NKV * HD
+    V_DIM = NKV * HD
+    QKV_DIM = Q_DIM + K_DIM + V_DIM
+    EPS = 1e-6
+    MAX_SEQ = 128
+    POS = 5
+    INTER = 6144
 
     def rmsnorm_fn(x, w, eps=1e-6):
         return w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
@@ -188,8 +197,8 @@ def _run_all_ops(arch: str) -> dict:
     ref_pln = rmsnorm_fn(hidden, attn_ln_w, EPS)
     ref_qkv = qkv_w @ ref_pln
     ref_q = ref_qkv[:Q_DIM].view(NQ, HD)
-    ref_k = ref_qkv[Q_DIM:Q_DIM+K_DIM].view(NKV, HD)
-    ref_v = ref_qkv[Q_DIM+K_DIM:].view(NKV, HD)
+    ref_k = ref_qkv[Q_DIM : Q_DIM + K_DIM].view(NKV, HD)
+    ref_v = ref_qkv[Q_DIM + K_DIM :].view(NKV, HD)
     for h in range(NQ):
         ref_q[h] = rmsnorm_fn(ref_q[h], q_norm_w, EPS)
     for h in range(NKV):
@@ -327,7 +336,32 @@ def _run_all_ops(arch: str) -> dict:
     out_silu_standalone = kernels.silu_multiply(gate_test, up_test)
     silu_standalone_diff = (out_silu_standalone - ref_silu_standalone).abs().max().item()
     results["silu_multiply"] = {"max_diff": silu_standalone_diff, "pass": silu_standalone_diff < 1e-3}
-    print(f"[SiLU] Standalone SiLU*Up: max_diff={silu_standalone_diff:.8f} {'PASS' if silu_standalone_diff < 1e-3 else 'FAIL'}")
+    status = "PASS" if silu_standalone_diff < 1e-3 else "FAIL"
+    print(f"[SiLU] Standalone SiLU*Up: max_diff={silu_standalone_diff:.8f} {status}")
+
+    # ============================
+    # Megakernel: fused oproj + upgate + downproj
+    # ============================
+    torch.manual_seed(42)
+    hidden_mk = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
+    attn_out_mk = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
+    o_w_mk = torch.randn(HIDDEN, HIDDEN, device="cuda", dtype=torch.float32) * 0.01
+    mlp_ln_mk = torch.randn(HIDDEN, device="cuda", dtype=torch.float32)
+    gate_w_mk = torch.randn(INTER, HIDDEN, device="cuda", dtype=torch.float32) * 0.01
+    up_w_mk = torch.randn(INTER, HIDDEN, device="cuda", dtype=torch.float32) * 0.01
+    down_w_mk = torch.randn(HIDDEN, INTER, device="cuda", dtype=torch.float32) * 0.01
+
+    # Reference: apply the three ops sequentially
+    ref_mk = kernels.oproj_residual_forward(hidden_mk, attn_out_mk, o_w_mk)
+    ref_silu_mk = kernels.upgate_silu_forward(ref_mk, mlp_ln_mk, gate_w_mk, up_w_mk)
+    ref_mk = kernels.downproj_residual_forward(ref_mk, ref_silu_mk, down_w_mk)
+
+    out_mk = kernels.megakernel_layer_forward(
+        hidden_mk, attn_out_mk, o_w_mk, mlp_ln_mk, gate_w_mk, up_w_mk, down_w_mk
+    )
+    mk_diff = (out_mk - ref_mk).abs().max().item()
+    results["megakernel_layer"] = {"max_diff": mk_diff, "pass": mk_diff < 1e-5}
+    print(f"[Mega] Fused layer: max_diff={mk_diff:.8f} {'PASS' if mk_diff < 1e-5 else 'FAIL'}")
 
     # ============================
     # FA4 Attention (B200 / CUTLASS SM100 FMHA only)
@@ -336,7 +370,9 @@ def _run_all_ops(arch: str) -> dict:
         fa4 = _jit_compile_fa4(arch)
 
         FA4_SEQ = 1024
-        FA4_NQ = 16; FA4_NKV = 8; FA4_HD = 128
+        FA4_NQ = 16
+        FA4_NKV = 8
+        FA4_HD = 128
         FA4_SCALE = 1.0 / math.sqrt(FA4_HD)
         torch.manual_seed(42)
         Q_fa4 = torch.randn(FA4_NQ, FA4_SEQ, FA4_HD, device="cuda", dtype=torch.bfloat16)
@@ -348,9 +384,9 @@ def _run_all_ops(arch: str) -> dict:
         Q_sdpa = Q_fa4.unsqueeze(0)  # [1, NQ, SEQ, HD]
         K_sdpa = K_fa4.unsqueeze(0)  # [1, NKV, SEQ, HD]
         V_sdpa = V_fa4.unsqueeze(0)  # [1, NKV, SEQ, HD]
-        ref_out = torch.nn.functional.scaled_dot_product_attention(
-            Q_sdpa, K_sdpa, V_sdpa, is_causal=True
-        ).squeeze(0)  # [NQ, SEQ, HD]
+        ref_out = torch.nn.functional.scaled_dot_product_attention(Q_sdpa, K_sdpa, V_sdpa, is_causal=True).squeeze(
+            0
+        )  # [NQ, SEQ, HD]
 
         fa4_out = fa4.forward(Q_fa4, K_fa4, V_fa4, FA4_SCALE, True, False)[0]
         fa4_diff = (fa4_out.float() - ref_out.float()).abs().max().item()
@@ -392,7 +428,7 @@ def main(gpu: str = "b200"):
     else:
         result = run_all_b200.remote()
 
-    print(f"\nFinal Results:")
+    print("\nFinal Results:")
     for name, r in result["results"].items():
         status = "PASS" if r["pass"] else "FAIL"
         print(f"  {name:20s}: max_diff={r['max_diff']:.8f} [{status}]")

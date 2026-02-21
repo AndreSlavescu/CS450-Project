@@ -72,9 +72,7 @@ def _build_image(gpu: str) -> modal.Image:
             "pip install numpy ninja setuptools>=64.0.0",
             f"pip install --pre torch --index-url {cfg['torch_index']}",
         )
-        .add_local_dir(
-            str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc"
-        )
+        .add_local_dir(str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc")
     )
 
 
@@ -90,6 +88,7 @@ else:
 
 def _jit_compile_unified(arch):
     from torch.utils.cpp_extension import load
+
     print("\n  Compiling unified qwen3_kernels...")
     mod = load(
         name="qwen3_kernels",
@@ -107,6 +106,7 @@ def _jit_compile_unified(arch):
 
 def _run_profiled(arch: str) -> dict:
     import json
+
     import torch
 
     os.chdir("/workspace")
@@ -114,9 +114,17 @@ def _run_profiled(arch: str) -> dict:
 
     kernels = _jit_compile_unified(arch)
 
-    HIDDEN = 2048; NQ = 16; NKV = 8; HD = 128
-    Q_DIM = NQ * HD; K_DIM = NKV * HD; V_DIM = NKV * HD; QKV_DIM = Q_DIM + K_DIM + V_DIM
-    EPS = 1e-6; MAX_SEQ = 128; POS = 5; INTER = 6144
+    HIDDEN = 2048
+    NQ = 16
+    NKV = 8
+    HD = 128
+    Q_DIM = NQ * HD
+    K_DIM = NKV * HD
+    V_DIM = NKV * HD
+    QKV_DIM = Q_DIM + K_DIM + V_DIM
+    MAX_SEQ = 128
+    POS = 5
+    INTER = 6144
 
     def rmsnorm_fn(x, w, eps=1e-6):
         return w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
@@ -144,8 +152,7 @@ def _run_profiled(arch: str) -> dict:
 
     trace_path = "/workspace/trace_qkv_rope.json"
     kernels.qkv_rope_append_forward_profiled(
-        hidden, attn_ln_w, qkv_w, q_norm_w, k_norm_w, cos_c, sin_c,
-        k_cache, v_cache, POS, trace_path
+        hidden, attn_ln_w, qkv_w, q_norm_w, k_norm_w, cos_c, sin_c, k_cache, v_cache, POS, trace_path
     )
     if os.path.exists(trace_path):
         with open(trace_path) as f:
@@ -248,4 +255,4 @@ def main(gpu: str = "b200", label: str = "baseline"):
         print(f"  Saved {op_name}: {n_events} events -> {out_path}")
 
     print(f"\nAll traces saved to {traces_dir}/")
-    print(f"Open https://ui.perfetto.dev and load any .json file to visualize")
+    print("Open https://ui.perfetto.dev and load any .json file to visualize")

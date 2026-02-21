@@ -7,7 +7,7 @@
 // Profiler event IDs
 namespace oproj_events {
 enum : int {
-    EV_MATVEC     = 0,
+    EV_MATVEC = 0,
     EV_MATVEC_END = 1,
 };
 } // namespace oproj_events
@@ -22,24 +22,22 @@ enum : int {
  *   s_attn[HIDDEN_DIM]  = 2048 floats = 8 KB
  *   prof                = profiler state
  */
-__device__ void oproj_residual_device(
-    float*                      hidden_states,  // [HIDDEN_DIM] — in/out (residual added in-place)
-    const float* __restrict__   attn_out,       // [HIDDEN_DIM]
-    const float* __restrict__   o_proj_w,       // [HIDDEN_DIM, HIDDEN_DIM] row-major
-    profiler::event_record* g_events,
-    int* g_counts
-) {
+__device__ void oproj_residual_device(float* hidden_states, // [HIDDEN_DIM] — in/out (residual added in-place)
+                                      const float* __restrict__ attn_out, // [HIDDEN_DIM]
+                                      const float* __restrict__ o_proj_w, // [HIDDEN_DIM, HIDDEN_DIM] row-major
+                                      profiler::event_record* g_events, int* g_counts) {
     using namespace oproj_events;
     bool has_profiler = (g_events != nullptr);
 
     extern __shared__ char smem[];
-    float* s_attn = (float*)smem;
-    profiler::block_state* prof = (profiler::block_state*)(s_attn + HIDDEN_DIM);
+    float* s_attn = reinterpret_cast<float*>(smem);
+    profiler::block_state* prof = reinterpret_cast<profiler::block_state*>(s_attn + HIDDEN_DIM);
 
     int tid = threadIdx.x;
     int num_threads = blockDim.x;
 
-    if (tid == 0 && has_profiler) prof->init();
+    if (tid == 0 && has_profiler)
+        prof->init();
     __syncthreads();
 
     // Load attn_out into shared memory
@@ -48,7 +46,8 @@ __device__ void oproj_residual_device(
     }
     __syncthreads();
 
-    if (tid == 0 && has_profiler) prof->record(EV_MATVEC);
+    if (tid == 0 && has_profiler)
+        prof->record(EV_MATVEC);
 
     // MatVec: proj = o_proj_w @ attn_out, then residual add
     // Optimized with float4 vectorized loads + ILP (4 rows per iteration)
@@ -63,10 +62,14 @@ __device__ void oproj_residual_device(
             const float4* row3 = reinterpret_cast<const float4*>(o_proj_w + (long long)(out_base + 3) * HIDDEN_DIM);
             for (int j = 0; j < HIDDEN_DIM / 4; j++) {
                 float4 x = input4[j];
-                float4 w0 = __ldcg(row0 + j); acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                float4 w1 = __ldcg(row1 + j); acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
-                float4 w2 = __ldcg(row2 + j); acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
-                float4 w3 = __ldcg(row3 + j); acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
+                float4 w0 = __ldcg(row0 + j);
+                acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
+                float4 w1 = __ldcg(row1 + j);
+                acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
+                float4 w2 = __ldcg(row2 + j);
+                acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
+                float4 w3 = __ldcg(row3 + j);
+                acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
             }
             hidden_states[out_base + 0] += acc0;
             hidden_states[out_base + 1] += acc1;
@@ -75,7 +78,8 @@ __device__ void oproj_residual_device(
         }
     }
 
-    if (tid == 0 && has_profiler) prof->record(EV_MATVEC_END);
+    if (tid == 0 && has_profiler)
+        prof->record(EV_MATVEC_END);
 
     __syncthreads();
     if (tid == 0 && has_profiler) {
