@@ -22,9 +22,9 @@ enum : int {
  *   prof = profiler state only
  */
 __device__ void downproj_residual_device(
-    float* hidden_states,                  // [QWEN3_1_7B.hidden_size] — in/out
-    const float* __restrict__ silu_out,    // [QWEN3_1_7B.intermediate_size]
-    const float* __restrict__ down_proj_w, // [QWEN3_1_7B.hidden_size, QWEN3_1_7B.intermediate_size]
+    float* hidden_states,                          // [QWEN3_1_7B.hidden_size] — in/out
+    const float* __restrict__ silu_out,            // [QWEN3_1_7B.intermediate_size]
+    const __nv_bfloat16* __restrict__ down_proj_w, // [QWEN3_1_7B.hidden_size, QWEN3_1_7B.intermediate_size] bf16
     profiler::event_record* g_events, int* g_counts) {
     using namespace downproj_events;
     bool has_profiler = (g_events != nullptr);
@@ -42,35 +42,31 @@ __device__ void downproj_residual_device(
     if (tid == 0 && has_profiler)
         prof->record(EV_MATVEC);
 
-    // Optimized with float4 vectorized loads + ILP (4 rows per iteration)
+    // Warp-reduce GEMV: each warp owns one output row via lane reduction.
+    // With 128 blocks × 8 warps = 1024 total warps, all blocks stay active.
     {
-        constexpr int ILP = 4;
         const float4* input4 = reinterpret_cast<const float4*>(silu_out);
-        for (int out_base = tid * ILP; out_base < QWEN3_1_7B.hidden_size; out_base += num_threads * ILP) {
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-            const float4* row0 =
-                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 0) * QWEN3_1_7B.intermediate_size);
-            const float4* row1 =
-                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 1) * QWEN3_1_7B.intermediate_size);
-            const float4* row2 =
-                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 2) * QWEN3_1_7B.intermediate_size);
-            const float4* row3 =
-                reinterpret_cast<const float4*>(down_proj_w + (long long)(out_base + 3) * QWEN3_1_7B.intermediate_size);
-            for (int j = 0; j < QWEN3_1_7B.intermediate_size / 4; j++) {
-                float4 x = input4[j];
-                float4 w0 = __ldcg(row0 + j);
-                acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                float4 w1 = __ldcg(row1 + j);
-                acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
-                float4 w2 = __ldcg(row2 + j);
-                acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
-                float4 w3 = __ldcg(row3 + j);
-                acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
+        int lane = threadIdx.x & 31;
+        int global_warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int total_warps = (blockDim.x * gridDim.x) >> 5;
+        for (int out_row = global_warp; out_row < QWEN3_1_7B.hidden_size; out_row += total_warps) {
+            const uint4* row8 =
+                reinterpret_cast<const uint4*>(down_proj_w + (long long)out_row * QWEN3_1_7B.intermediate_size);
+            float dot = 0.f;
+            for (int k = lane; k < QWEN3_1_7B.intermediate_size / 8; k += 32) {
+                uint4 raw = __ldcg(row8 + k);
+                float2 f01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+                float2 f23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+                float2 f45 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.z));
+                float2 f67 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.w));
+                float4 x0 = __ldcg(input4 + k * 2), x1 = __ldcg(input4 + k * 2 + 1);
+                dot += f01.x * x0.x + f01.y * x0.y + f23.x * x0.z + f23.y * x0.w + f45.x * x1.x + f45.y * x1.y +
+                       f67.x * x1.z + f67.y * x1.w;
             }
-            hidden_states[out_base + 0] += acc0;
-            hidden_states[out_base + 1] += acc1;
-            hidden_states[out_base + 2] += acc2;
-            hidden_states[out_base + 3] += acc3;
+            for (int s = 16; s > 0; s >>= 1)
+                dot += __shfl_down_sync(0xffffffff, dot, s);
+            if (lane == 0)
+                hidden_states[out_row] += dot;
         }
     }
 

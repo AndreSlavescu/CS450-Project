@@ -31,13 +31,13 @@ enum : int {
  *   s_reduce[WARP_SIZE]    = 32 floats   = 128 B
  *   prof                   = profiler state
  */
-__device__ void
-upgate_silu_device(float* silu_out,                    // [QWEN3_1_7B.intermediate_size] output
-                   const float* __restrict__ hidden,   // [QWEN3_1_7B.hidden_size]
-                   const float* __restrict__ mlp_ln_w, // [QWEN3_1_7B.hidden_size]
-                   const float* __restrict__ gate_w,   // [QWEN3_1_7B.intermediate_size, QWEN3_1_7B.hidden_size]
-                   const float* __restrict__ up_w,     // [QWEN3_1_7B.intermediate_size, QWEN3_1_7B.hidden_size]
-                   profiler::event_record* g_events, int* g_counts) {
+__device__ void upgate_silu_device(
+    float* silu_out,                          // [QWEN3_1_7B.intermediate_size] output
+    const float* __restrict__ hidden,         // [QWEN3_1_7B.hidden_size]
+    const float* __restrict__ mlp_ln_w,       // [QWEN3_1_7B.hidden_size]
+    const __nv_bfloat16* __restrict__ gate_w, // [QWEN3_1_7B.intermediate_size, QWEN3_1_7B.hidden_size] bf16
+    const __nv_bfloat16* __restrict__ up_w,   // [QWEN3_1_7B.intermediate_size, QWEN3_1_7B.hidden_size] bf16
+    profiler::event_record* g_events, int* g_counts) {
     using namespace upgate_events;
     bool has_profiler = (g_events != nullptr);
 
@@ -76,52 +76,40 @@ upgate_silu_device(float* silu_out,                    // [QWEN3_1_7B.intermedia
     if (tid == 0 && has_profiler)
         prof->record(EV_SILU);
 
+    // Warp-reduce GEMV: each warp owns one output row for both gate and up.
+    // With 128 blocks × 8 warps = 1024 total warps, all blocks stay active.
     {
-        constexpr int ILP = 4;
         const float4* input4 = reinterpret_cast<const float4*>(s_post_ln);
-        for (int out_base = tid * ILP; out_base < QWEN3_1_7B.intermediate_size; out_base += num_threads * ILP) {
-            float gate_acc0 = 0.0f, gate_acc1 = 0.0f, gate_acc2 = 0.0f, gate_acc3 = 0.0f;
-            float up_acc0 = 0.0f, up_acc1 = 0.0f, up_acc2 = 0.0f, up_acc3 = 0.0f;
-            const float4* gr0 =
-                reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 0) * QWEN3_1_7B.hidden_size);
-            const float4* gr1 =
-                reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 1) * QWEN3_1_7B.hidden_size);
-            const float4* gr2 =
-                reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 2) * QWEN3_1_7B.hidden_size);
-            const float4* gr3 =
-                reinterpret_cast<const float4*>(gate_w + (long long)(out_base + 3) * QWEN3_1_7B.hidden_size);
-            const float4* ur0 =
-                reinterpret_cast<const float4*>(up_w + (long long)(out_base + 0) * QWEN3_1_7B.hidden_size);
-            const float4* ur1 =
-                reinterpret_cast<const float4*>(up_w + (long long)(out_base + 1) * QWEN3_1_7B.hidden_size);
-            const float4* ur2 =
-                reinterpret_cast<const float4*>(up_w + (long long)(out_base + 2) * QWEN3_1_7B.hidden_size);
-            const float4* ur3 =
-                reinterpret_cast<const float4*>(up_w + (long long)(out_base + 3) * QWEN3_1_7B.hidden_size);
-            for (int j = 0; j < QWEN3_1_7B.hidden_size / 4; j++) {
-                float4 x = input4[j];
-                float4 gw0 = __ldcg(gr0 + j);
-                gate_acc0 += gw0.x * x.x + gw0.y * x.y + gw0.z * x.z + gw0.w * x.w;
-                float4 gw1 = __ldcg(gr1 + j);
-                gate_acc1 += gw1.x * x.x + gw1.y * x.y + gw1.z * x.z + gw1.w * x.w;
-                float4 gw2 = __ldcg(gr2 + j);
-                gate_acc2 += gw2.x * x.x + gw2.y * x.y + gw2.z * x.z + gw2.w * x.w;
-                float4 gw3 = __ldcg(gr3 + j);
-                gate_acc3 += gw3.x * x.x + gw3.y * x.y + gw3.z * x.z + gw3.w * x.w;
-                float4 uw0 = __ldcg(ur0 + j);
-                up_acc0 += uw0.x * x.x + uw0.y * x.y + uw0.z * x.z + uw0.w * x.w;
-                float4 uw1 = __ldcg(ur1 + j);
-                up_acc1 += uw1.x * x.x + uw1.y * x.y + uw1.z * x.z + uw1.w * x.w;
-                float4 uw2 = __ldcg(ur2 + j);
-                up_acc2 += uw2.x * x.x + uw2.y * x.y + uw2.z * x.z + uw2.w * x.w;
-                float4 uw3 = __ldcg(ur3 + j);
-                up_acc3 += uw3.x * x.x + uw3.y * x.y + uw3.z * x.z + uw3.w * x.w;
+        int lane = threadIdx.x & 31;
+        int global_warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int total_warps = (blockDim.x * gridDim.x) >> 5;
+        for (int out_row = global_warp; out_row < QWEN3_1_7B.intermediate_size; out_row += total_warps) {
+            const uint4* gr8 = reinterpret_cast<const uint4*>(gate_w + (long long)out_row * QWEN3_1_7B.hidden_size);
+            const uint4* ur8 = reinterpret_cast<const uint4*>(up_w + (long long)out_row * QWEN3_1_7B.hidden_size);
+            float gate_dot = 0.f, up_dot = 0.f;
+            for (int k = lane; k < QWEN3_1_7B.hidden_size / 8; k += 32) {
+                float4 x0 = input4[k * 2], x1 = input4[k * 2 + 1];
+                uint4 graw = __ldcg(gr8 + k);
+                float2 gf01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.x));
+                float2 gf23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.y));
+                float2 gf45 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.z));
+                float2 gf67 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.w));
+                gate_dot += gf01.x * x0.x + gf01.y * x0.y + gf23.x * x0.z + gf23.y * x0.w + gf45.x * x1.x +
+                            gf45.y * x1.y + gf67.x * x1.z + gf67.y * x1.w;
+                uint4 uraw = __ldcg(ur8 + k);
+                float2 uf01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uraw.x));
+                float2 uf23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uraw.y));
+                float2 uf45 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uraw.z));
+                float2 uf67 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uraw.w));
+                up_dot += uf01.x * x0.x + uf01.y * x0.y + uf23.x * x0.z + uf23.y * x0.w + uf45.x * x1.x +
+                          uf45.y * x1.y + uf67.x * x1.z + uf67.y * x1.w;
             }
-            // Fused SiLU(gate) * up via fast PTX approx (rcp + ex2)
-            silu_out[out_base + 0] = kernels::silu_multiply(gate_acc0, up_acc0);
-            silu_out[out_base + 1] = kernels::silu_multiply(gate_acc1, up_acc1);
-            silu_out[out_base + 2] = kernels::silu_multiply(gate_acc2, up_acc2);
-            silu_out[out_base + 3] = kernels::silu_multiply(gate_acc3, up_acc3);
+            for (int s = 16; s > 0; s >>= 1) {
+                gate_dot += __shfl_down_sync(0xffffffff, gate_dot, s);
+                up_dot += __shfl_down_sync(0xffffffff, up_dot, s);
+            }
+            if (lane == 0)
+                silu_out[out_row] = kernels::silu_multiply(gate_dot, up_dot);
         }
     }
 

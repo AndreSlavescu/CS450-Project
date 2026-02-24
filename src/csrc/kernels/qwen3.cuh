@@ -16,10 +16,11 @@ struct Qwen3Config {
     float rope_theta;
     float rms_norm_eps;
 
-    __host__ __device__ int gqa_ratio() const { return num_attention_heads / num_key_value_heads; }
-    __host__ __device__ int qkv_output_dim() const {
+    constexpr __host__ __device__ int gqa_ratio() const { return num_attention_heads / num_key_value_heads; }
+    constexpr __host__ __device__ int qkv_output_dim() const {
         return (num_attention_heads + 2 * num_key_value_heads) * head_dim;
     }
+    // Not constexpr: sqrtf is not a constexpr function. Use `const float` at call sites.
     __host__ __device__ float attn_scale() const { return 1.0f / sqrtf(static_cast<float>(head_dim)); }
 };
 

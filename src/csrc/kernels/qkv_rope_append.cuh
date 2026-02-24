@@ -5,66 +5,39 @@
 #include "rmsnorm.cuh"
 #include "../profiler/gpu_profiler.cuh"
 
-// Profiler event IDs (paired: even=begin, odd=end)
-namespace qkv_rope_events {
-enum : int {
-    EV_RMSNORM = 0,
-    EV_RMSNORM_END = 1,
-    EV_MATVEC = 2,
-    EV_MATVEC_END = 3,
-    EV_QKNORM = 4,
-    EV_QKNORM_END = 5,
-    EV_ROPE = 6,
-    EV_ROPE_END = 7,
-    EV_CACHE = 8,
-    EV_CACHE_END = 9,
-};
-} // namespace qkv_rope_events
-
 /*
- * Fused kernel: RMSNorm → QKV MatVec → Q/K per-head RMSNorm → RoPE → KV Cache Append
+ * Phase 1a — grid-parallel QKV MatVec.
  *
- * All operations run in a single block for BS=1 single-token decode.
+ * Called with ALL blocks (grid_size = 128).
  *
- * Shared memory layout (separate Q/K/V buffers):
- *   s_post_ln[hidden_size]  = 2048 floats = 8 KB
- *   s_q[q_dim]              = 2048 floats = 8 KB
- *   s_k[kv_dim]             = 1024 floats = 4 KB
- *   s_v[kv_dim]             = 1024 floats = 4 KB
- *   s_reduce[WARP_SIZE]     = 32 floats   = 128 B
- *   prof                    = profiler state
+ * Each block:
+ *   1. Computes RMSNorm(hidden, attn_ln_w) redundantly into local s_post_ln.
+ *   2. Runs Q/K/V matrix-vector products partitioned by global thread id:
+ *        global_tid = blockIdx.x * blockDim.x + threadIdx.x
+ *      Each global thread owns a stride of ILP=4 output rows, so the weight
+ *      rows are evenly spread across all 128 * 256 = 32 768 threads.
+ *
+ * Writes to global g_q[q_dim], g_k[kv_dim], g_v[kv_dim].
+ * These are coherent after a grid_sync.sync() by the caller.
+ *
+ * Shared memory layout (within the kernel's fixed allocation):
+ *   s_post_ln[hidden_size]  = 2048 × 4 = 8 192 B
+ *   s_reduce[WARP_SIZE]     =   32 × 4 =   128 B
  */
-__device__ void qkv_rope_append_device(float* q_out,                         // [q_dim]  output
-                                       float* k_out,                         // [kv_dim] output
-                                       float* v_out,                         // [kv_dim] output
-                                       float* k_cache,                       // [max_seq, num_kv_heads, head_dim]
-                                       float* v_cache,                       // [max_seq, num_kv_heads, head_dim]
-                                       const float* __restrict__ hidden,     // [hidden_size]
-                                       const float* __restrict__ attn_ln_w,  // [hidden_size]
-                                       const float* __restrict__ qkv_weight, // [qkv_dim, hidden_size] row-major
-                                       const float* __restrict__ q_norm_w,   // [head_dim]
-                                       const float* __restrict__ k_norm_w,   // [head_dim]
-                                       const float* __restrict__ cos_cached, // [head_dim] for this position
-                                       const float* __restrict__ sin_cached, // [head_dim] for this position
-                                       int pos_id, int max_seq_len, profiler::event_record* g_events, int* g_counts) {
-    using namespace qkv_rope_events;
-    bool has_profiler = (g_events != nullptr);
-
+__device__ void
+qkv_matvec_device(float* __restrict__ g_q,                        // [q_dim]  global output
+                  float* __restrict__ g_k,                        // [kv_dim] global output
+                  float* __restrict__ g_v,                        // [kv_dim] global output
+                  const float* __restrict__ hidden,               // [hidden_size]
+                  const float* __restrict__ attn_ln_w,            // [hidden_size]
+                  const __nv_bfloat16* __restrict__ qkv_weight) { // [qkv_dim, hidden_size] row-major, bf16
     constexpr int hidden_size = QWEN3_1_7B.hidden_size;
     constexpr int q_dim = QWEN3_1_7B.num_attention_heads * QWEN3_1_7B.head_dim;
     constexpr int kv_dim = QWEN3_1_7B.num_key_value_heads * QWEN3_1_7B.head_dim;
-    constexpr int num_q_heads = QWEN3_1_7B.num_attention_heads;
-    constexpr int num_kv_heads = QWEN3_1_7B.num_key_value_heads;
-    constexpr int head_dim = QWEN3_1_7B.head_dim;
-    constexpr int half_head = QWEN3_1_7B.head_dim / 2;
 
     extern __shared__ char smem[];
     float* s_post_ln = reinterpret_cast<float*>(smem);
-    float* s_q = s_post_ln + hidden_size;
-    float* s_k = s_q + q_dim;
-    float* s_v = s_k + kv_dim;
-    float* s_reduce = s_v + kv_dim;
-    profiler::block_state* prof = reinterpret_cast<profiler::block_state*>(s_reduce + kernels::WARP_SIZE);
+    float* s_reduce = s_post_ln + hidden_size;
 
     int tid = threadIdx.x;
     int num_threads = blockDim.x;
@@ -72,180 +45,162 @@ __device__ void qkv_rope_append_device(float* q_out,                         // 
     int warp_id = tid / kernels::WARP_SIZE;
     int num_warps = num_threads / kernels::WARP_SIZE;
 
-    if (tid == 0 && has_profiler)
-        prof->init();
-    __syncthreads();
-
-    // ===== Phase 1: RMSNorm on hidden_states =====
-    if (tid == 0 && has_profiler)
-        prof->record(EV_RMSNORM);
-
+    // ===== Phase 1: RMSNorm (all blocks, redundant, uses local smem) =====
     kernels::rmsnorm(s_post_ln, hidden, attn_ln_w, hidden_size, s_reduce, tid, num_threads, lane_id, warp_id,
                      num_warps);
     __syncthreads();
 
-    if (tid == 0 && has_profiler)
-        prof->record(EV_RMSNORM_END);
-
-    // ===== Phase 2: Q/K/V MatVec with separate output buffers =====
-    // Optimized with float4 vectorized loads + ILP (4 rows per iteration)
-    if (tid == 0 && has_profiler)
-        prof->record(EV_MATVEC);
-
+    // ===== Phase 2: Q/K/V warp-reduce GEMV (BF16 weights) =====
+    // Each warp owns one output row; uint4 loads = 8 bf16 per load, halving HBM traffic.
+    // With 128 blocks × 8 warps = 1024 total warps, even Q (2048 rows) gives
+    // every warp 2 rows of real work — all 128 SMs hit HBM simultaneously.
     {
-        constexpr int ILP = 4;
         const float4* input4 = reinterpret_cast<const float4*>(s_post_ln);
+        int lane = threadIdx.x & 31;
+        int global_warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int total_warps = (blockDim.x * gridDim.x) >> 5; // 1024
 
-        // Q matvec: q_weight[q_dim, hidden_size] @ post_ln → s_q
-        const float* q_weight = qkv_weight;
-        for (int out_base = tid * ILP; out_base < q_dim; out_base += num_threads * ILP) {
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-            const float4* row0 = reinterpret_cast<const float4*>(q_weight + (long long)(out_base + 0) * hidden_size);
-            const float4* row1 = reinterpret_cast<const float4*>(q_weight + (long long)(out_base + 1) * hidden_size);
-            const float4* row2 = reinterpret_cast<const float4*>(q_weight + (long long)(out_base + 2) * hidden_size);
-            const float4* row3 = reinterpret_cast<const float4*>(q_weight + (long long)(out_base + 3) * hidden_size);
-            for (int j = 0; j < hidden_size / 4; j++) {
-                float4 x = input4[j];
-                float4 w0 = __ldcg(row0 + j);
-                acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                float4 w1 = __ldcg(row1 + j);
-                acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
-                float4 w2 = __ldcg(row2 + j);
-                acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
-                float4 w3 = __ldcg(row3 + j);
-                acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
+        // --- Q warp-reduce GEMV ---
+        const __nv_bfloat16* q_weight = qkv_weight;
+        for (int out_row = global_warp; out_row < q_dim; out_row += total_warps) {
+            const uint4* row8 = reinterpret_cast<const uint4*>(q_weight + (long long)out_row * hidden_size);
+            float dot = 0.f;
+            for (int k = lane; k < hidden_size / 8; k += 32) {
+                uint4 raw = __ldcg(row8 + k);
+                float2 f01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+                float2 f23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+                float2 f45 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.z));
+                float2 f67 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.w));
+                float4 x0 = input4[k * 2], x1 = input4[k * 2 + 1];
+                dot += f01.x * x0.x + f01.y * x0.y + f23.x * x0.z + f23.y * x0.w + f45.x * x1.x + f45.y * x1.y +
+                       f67.x * x1.z + f67.y * x1.w;
             }
-            s_q[out_base + 0] = acc0;
-            s_q[out_base + 1] = acc1;
-            s_q[out_base + 2] = acc2;
-            s_q[out_base + 3] = acc3;
+            for (int s = 16; s > 0; s >>= 1)
+                dot += __shfl_down_sync(0xffffffff, dot, s);
+            if (lane == 0)
+                g_q[out_row] = dot;
         }
 
-        // K matvec: k_weight[kv_dim, hidden_size] @ post_ln → s_k
-        const float* k_weight = qkv_weight + (long long)q_dim * hidden_size;
-        for (int out_base = tid * ILP; out_base < kv_dim; out_base += num_threads * ILP) {
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-            const float4* row0 = reinterpret_cast<const float4*>(k_weight + (long long)(out_base + 0) * hidden_size);
-            const float4* row1 = reinterpret_cast<const float4*>(k_weight + (long long)(out_base + 1) * hidden_size);
-            const float4* row2 = reinterpret_cast<const float4*>(k_weight + (long long)(out_base + 2) * hidden_size);
-            const float4* row3 = reinterpret_cast<const float4*>(k_weight + (long long)(out_base + 3) * hidden_size);
-            for (int j = 0; j < hidden_size / 4; j++) {
-                float4 x = input4[j];
-                float4 w0 = __ldcg(row0 + j);
-                acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                float4 w1 = __ldcg(row1 + j);
-                acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
-                float4 w2 = __ldcg(row2 + j);
-                acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
-                float4 w3 = __ldcg(row3 + j);
-                acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
+        // --- K warp-reduce GEMV ---
+        const __nv_bfloat16* k_weight = qkv_weight + (long long)q_dim * hidden_size;
+        for (int out_row = global_warp; out_row < kv_dim; out_row += total_warps) {
+            const uint4* row8 = reinterpret_cast<const uint4*>(k_weight + (long long)out_row * hidden_size);
+            float dot = 0.f;
+            for (int k = lane; k < hidden_size / 8; k += 32) {
+                uint4 raw = __ldcg(row8 + k);
+                float2 f01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+                float2 f23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+                float2 f45 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.z));
+                float2 f67 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.w));
+                float4 x0 = input4[k * 2], x1 = input4[k * 2 + 1];
+                dot += f01.x * x0.x + f01.y * x0.y + f23.x * x0.z + f23.y * x0.w + f45.x * x1.x + f45.y * x1.y +
+                       f67.x * x1.z + f67.y * x1.w;
             }
-            s_k[out_base + 0] = acc0;
-            s_k[out_base + 1] = acc1;
-            s_k[out_base + 2] = acc2;
-            s_k[out_base + 3] = acc3;
+            for (int s = 16; s > 0; s >>= 1)
+                dot += __shfl_down_sync(0xffffffff, dot, s);
+            if (lane == 0)
+                g_k[out_row] = dot;
         }
 
-        // V matvec: v_weight[kv_dim, hidden_size] @ post_ln → s_v
-        const float* v_weight = qkv_weight + (long long)(q_dim + kv_dim) * hidden_size;
-        for (int out_base = tid * ILP; out_base < kv_dim; out_base += num_threads * ILP) {
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-            const float4* row0 = reinterpret_cast<const float4*>(v_weight + (long long)(out_base + 0) * hidden_size);
-            const float4* row1 = reinterpret_cast<const float4*>(v_weight + (long long)(out_base + 1) * hidden_size);
-            const float4* row2 = reinterpret_cast<const float4*>(v_weight + (long long)(out_base + 2) * hidden_size);
-            const float4* row3 = reinterpret_cast<const float4*>(v_weight + (long long)(out_base + 3) * hidden_size);
-            for (int j = 0; j < hidden_size / 4; j++) {
-                float4 x = input4[j];
-                float4 w0 = __ldcg(row0 + j);
-                acc0 += w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                float4 w1 = __ldcg(row1 + j);
-                acc1 += w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
-                float4 w2 = __ldcg(row2 + j);
-                acc2 += w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
-                float4 w3 = __ldcg(row3 + j);
-                acc3 += w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
+        // --- V warp-reduce GEMV ---
+        const __nv_bfloat16* v_weight = qkv_weight + (long long)(q_dim + kv_dim) * hidden_size;
+        for (int out_row = global_warp; out_row < kv_dim; out_row += total_warps) {
+            const uint4* row8 = reinterpret_cast<const uint4*>(v_weight + (long long)out_row * hidden_size);
+            float dot = 0.f;
+            for (int k = lane; k < hidden_size / 8; k += 32) {
+                uint4 raw = __ldcg(row8 + k);
+                float2 f01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+                float2 f23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+                float2 f45 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.z));
+                float2 f67 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.w));
+                float4 x0 = input4[k * 2], x1 = input4[k * 2 + 1];
+                dot += f01.x * x0.x + f01.y * x0.y + f23.x * x0.z + f23.y * x0.w + f45.x * x1.x + f45.y * x1.y +
+                       f67.x * x1.z + f67.y * x1.w;
             }
-            s_v[out_base + 0] = acc0;
-            s_v[out_base + 1] = acc1;
-            s_v[out_base + 2] = acc2;
-            s_v[out_base + 3] = acc3;
+            for (int s = 16; s > 0; s >>= 1)
+                dot += __shfl_down_sync(0xffffffff, dot, s);
+            if (lane == 0)
+                g_v[out_row] = dot;
         }
     }
-    __syncthreads();
+    // No __syncthreads() needed: caller does grid_sync.sync() before reading outputs.
+}
 
-    if (tid == 0 && has_profiler)
-        prof->record(EV_MATVEC_END);
+/*
+ * Phase 1b — Q/K per-head RMSNorm, RoPE, and KV-cache append.
+ *
+ * MUST be called only from block 0 (guarded at the call site).
+ * All 256 threads of block 0 participate.
+ *
+ * After a grid_sync.sync(), g_q and g_k are fully written by qkv_matvec_device.
+ * This function applies in-place modifications and writes the KV cache.
+ *
+ * Shared memory layout:
+ *   s_reduce[WARP_SIZE] = 32 × 4 = 128 B  (for per-head block_reduce_sum)
+ */
+__device__ void
+qknorm_rope_kvcache_device(float* __restrict__ g_q,              // [q_dim]  in/out: norm + RoPE applied in-place
+                           float* __restrict__ g_k,              // [kv_dim] in/out: norm + RoPE applied in-place
+                           const float* __restrict__ g_v,        // [kv_dim] read-only
+                           float* __restrict__ k_cache,          // [max_seq * kv_dim]
+                           float* __restrict__ v_cache,          // [max_seq * kv_dim]
+                           const float* __restrict__ q_norm_w,   // [head_dim]
+                           const float* __restrict__ k_norm_w,   // [head_dim]
+                           const float* __restrict__ cos_cached, // [head_dim] for this position (first half filled)
+                           const float* __restrict__ sin_cached, // [head_dim] for this position
+                           int pos_id) {
+    constexpr int q_dim = QWEN3_1_7B.num_attention_heads * QWEN3_1_7B.head_dim;
+    constexpr int kv_dim = QWEN3_1_7B.num_key_value_heads * QWEN3_1_7B.head_dim;
+    constexpr int num_q_heads = QWEN3_1_7B.num_attention_heads;
+    constexpr int num_kv_heads = QWEN3_1_7B.num_key_value_heads;
+    constexpr int head_dim = QWEN3_1_7B.head_dim;
+    constexpr int half_head = head_dim / 2;
 
-    // ===== Phase 3: Q/K per-head RMSNorm =====
-    if (tid == 0 && has_profiler)
-        prof->record(EV_QKNORM);
+    // s_reduce sits at the start of the block's shared memory (128 B).
+    extern __shared__ char smem[];
+    float* s_reduce = reinterpret_cast<float*>(smem);
 
-    kernels::rmsnorm_per_head(s_q, q_norm_w, num_q_heads, head_dim, s_reduce, tid, num_threads, lane_id, warp_id,
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int lane_id = tid % kernels::WARP_SIZE;
+    int warp_id = tid / kernels::WARP_SIZE;
+    int num_warps = num_threads / kernels::WARP_SIZE;
+
+    // ===== Q per-head RMSNorm (in-place on global g_q) =====
+    kernels::rmsnorm_per_head(g_q, q_norm_w, num_q_heads, head_dim, s_reduce, tid, num_threads, lane_id, warp_id,
                               num_warps);
 
-    kernels::rmsnorm_per_head(s_k, k_norm_w, num_kv_heads, head_dim, s_reduce, tid, num_threads, lane_id, warp_id,
+    // ===== K per-head RMSNorm (in-place on global g_k) =====
+    kernels::rmsnorm_per_head(g_k, k_norm_w, num_kv_heads, head_dim, s_reduce, tid, num_threads, lane_id, warp_id,
                               num_warps);
 
-    if (tid == 0 && has_profiler)
-        prof->record(EV_QKNORM_END);
-
-    // ===== Phase 4: RoPE on Q and K =====
-    if (tid == 0 && has_profiler)
-        prof->record(EV_ROPE);
-
+    // ===== Q RoPE (in-place) =====
     for (int h = 0; h < num_q_heads; h++) {
-        int offset = h * head_dim;
+        int off = h * head_dim;
         for (int i = tid; i < half_head; i += num_threads) {
-            float x_first = s_q[offset + i];
-            float x_second = s_q[offset + i + half_head];
-            float c = cos_cached[i];
-            float s = sin_cached[i];
-            s_q[offset + i] = x_first * c - x_second * s;
-            s_q[offset + i + half_head] = x_second * c + x_first * s;
+            float x0 = g_q[off + i], x1 = g_q[off + i + half_head];
+            float c = cos_cached[i], s = sin_cached[i];
+            g_q[off + i] = x0 * c - x1 * s;
+            g_q[off + i + half_head] = x1 * c + x0 * s;
         }
     }
 
+    // ===== K RoPE (in-place) =====
     for (int h = 0; h < num_kv_heads; h++) {
-        int offset = h * head_dim;
+        int off = h * head_dim;
         for (int i = tid; i < half_head; i += num_threads) {
-            float x_first = s_k[offset + i];
-            float x_second = s_k[offset + i + half_head];
-            float c = cos_cached[i];
-            float s = sin_cached[i];
-            s_k[offset + i] = x_first * c - x_second * s;
-            s_k[offset + i + half_head] = x_second * c + x_first * s;
+            float x0 = g_k[off + i], x1 = g_k[off + i + half_head];
+            float c = cos_cached[i], s = sin_cached[i];
+            g_k[off + i] = x0 * c - x1 * s;
+            g_k[off + i + half_head] = x1 * c + x0 * s;
         }
     }
     __syncthreads();
 
-    if (tid == 0 && has_profiler)
-        prof->record(EV_ROPE_END);
-
-    // ===== Phase 5: Write outputs + KV cache append =====
-    if (tid == 0 && has_profiler)
-        prof->record(EV_CACHE);
-
-    for (int i = tid; i < q_dim; i += num_threads) {
-        q_out[i] = s_q[i];
-    }
-
+    // ===== KV cache append =====
     for (int i = tid; i < kv_dim; i += num_threads) {
-        float k_val = s_k[i];
-        k_out[i] = k_val;
-        k_cache[pos_id * kv_dim + i] = k_val;
+        k_cache[pos_id * kv_dim + i] = g_k[i];
+        v_cache[pos_id * kv_dim + i] = g_v[i];
     }
-
-    for (int i = tid; i < kv_dim; i += num_threads) {
-        float v_val = s_v[i];
-        v_out[i] = v_val;
-        v_cache[pos_id * kv_dim + i] = v_val;
-    }
-
-    if (tid == 0 && has_profiler)
-        prof->record(EV_CACHE_END);
-
     __syncthreads();
-    if (tid == 0 && has_profiler) {
-        prof->flush(g_events + blockIdx.x * profiler::config::MAX_EVENTS, g_counts + blockIdx.x);
-    }
 }

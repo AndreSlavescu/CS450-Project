@@ -78,13 +78,13 @@ _placeholder = modal.Image.debian_slim()
 if _target_gpu == "h100":
     bench_image = (
         modal.Image.from_dockerfile(GPU_CONFIGS["h100"]["dockerfile"], force_build=force_rebuild)
-        .pip_install("transformers>=4.51.0", "accelerate", "sentencepiece")
+        .pip_install("transformers>=4.51.0,<5.0", "accelerate", "sentencepiece")
         .add_local_dir(str(PROJECT_ROOT / "src"), "/workspace/src")
     )
 else:
     bench_image = (
         modal.Image.from_dockerfile(GPU_CONFIGS["b200"]["dockerfile"], force_build=force_rebuild)
-        .pip_install("transformers>=4.51.0", "accelerate", "sentencepiece")
+        .pip_install("transformers>=4.51.0,<5.0", "accelerate", "sentencepiece")
         .add_local_dir(str(PROJECT_ROOT / "src"), "/workspace/src")
     )
 
@@ -678,6 +678,111 @@ def run_hf_benchmark(
     return _run_hf_benchmark(model_cfg, seq_lens, warmup_iters, bench_iters)
 
 
+def _run_megakernel_benchmark(
+    model_cfg: dict,
+    seq_lens: list[int],
+    warmup_iters: int,
+    bench_iters: int,
+) -> dict:
+    import os
+    import sys
+
+    import torch
+
+    # Make /workspace importable so `from src.python.Qwen3.xxx import ...` works.
+    sys.path.insert(0, "/workspace")
+    os.chdir("/workspace")
+
+    cfg = ModelConfig(**model_cfg)
+
+    device_name = torch.cuda.get_device_name(0)
+    print(f"Device: {device_name}")
+
+    print("Loading megakernel Decoder (JIT compile + weight load)...")
+    from src.python.Qwen3.decoder import Decoder
+
+    dec = Decoder(verbose=True)
+    print("Decoder ready.")
+
+    results = {}
+
+    for seq_len in seq_lens:
+        print(f"\n--- Megakernel benchmarking seq_len={seq_len} ---")
+
+        # Simulate having already decoded seq_len tokens: set the position counter
+        # directly and leave the KV cache zeroed (all-zero KV is fine for timing).
+        dec.reset()
+        dec._position = seq_len
+
+        dummy_token = 1  # arbitrary non-EOS token id
+
+        def _run_once():
+            # Reset position so every timed call measures decode at the same depth.
+            dec._position = seq_len
+            return dec.step(dummy_token)
+
+        print(f"  Warming up ({warmup_iters} iters)...")
+        for _ in range(warmup_iters):
+            _run_once()
+        torch.cuda.synchronize()
+
+        times_ms = []
+        print(f"  Benchmarking ({bench_iters} iters)...")
+        for _ in range(bench_iters):
+            dec._position = seq_len
+            torch.cuda.synchronize()
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
+            dec.step(dummy_token)
+            end_evt.record()
+            torch.cuda.synchronize()
+            times_ms.append(start_evt.elapsed_time(end_evt))
+
+        times_ms_sorted = sorted(times_ms)
+        trim = max(1, len(times_ms_sorted) // 10)
+        trimmed = times_ms_sorted[trim:-trim] if len(times_ms_sorted) > 2 * trim else times_ms_sorted
+        mean_ms = sum(trimmed) / len(trimmed)
+        median_ms = times_ms_sorted[len(times_ms_sorted) // 2]
+        min_ms = times_ms_sorted[0]
+
+        tokens_per_sec = 1000.0 / mean_ms
+        theory = TheoreticalPerf(cfg, seq_len)
+        total_flops = theory.total_flops()
+        total_bytes = theory.total_memory_bytes()
+
+        achieved_tflops = total_flops / (mean_ms / 1000.0) / 1e12
+        achieved_bw_gb_s = total_bytes / (mean_ms / 1000.0) / 1e9
+
+        result = {
+            "requested_seq_len": seq_len,
+            "actual_seq_len": seq_len,
+            "mean_ms": mean_ms,
+            "median_ms": median_ms,
+            "min_ms": min_ms,
+            "tokens_per_sec": tokens_per_sec,
+            "theoretical_flops": total_flops,
+            "theoretical_bytes": total_bytes,
+            "achieved_tflops": achieved_tflops,
+            "achieved_bw_gb_s": achieved_bw_gb_s,
+            "all_times_ms": times_ms,
+        }
+        results[seq_len] = result
+
+        print(f"  Mean time: {mean_ms:.3f} ms | Median: {median_ms:.3f} ms | Min: {min_ms:.3f} ms")
+        print(f"  Tokens/sec: {tokens_per_sec:.1f}")
+        print(f"  Achieved: {achieved_tflops:.2f} TFLOPS, {achieved_bw_gb_s:.1f} GB/s")
+
+    return {
+        "device": device_name,
+        "model": cfg.name,
+        "model_id": cfg.hf_id,
+        "warmup_iters": warmup_iters,
+        "bench_iters": bench_iters,
+        "results": results,
+    }
+
+
 @app.function(
     image=bench_image,
     gpu=GPU_CONFIGS[_target_gpu]["modal_gpu"],
@@ -690,39 +795,13 @@ def run_megakernel_benchmark(
     warmup_iters: int = WARMUP_ITERS,
     bench_iters: int = BENCH_ITERS,
 ) -> dict:
-    """
-    Runs the megakernel benchmark
-
-    NOTE:
-
-    Currently a placeholder and returns empty results, because the megakernel
-    is not yet implemented.
-    """
     import torch
-
-    cfg = ModelConfig(**model_cfg)
 
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"Device: {torch.cuda.get_device_name(0)}")
 
-    # TODO: Replace with actual megakernel benchmark
-    # ==========================================================================
-    # When the megakernel is ready:
-    # 1. Load weights into megakernel format
-    # 2. For each seq_len, run warmup + timed decode steps
-    # 3. Measure with torch.cuda.Event or the GPU profiler (gpu_profiler.cuh)
-    # 4. Return results in the same format as _run_hf_benchmark
-    # ==========================================================================
-    print("Megakernel benchmark not yet implemented. Returning empty results.")
-    return {
-        "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
-        "model": cfg.name,
-        "model_id": cfg.hf_id,
-        "warmup_iters": warmup_iters,
-        "bench_iters": bench_iters,
-        "results": {},
-    }
+    return _run_megakernel_benchmark(model_cfg, seq_lens, warmup_iters, bench_iters)
 
 
 @app.function(
@@ -1053,8 +1132,8 @@ def main(
         return
 
     mode = mode.lower()
-    if mode not in ("model", "kernels"):
-        print("Unknown mode. Use 'model' or 'kernels'.")
+    if mode not in ("model", "kernels", "megakernel"):
+        print("Unknown mode. Use 'model', 'kernels', or 'megakernel'.")
         return
 
     requested_kernels = [k.strip() for k in kernels.split(",") if k.strip()]
@@ -1155,6 +1234,28 @@ def main(
 
         return
 
+    model_cfg_dict = asdict(model_cfg)
+
+    if mode == "megakernel":
+        print(f"\n{'='*70}")
+        print("Running Megakernel Benchmark (compile + decode only)...")
+        print(f"{'='*70}")
+        mega_results = run_megakernel_benchmark.remote(model_cfg_dict, BENCH_SEQ_LENS, warmup_iters, bench_iters)
+        print(f"\n{'='*70}")
+        print("MEGAKERNEL RESULTS")
+        print(f"{'='*70}")
+        mega_data = mega_results.get("results", {})
+        print(f"{'seq_len':>8} {'mean_ms':>10} {'tok/s':>8} {'TFLOPS':>9} {'BW GB/s':>10}")
+        print("-" * 55)
+        for sl in BENCH_SEQ_LENS:
+            r = mega_data.get(sl) or mega_data.get(str(sl))
+            if r:
+                print(
+                    f"{sl:>8} {r['mean_ms']:>10.3f} {r['tokens_per_sec']:>8.1f} "
+                    f"{r['achieved_tflops']:>9.3f} {r['achieved_bw_gb_s']:>10.1f}"
+                )
+        return
+
     print(f"\n{'='*70}")
     print(f"Theoretical Analysis: {model_cfg.name} (per decode step, batch=1, bf16)")
     print(f"{'='*70}")
@@ -1171,7 +1272,6 @@ def main(
         )
     print(f"  Ridge point (FLOP/byte): {ridge_point:.1f}")
 
-    model_cfg_dict = asdict(model_cfg)
     print(f"\n{'='*70}")
     print("Running HF Baseline Benchmark...")
     print(f"{'='*70}")
