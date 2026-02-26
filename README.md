@@ -77,6 +77,19 @@ modal run run_modal.py --hazy-megakernel --gpu b200 # run application targetting
 modal run run_modal.py --waterloo-megakernel --gpu b200 # run application targetting b200 to reproduce waterloo baseline
 ```
 
+### Benchmarking TTFT on Modal
+
+Below is a command on how to run our TTFT benchmark that compares against 3 major inference engines / systems, namely:
+
+- vLLM
+- SGLang
+- HuggingFace (transformers)
+
+```bash
+# builds our container + runs the TTFT path comparing our persistent megakernel with the above engines.
+modal run modal_tests/test_benchmark_modal.py --gpu b200 --mode ttft
+```
+
 ## Relevant Links
 
 [Pull Request Template](.github/PULL_REQUEST_TEMPLATE.md)

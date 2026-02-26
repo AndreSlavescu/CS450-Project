@@ -5,43 +5,31 @@
 
 namespace kernels {
 
-/*
- * RMSNorm device function.
- *
- * Computes: output[i] = input[i] * rsqrt(mean(input^2) + eps) * weight[i]
- *
- * Writes normalized result to `output` (may alias `input` if in-place is desired,
- * but caller must ensure no race — typically use shared memory as output).
- *
- * Requires `shared_reduce` to have at least WARP_SIZE floats of shared memory.
- * Caller must __syncthreads() after this returns before reading `output`.
- */
 __device__ __forceinline__ void rmsnorm(float* output, const float* input, const float* weight, int dim,
                                         float* shared_reduce, int tid, int num_threads, int lane_id, int warp_id,
                                         int num_warps) {
     float thread_ss = 0.0f;
-    for (int i = tid; i < dim; i += num_threads) {
-        float xi = input[i];
-        thread_ss += xi * xi;
+    for (int i = tid; i < dim; i += 2 * num_threads) {
+        float x0 = input[i];
+        thread_ss += x0 * x0;
+        int j = i + num_threads;
+        if (j < dim) {
+            float x1 = input[j];
+            thread_ss += x1 * x1;
+        }
     }
 
     float total_ss = block_reduce_sum(thread_ss, shared_reduce, lane_id, warp_id, num_warps);
     float rms = rsqrtf(total_ss / dim + QWEN3_1_7B.rms_norm_eps);
 
-    for (int i = tid; i < dim; i += num_threads) {
+    for (int i = tid; i < dim; i += 2 * num_threads) {
         output[i] = input[i] * rms * weight[i];
+        int j = i + num_threads;
+        if (j < dim)
+            output[j] = input[j] * rms * weight[j];
     }
 }
 
-/*
- * Per-head RMSNorm device function.
- *
- * Normalizes `num_heads` heads of `head_dim` elements each, starting at `data[0]`.
- * Applies `weight[0..head_dim-1]` (shared across all heads).
- * In-place: overwrites data.
- *
- * Caller must __syncthreads() between successive calls.
- */
 __device__ __forceinline__ void rmsnorm_per_head(float* data, const float* weight, int num_heads, int head_dim,
                                                  float* shared_reduce, int tid, int num_threads, int lane_id,
                                                  int warp_id, int num_warps) {

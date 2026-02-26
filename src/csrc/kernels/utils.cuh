@@ -8,8 +8,6 @@ namespace kernels {
 
 static constexpr unsigned WARP_SIZE = 32;
 
-// Block-level sum reduction using cooperative groups.
-// Requires shared memory of at least WARP_SIZE floats at `shared_reduce`.
 __device__ __forceinline__ float block_reduce_sum(float val, float* shared_reduce, int lane_id, int warp_id,
                                                   int num_warps) {
     namespace cg = cooperative_groups;

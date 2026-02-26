@@ -4,28 +4,16 @@
 #include "utils.cuh"
 #include "../profiler/gpu_profiler.cuh"
 
-// Profiler event IDs
 namespace downproj_events {
 enum : int {
     EV_MATVEC = 0,
     EV_MATVEC_END = 1,
 };
-} // namespace downproj_events
+}
 
-/*
- * Down Projection + Residual Add
- *
- * proj = down_proj_w @ silu_out   (matvec: [QWEN3_1_7B.hidden_size, QWEN3_1_7B.intermediate_size] @
- * [QWEN3_1_7B.intermediate_size]) hidden_states += proj           (residual)
- *
- * Shared memory layout:
- *   prof = profiler state only
- */
-__device__ void downproj_residual_device(
-    float* hidden_states,                          // [QWEN3_1_7B.hidden_size] — in/out
-    const float* __restrict__ silu_out,            // [QWEN3_1_7B.intermediate_size]
-    const __nv_bfloat16* __restrict__ down_proj_w, // [QWEN3_1_7B.hidden_size, QWEN3_1_7B.intermediate_size] bf16
-    profiler::event_record* g_events, int* g_counts) {
+__device__ void downproj_residual_device(float* hidden_states, const float* __restrict__ silu_out,
+                                         const __nv_bfloat16* __restrict__ down_proj_w,
+                                         profiler::event_record* g_events, int* g_counts) {
     using namespace downproj_events;
     bool has_profiler = (g_events != nullptr);
 
@@ -42,8 +30,6 @@ __device__ void downproj_residual_device(
     if (tid == 0 && has_profiler)
         prof->record(EV_MATVEC);
 
-    // Warp-reduce GEMV: each warp owns one output row via lane reduction.
-    // With 128 blocks × 8 warps = 1024 total warps, all blocks stay active.
     {
         const float4* input4 = reinterpret_cast<const float4*>(silu_out);
         int lane = threadIdx.x & 31;

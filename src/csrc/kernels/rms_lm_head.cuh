@@ -5,7 +5,6 @@
 #include "rmsnorm.cuh"
 #include "../profiler/gpu_profiler.cuh"
 
-// Profiler event IDs
 namespace lmhead_events {
 enum : int {
     EV_RMSNORM = 0,
@@ -13,27 +12,11 @@ enum : int {
     EV_MATVEC = 2,
     EV_MATVEC_END = 3,
 };
-} // namespace lmhead_events
+}
 
-/*
- * Final RMSNorm + LM Head projection
- *
- * post_ln = RMSNorm(hidden_states, norm_w)
- * logits = lm_head_w @ post_ln     (matvec: [vocab_size, QWEN3_1_7B.hidden_size] @ [QWEN3_1_7B.hidden_size])
- *
- * Note: For Qwen3-1.7B, lm_head_w = embed_tokens.weight (tied embeddings).
- *
- * Shared memory layout:
- *   s_post_ln[QWEN3_1_7B.hidden_size]  = 2048 floats = 8 KB
- *   s_reduce[WARP_SIZE]    = 32 floats   = 128 B
- *   prof                   = profiler state
- */
-__device__ void
-rms_lm_head_device(float* logits,                               // [vocab_size] output
-                   const float* __restrict__ hidden,            // [QWEN3_1_7B.hidden_size]
-                   const float* __restrict__ norm_w,            // [QWEN3_1_7B.hidden_size]
-                   const __nv_bfloat16* __restrict__ lm_head_w, // [vocab_size, QWEN3_1_7B.hidden_size] bf16
-                   int vocab_size, profiler::event_record* g_events, int* g_counts) {
+__device__ void rms_lm_head_device(float* logits, const float* __restrict__ hidden, const float* __restrict__ norm_w,
+                                   const __nv_bfloat16* __restrict__ lm_head_w, int vocab_size,
+                                   profiler::event_record* g_events, int* g_counts) {
     using namespace lmhead_events;
     bool has_profiler = (g_events != nullptr);
 
@@ -52,7 +35,6 @@ rms_lm_head_device(float* logits,                               // [vocab_size] 
         prof->init();
     __syncthreads();
 
-    // ===== Phase 1: RMSNorm =====
     if (tid == 0 && has_profiler)
         prof->record(EV_RMSNORM);
 
@@ -63,13 +45,9 @@ rms_lm_head_device(float* logits,                               // [vocab_size] 
     if (tid == 0 && has_profiler)
         prof->record(EV_RMSNORM_END);
 
-    // ===== Phase 2: LM Head MatVec =====
-    // Optimized with float4 vectorized loads + ILP (4 rows per iteration)
     if (tid == 0 && has_profiler)
         prof->record(EV_MATVEC);
 
-    // Warp-reduce GEMV: each warp owns one output row via lane reduction.
-    // With 128 blocks × 8 warps = 1024 total warps, all 128 blocks stay active.
     {
         const float4* input4 = reinterpret_cast<const float4*>(s_post_ln);
         int lane = threadIdx.x & 31;

@@ -10,34 +10,6 @@
 #define FA4_PROFILE_DEFAULT 0
 #endif
 
-// ---------------------------------------------------------------------------
-// PyTorch extension for FA4 Forward Attention
-//
-// Provides a Python-callable interface for the raw CUDA FlashAttention-style
-// forward kernel.  Supports GQA, causal masking, and optional LSE output
-// for ring attention accumulation.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// fa4_forward
-//
-// Args:
-//   Q:  [num_q_heads, seq_q, head_dim]   bf16
-//   K:  [num_kv_heads, seq_kv, head_dim] bf16
-//   V:  [num_kv_heads, seq_kv, head_dim] bf16
-//   scale:      attention scale (1/sqrt(head_dim))
-//   causal:     apply causal masking
-//   return_lse: if true, also return log-sum-exp per query row
-//   q_offset:   global position offset for Q (for ring attention)
-//   kv_offset:  global position offset for KV (for ring attention)
-//
-// Returns:
-//   [O]             if return_lse is false
-//   [O, lse]        if return_lse is true
-//
-//   O:   [num_q_heads, seq_q, head_dim] bf16
-//   lse: [num_q_heads, seq_q]           fp32
-// ---------------------------------------------------------------------------
 namespace {
 void fa4_check_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V) {
     TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be CUDA tensors");
@@ -66,10 +38,8 @@ std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor
     TORCH_CHECK(V.size(0) == num_kv_heads && V.size(1) == seq_kv, "V shape must match K");
     TORCH_CHECK(num_q_heads % num_kv_heads == 0, "num_q_heads must be divisible by num_kv_heads (GQA)");
 
-    // Allocate output
     auto O = torch::empty_like(Q);
 
-    // Optionally allocate LSE
     float* lse_ptr = nullptr;
     torch::Tensor lse;
     if (return_lse) {
@@ -98,7 +68,7 @@ std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor
 
         profiler::event_names names;
         fa4_register_profile_event_names(names);
-        profile_buf.export_perfetto_json(trace_path.c_str(), &names, /*paired=*/true);
+        profile_buf.export_perfetto_json(trace_path.c_str(), &names, true);
         profile_buf.free();
     } else {
         fa4_forward(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
@@ -114,9 +84,6 @@ std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor
     return {O};
 }
 
-// ---------------------------------------------------------------------------
-// pybind11 module
-// ---------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FA4 Forward Attention for Qwen3";
 

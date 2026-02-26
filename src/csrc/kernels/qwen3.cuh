@@ -20,11 +20,10 @@ struct Qwen3Config {
     constexpr __host__ __device__ int qkv_output_dim() const {
         return (num_attention_heads + 2 * num_key_value_heads) * head_dim;
     }
-    // Not constexpr: sqrtf is not a constexpr function. Use `const float` at call sites.
+
     __host__ __device__ float attn_scale() const { return 1.0f / sqrtf(static_cast<float>(head_dim)); }
 };
 
-// Qwen3-1.7B
 constexpr Qwen3Config QWEN3_1_7B = {
     .hidden_size = 2048,
     .intermediate_size = 6144,
@@ -38,7 +37,6 @@ constexpr Qwen3Config QWEN3_1_7B = {
     .rms_norm_eps = 1e-6f,
 };
 
-// Qwen3-8B
 constexpr Qwen3Config QWEN3_8B = {
     .hidden_size = 4096,
     .intermediate_size = 12288,

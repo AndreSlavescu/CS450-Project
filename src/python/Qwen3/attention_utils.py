@@ -10,22 +10,6 @@ def merge_partial_attention(
     O_new: Tensor,
     lse_new: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Merge two partial attention outputs using log-sum-exp.
-
-    Used by zigzag ring attention to combine results from different KV blocks
-    across ring iterations.  The merge is numerically stable via the LSE trick.
-
-    Args:
-        O_prev:   [num_heads, seq_q, head_dim]  bf16 — previous merged output
-        lse_prev: [num_heads, seq_q]             fp32 — previous log-sum-exp
-        O_new:    [num_heads, seq_q, head_dim]  bf16 — new partial output
-        lse_new:  [num_heads, seq_q]             fp32 — new partial log-sum-exp
-
-    Returns:
-        O_merged:   [num_heads, seq_q, head_dim]  bf16
-        lse_merged: [num_heads, seq_q]             fp32
-    """
-    # Work in fp32 for numerical accuracy
     O_prev_f = O_prev.float()
     O_new_f = O_new.float()
 
@@ -47,25 +31,6 @@ def get_zigzag_assignment(
     seq_len: int,
     block_size: int,
 ) -> dict[str, int]:
-    """Compute zigzag block assignment for a given rank.
-
-    ZigZag splits the sequence into 2*world_size blocks and assigns mirrored
-    pairs to each GPU for load-balanced causal attention:
-        GPU k gets blocks (k) and (2*world_size - 1 - k)
-
-    Args:
-        rank:       GPU rank index
-        world_size: total number of GPUs
-        seq_len:    full sequence length
-        block_size: tokens per block
-
-    Returns:
-        dict with keys:
-            block_a: forward block index (-1 if out of bounds)
-            block_b: mirrored block index (-1 if out of bounds)
-            pos_a:   starting token position of block_a
-            pos_b:   starting token position of block_b
-    """
     total_blocks = (seq_len + block_size - 1) // block_size
     padded_blocks = 2 * world_size
 

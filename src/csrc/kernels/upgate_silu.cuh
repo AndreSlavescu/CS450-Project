@@ -6,7 +6,6 @@
 #include "silu.cuh"
 #include "../profiler/gpu_profiler.cuh"
 
-// Profiler event IDs
 namespace upgate_events {
 enum : int {
     EV_RMSNORM = 0,
@@ -16,28 +15,12 @@ enum : int {
     EV_SILU = 4,
     EV_SILU_END = 5,
 };
-} // namespace upgate_events
+}
 
-/*
- * RMSNorm + Gate/Up double MatVec + SiLU
- *
- * post_ln = RMSNorm(hidden_states, mlp_ln_w)
- * gate = gate_w @ post_ln          [QWEN3_1_7B.intermediate_size]
- * up   = up_w   @ post_ln          [QWEN3_1_7B.intermediate_size]
- * silu_out = SiLU(gate) * up        [QWEN3_1_7B.intermediate_size]
- *
- * Shared memory layout:
- *   s_post_ln[QWEN3_1_7B.hidden_size]  = 2048 floats = 8 KB
- *   s_reduce[WARP_SIZE]    = 32 floats   = 128 B
- *   prof                   = profiler state
- */
-__device__ void upgate_silu_device(
-    float* silu_out,                          // [QWEN3_1_7B.intermediate_size] output
-    const float* __restrict__ hidden,         // [QWEN3_1_7B.hidden_size]
-    const float* __restrict__ mlp_ln_w,       // [QWEN3_1_7B.hidden_size]
-    const __nv_bfloat16* __restrict__ gate_w, // [QWEN3_1_7B.intermediate_size, QWEN3_1_7B.hidden_size] bf16
-    const __nv_bfloat16* __restrict__ up_w,   // [QWEN3_1_7B.intermediate_size, QWEN3_1_7B.hidden_size] bf16
-    profiler::event_record* g_events, int* g_counts) {
+__device__ void upgate_silu_device(float* silu_out, const float* __restrict__ hidden,
+                                   const float* __restrict__ mlp_ln_w, const __nv_bfloat16* __restrict__ gate_w,
+                                   const __nv_bfloat16* __restrict__ up_w, profiler::event_record* g_events,
+                                   int* g_counts) {
     using namespace upgate_events;
     bool has_profiler = (g_events != nullptr);
 
@@ -56,7 +39,6 @@ __device__ void upgate_silu_device(
         prof->init();
     __syncthreads();
 
-    // ===== Phase 1: RMSNorm =====
     if (tid == 0 && has_profiler)
         prof->record(EV_RMSNORM);
 
@@ -67,8 +49,6 @@ __device__ void upgate_silu_device(
     if (tid == 0 && has_profiler)
         prof->record(EV_RMSNORM_END);
 
-    // ===== Phase 2+3: Gate + Up MatVec, then fused SiLU * up =====
-    // Optimized with float4 vectorized loads + ILP (4 rows per iteration)
     if (tid == 0 && has_profiler)
         prof->record(EV_MATVEC);
     if (tid == 0 && has_profiler)
@@ -76,8 +56,6 @@ __device__ void upgate_silu_device(
     if (tid == 0 && has_profiler)
         prof->record(EV_SILU);
 
-    // Warp-reduce GEMV: each warp owns one output row for both gate and up.
-    // With 128 blocks × 8 warps = 1024 total warps, all blocks stay active.
     {
         const float4* input4 = reinterpret_cast<const float4*>(s_post_ln);
         int lane = threadIdx.x & 31;

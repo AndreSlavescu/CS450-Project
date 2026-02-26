@@ -5,27 +5,9 @@
 #include "tp_sp.cuh"
 #include "qwen3.cuh"
 
-// ---------------------------------------------------------------------------
-// PyTorch C++ extension for TP+SP collectives via P2P direct memory access
-//
-// For BS=1 decode the activation tensors are tiny (4-8 KB), so NCCL's
-// ~5-10us launch overhead dominates.  Instead we use P2P NVLink writes:
-// each GPU maps every other GPU's memory via cudaDeviceEnablePeerAccess,
-// then simple kernels write/read across GPUs with no collective overhead.
-// ---------------------------------------------------------------------------
-
 static P2PState g_p2p_state = {};
 static bool g_p2p_initialized = false;
 
-// ---------------------------------------------------------------------------
-// Initialization: enable peer access + exchange buffer pointers
-//
-// Args:
-//   tp_size:   number of TP ranks
-//   tp_rank:   this rank's index
-//   all_gather_ptrs_addr:   int64 pointer to device array of tp_size bf16*
-//   reduce_scatter_ptrs_addr: int64 pointer to device array of tp_size bf16*
-// ---------------------------------------------------------------------------
 void init_p2p_state(int64_t tp_size, int64_t tp_rank, int64_t all_gather_ptrs_addr, int64_t reduce_scatter_ptrs_addr) {
     g_p2p_state.tp_size = static_cast<int>(tp_size);
     g_p2p_state.tp_rank = static_cast<int>(tp_rank);
@@ -41,12 +23,6 @@ void destroy_p2p_state() {
     g_p2p_initialized = false;
 }
 
-// ---------------------------------------------------------------------------
-// all_gather: each rank writes its shard into every peer's output buffer
-//
-// Input:  local_shard [shard_size] bf16
-// Output: caller's all_gather buffer now has all shards written by all ranks
-// ---------------------------------------------------------------------------
 void tp_all_gather_op(torch::Tensor local_shard) {
     TORCH_CHECK(g_p2p_initialized, "P2P state not initialized");
     TORCH_CHECK(local_shard.is_cuda(), "input must be a CUDA tensor");
@@ -61,12 +37,6 @@ void tp_all_gather_op(torch::Tensor local_shard) {
                       stream);
 }
 
-// ---------------------------------------------------------------------------
-// reduce_scatter: each rank reads its shard from all peers and sums locally
-//
-// Input:  each rank's reduce_scatter buffer has full partial results
-// Output: dst [shard_size] bf16
-// ---------------------------------------------------------------------------
 torch::Tensor tp_reduce_scatter_op(int64_t shard_size) {
     TORCH_CHECK(g_p2p_initialized, "P2P state not initialized");
 
@@ -83,11 +53,6 @@ torch::Tensor tp_reduce_scatter_op(int64_t shard_size) {
     return dst;
 }
 
-// ---------------------------------------------------------------------------
-// Fused reduce-scatter + residual add (single kernel)
-//
-// Output: dst [shard_size] = reduce_scatter(partials) + residual
-// ---------------------------------------------------------------------------
 torch::Tensor tp_reduce_scatter_residual_op(torch::Tensor residual, int64_t shard_size) {
     TORCH_CHECK(g_p2p_initialized, "P2P state not initialized");
     TORCH_CHECK(residual.is_cuda(), "residual must be a CUDA tensor");
@@ -105,9 +70,6 @@ torch::Tensor tp_reduce_scatter_residual_op(torch::Tensor residual, int64_t shar
     return dst;
 }
 
-// ---------------------------------------------------------------------------
-// pybind11 module
-// ---------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "TP+SP P2P communication primitives for Qwen3";
 

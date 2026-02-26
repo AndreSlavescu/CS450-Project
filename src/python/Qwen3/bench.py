@@ -1,20 +1,3 @@
-"""Qwen3-1.7B batch-size-1 decode latency benchmark.
-
-Compares the persistent megakernel against:
-  - HuggingFace PyTorch (always available)
-  - vLLM             (skipped if not installed)
-  - SGLang           (skipped if not installed)
-
-Usage:
-    # from repo root:
-    python -m src.python.Qwen3.bench
-
-    # options:
-    python -m src.python.Qwen3.bench --tokens 100 --warmup 3 --runs 5
-    python -m src.python.Qwen3.bench --prompt "Explain quantum entanglement"
-    python -m src.python.Qwen3.bench --no-correctness   # skip token comparison
-"""
-
 import argparse
 import gc
 import time
@@ -29,14 +12,10 @@ DEFAULT_TOKENS = 100
 DEFAULT_WARMUP = 3
 DEFAULT_RUNS = 5
 DEFAULT_PROMPT = "Hello"
-CORRECTNESS_TOKENS = 8  # tokens to compare for correctness check
-
-
-# ── timing helper ─────────────────────────────────────────────────────────────
+CORRECTNESS_TOKENS = 8
 
 
 def _timed(fn, warmup: int, runs: int) -> float:
-    """Return average seconds per call over `runs` measured calls."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -52,14 +31,7 @@ def _timed(fn, warmup: int, runs: int) -> float:
     return sum(times) / len(times)
 
 
-# ── HuggingFace baseline ──────────────────────────────────────────────────────
-
-
 def bench_hf(prompt: str, tokens: int, warmup: int, runs: int) -> tuple:
-    """
-    Returns (tok_per_sec, ms_per_tok, generated_ids_list).
-    generated_ids_list is from the last run (for correctness comparison).
-    """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     print("  Loading HuggingFace model...")
@@ -91,11 +63,7 @@ def bench_hf(prompt: str, tokens: int, warmup: int, runs: int) -> tuple:
     return tokens / avg_s, avg_s * 1000 / tokens, gen_ids_out
 
 
-# ── megakernel ────────────────────────────────────────────────────────────────
-
-
 def bench_megakernel(prompt: str, tokens: int, warmup: int, runs: int) -> tuple:
-    """Returns (tok_per_sec, ms_per_tok, generated_ids_list)."""
     from .decoder import Decoder
 
     print("  Loading megakernel decoder...")
@@ -129,9 +97,6 @@ def bench_megakernel(prompt: str, tokens: int, warmup: int, runs: int) -> tuple:
     return tokens / avg_s, avg_s * 1000 / tokens, gen_ids_out, tokenizer
 
 
-# ── vLLM ──────────────────────────────────────────────────────────────────────
-
-
 def bench_vllm(prompt: str, tokens: int, warmup: int, runs: int) -> tuple | None:
     try:
         from vllm import LLM, SamplingParams
@@ -153,9 +118,6 @@ def bench_vllm(prompt: str, tokens: int, warmup: int, runs: int) -> tuple | None
     torch.cuda.empty_cache()
 
     return tokens / avg_s, avg_s * 1000 / tokens
-
-
-# ── SGLang ────────────────────────────────────────────────────────────────────
 
 
 def bench_sglang(prompt: str, tokens: int, warmup: int, runs: int) -> tuple | None:
@@ -182,11 +144,7 @@ def bench_sglang(prompt: str, tokens: int, warmup: int, runs: int) -> tuple | No
     return tokens / avg_s, avg_s * 1000 / tokens
 
 
-# ── correctness check ─────────────────────────────────────────────────────────
-
-
 def correctness_check(prompt: str, n: int = CORRECTNESS_TOKENS):
-    """Compare first n generated tokens between HF and the megakernel."""
     print(f"\nCorrectness check ({n} tokens, prompt={prompt!r})")
     print("-" * 50)
 
@@ -234,9 +192,6 @@ def correctness_check(prompt: str, n: int = CORRECTNESS_TOKENS):
     print(f"  MK text: {tokenizer.decode(mk_ids, skip_special_tokens=True)!r}")
     print(f"  Match  : {'YES' if match else 'NO (numerical divergence expected for long runs)'}")
     return match
-
-
-# ── main ──────────────────────────────────────────────────────────────────────
 
 
 def main():
@@ -288,7 +243,6 @@ def main():
         if r:
             results["SGLang"] = r
 
-    # ── summary table ─────────────────────────────────────────────────────────
     if not results:
         print("\nNo backends ran — check --backends flag.")
         return

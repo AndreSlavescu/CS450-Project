@@ -6,18 +6,6 @@
 
 #include "../profiler/gpu_profiler.cuh"
 
-// ---------------------------------------------------------------------------
-// FA4 Forward Attention — CUTLASS SM100 FMHA for Blackwell
-//
-// Wraps CUTLASS's optimized Blackwell FMHA (example 77) which uses:
-//   - 16-warp (512-thread) kernel with fine-grained warp specialization
-//   - tcgen05 native MMA with TMEM accumulators
-//   - TMA pipeline for Q/K/V loads and O/LSE stores
-//   - Online softmax with dual-pipe architecture
-//   - GQA support via stride broadcasting
-// ---------------------------------------------------------------------------
-
-// Profiler events (retained for API compatibility with fmha_attention.cu)
 enum Fa4ProfileEvent : int {
     FA4_EV_SETUP_BEGIN = 0,
     FA4_EV_SETUP_END = 1,
@@ -32,10 +20,6 @@ inline void fa4_register_profile_event_names(profiler::event_names& names) {
     names.set(FA4_EV_COMPUTE_BEGIN, "compute");
     names.set(FA4_EV_EPILOGUE_BEGIN, "epilogue");
 }
-
-// ---------------------------------------------------------------------------
-// CUTLASS FMHA integration
-// ---------------------------------------------------------------------------
 
 #if __has_include("device/fmha.hpp")
 #define FA4_HAS_CUTLASS_FMHA 1
@@ -61,11 +45,8 @@ using ElementOut = cutlass::bfloat16_t;
 using ElementAccQK = float;
 using ElementAccPV = float;
 
-// Tile shape: (Q_tile=256, KV_tile=128, D=128)
 using TileShape = Shape<_256, _128, _128>;
 
-// Stride types for [num_heads, seq, head_dim] memory layout.
-// CUTLASS FMHA logical dimension order: (seq, head_dim, ((h_repeat, h_kv), batch))
 using StrideQ = tuple<int, _1, tuple<tuple<int, int>, int>>;
 using StrideK = tuple<int, _1, tuple<tuple<_0, int>, int>>;
 using StrideV = StrideK;
@@ -74,7 +55,6 @@ using StrideLSE = tuple<_1, tuple<tuple<int, int>, int>>;
 
 using ProblemShape = tuple<int, int, int, tuple<tuple<int, int>, int>>;
 
-// Compose CUTLASS FMHA types parameterized by mask type.
 template <typename Mask> struct FmhaTypes {
     using Mainloop =
         cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<Element, ElementAccQK, ElementAccPV,
@@ -91,12 +71,9 @@ template <typename Mask> struct FmhaTypes {
     using Op = cutlass::fmha::device::FMHA<Kernel>;
 };
 
-// Mask aliases
 using CausalMaskType = cutlass::fmha::collective::CausalMask<true>;
 using NoMaskType = cutlass::fmha::collective::NoMask;
 
-// Cached device buffers to avoid per-call cudaMalloc/cudaFree overhead.
-// These are grown-only: once allocated, they persist until process exit.
 struct DeviceBufferCache {
     float* lse_buf = nullptr;
     size_t lse_bytes = 0;
@@ -143,7 +120,6 @@ inline DeviceBufferCache& get_buffer_cache() {
     return cache;
 }
 
-// Run CUTLASS FMHA with a specific mask type.
 template <typename Mask>
 inline void run_fmha_impl(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, const __nv_bfloat16* K,
                           const __nv_bfloat16* V, int num_q_heads, int num_kv_heads, int seq_q, int seq_kv,
@@ -153,10 +129,8 @@ inline void run_fmha_impl(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, 
     constexpr int D = 128;
     const int H_R = num_q_heads / num_kv_heads;
 
-    // Problem shape: (seq_q, seq_kv, D, ((h_repeat, h_kv), batch))
     auto problem_shape = make_tuple(seq_q, seq_kv, D, make_tuple(make_tuple(H_R, num_kv_heads), 1));
 
-    // Strides for [num_heads, seq, head_dim] contiguous layout.
     auto stride_Q = make_stride(D, _1{}, make_stride(make_stride(seq_q * D, H_R * seq_q * D), num_q_heads * seq_q * D));
 
     auto stride_K = make_stride(D, _1{}, make_stride(make_stride(_0{}, seq_kv * D), num_kv_heads * seq_kv * D));
@@ -165,14 +139,12 @@ inline void run_fmha_impl(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, 
 
     auto stride_LSE = make_stride(_1{}, make_stride(make_stride(seq_q, H_R * seq_q), num_q_heads * seq_q));
 
-    // Use caller's LSE buffer or get one from the cache (avoids cudaMalloc per call)
     auto& cache = get_buffer_cache();
     float* lse_buf = lse;
     if (!lse_buf) {
         lse_buf = cache.get_lse(static_cast<size_t>(num_q_heads) * static_cast<size_t>(seq_q) * sizeof(float));
     }
 
-    // Hardware info for persistent tile scheduler (SM count cached)
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count = cache.get_sm_count();
@@ -189,7 +161,6 @@ inline void run_fmha_impl(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, 
     TORCH_CHECK(status == cutlass::Status::kSuccess,
                 "CUTLASS FMHA: can_implement failed (status=", static_cast<int>(status), ")");
 
-    // Get workspace from cache (avoids cudaMalloc per call)
     size_t workspace_size = Op::get_workspace_size(arguments);
     void* workspace = cache.get_workspace(workspace_size);
 
@@ -202,7 +173,6 @@ inline void run_fmha_impl(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, 
                 ")");
 }
 
-// Dispatch to causal or non-causal FMHA.
 inline void run_fmha(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, const __nv_bfloat16* K,
                      const __nv_bfloat16* V, int num_q_heads, int num_kv_heads, int seq_q, int seq_kv, bool causal,
                      cudaStream_t stream) {
@@ -217,16 +187,9 @@ inline void run_fmha(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, const
 
 #else
 #define FA4_HAS_CUTLASS_FMHA 0
-#endif // __has_include("device/fmha.hpp")
+#endif
 
-// ---------------------------------------------------------------------------
-// Public API (called from fmha_attention.cu)
-// ---------------------------------------------------------------------------
-
-inline int fa4_profile_block_count(int num_q_heads, int seq_q, int /*seq_kv*/) {
-    // Return a reasonable block count for profiler buffer allocation.
-    // With CUTLASS FMHA, internal profiling is not supported, but we still
-    // need to return a valid count for the profiler host_buffer allocation.
+inline int fa4_profile_block_count(int num_q_heads, int seq_q, int) {
     return num_q_heads * ((seq_q + 255) / 256);
 }
 
@@ -235,9 +198,8 @@ inline void fa4_forward(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, co
                         bool causal, int q_offset, int kv_offset, cudaStream_t stream) {
 #if FA4_HAS_CUTLASS_FMHA
     TORCH_CHECK(num_q_heads % num_kv_heads == 0, "num_q_heads must be divisible by num_kv_heads (GQA)");
-    // Note: q_offset/kv_offset for ring attention are not yet supported
-    // by the CUTLASS FMHA wrapper. They are ignored here (default=0 in benchmarks).
-    (void)scale; // CUTLASS auto-computes 1/sqrt(D)
+
+    (void)scale;
     (void)q_offset;
     (void)kv_offset;
     fa4_cutlass::run_fmha(O, lse, Q, K, V, num_q_heads, num_kv_heads, seq_q, seq_kv, causal, stream);
@@ -264,8 +226,6 @@ inline void fa4_forward_profile(__nv_bfloat16* O, float* lse, const __nv_bfloat1
                                 const __nv_bfloat16* V, int num_q_heads, int num_kv_heads, int seq_q, int seq_kv,
                                 float scale, bool causal, int q_offset, int kv_offset, cudaStream_t stream,
                                 profiler::event_record* profile_events, int* profile_counts) {
-    // CUTLASS FMHA does not support internal profiling events.
-    // Use external tools (Nsight Systems/Compute) for profiling.
     (void)profile_events;
     (void)profile_counts;
     fa4_forward(O, lse, Q, K, V, num_q_heads, num_kv_heads, seq_q, seq_kv, scale, causal, q_offset, kv_offset, stream);

@@ -1,29 +1,9 @@
-"""
-Model FLOPS Utilization (MFU) and memory bandwidth benchmark comparing HuggingFace (HF) baseline vs Megakernel.
-
-Measures MFU and HBM bandwidth utilization using
-theoretical FLOP/byte counts and precise GPU timing via capturing CUDA events.
-
-Supports Qwen3-1.7B and Qwen3-8B model configs.
+"""MFU / bandwidth / TTFT benchmark on Modal (H100 / B200).
 
 Usage:
-    # Run benchmark for Qwen3-1.7B
-    modal run modal_tests/test_benchmark_modal.py --gpu h100
     modal run modal_tests/test_benchmark_modal.py --gpu b200
-
-    # Run benchmark for Qwen3-8B
-    modal run modal_tests/test_benchmark_modal.py --gpu h100 --model qwen3-8b
-    modal run modal_tests/test_benchmark_modal.py --gpu b200 --model qwen3-8b
-
-    # Force rebuild the image
-    FORCE_REBUILD=1 modal run modal_tests/test_benchmark_modal.py --gpu h100
-    FORCE_REBUILD=1 modal run modal_tests/test_benchmark_modal.py --gpu b200
-
-    # Attention kernel microbenchmarks (FA4 / SDPA / ZigZag local)
+    modal run modal_tests/test_benchmark_modal.py --gpu b200 --mode ttft
     modal run modal_tests/test_benchmark_modal.py --gpu b200 --mode kernels
-
-    # Attention microbench + FA4 pipeline trace export
-    modal run modal_tests/test_benchmark_modal.py --gpu b200 --mode kernels --kernels fa4,fa4_profile
 """
 
 from __future__ import annotations
@@ -60,14 +40,12 @@ GPU_CONFIGS = {
     "h100": {
         "dockerfile": PROJECT_ROOT / "Dockerfile.h100",
         "modal_gpu": "H100",
-        # H100 SXM peak specs
         "peak_bandwidth_tb_s": 3.35,
         "peak_tflops_bf16": 989.0,
     },
     "b200": {
         "dockerfile": PROJECT_ROOT / "Dockerfile.b200",
         "modal_gpu": "B200",
-        # B200 peak specs
         "peak_bandwidth_tb_s": 8.0,
         "peak_tflops_bf16": 2250.0,
     },
@@ -88,15 +66,28 @@ else:
         .add_local_dir(str(PROJECT_ROOT / "src"), "/workspace/src")
     )
 
-
-# ---------------------------------------------------------------------------
-# Model configs
-# ---------------------------------------------------------------------------
+if _target_mode == "ttft":
+    _ttft_dockerfile = GPU_CONFIGS.get(_target_gpu, GPU_CONFIGS["b200"])["dockerfile"]
+    vllm_image = modal.Image.from_dockerfile(_ttft_dockerfile, force_build=force_rebuild).pip_install(
+        "vllm>=0.8.0", "transformers>=4.51.0,<5.0", "sentencepiece"
+    )
+    sglang_image = (
+        modal.Image.from_dockerfile(_ttft_dockerfile, force_build=force_rebuild)
+        .apt_install("libnuma-dev")
+        .pip_install(
+            "sglang[srt]>=0.4.0",
+            "flashinfer-python",
+            "transformers>=4.51.0,<5.0",
+            "sentencepiece",
+        )
+    )
+else:
+    vllm_image = _placeholder
+    sglang_image = _placeholder
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Architecture constants for a transformer model."""
 
     name: str
     hf_id: str
@@ -145,7 +136,8 @@ BENCH_SEQ_LENS = [1, 32, 128, 512, 1024]
 BENCH_PROMPT = "The quick brown fox jumps over the lazy dog"
 KERNEL_BENCH_SEQ_LENS = [1024, 2048, 4096, 8192, 16384, 32768]
 KERNEL_DEFAULTS = ("fa4", "fa4_lse", "sdpa", "sdpa_math", "zigzag_local")
-# fa4_nocausal: non-causal FA4 for measuring raw throughput ceiling
+TTFT_PROMPT_LENS = [16, 64, 128, 256, 512, 1024]
+_TTFT_BASE = "The quick brown fox jumps over the lazy dog. "
 
 
 class TheoreticalPerf:
@@ -202,7 +194,6 @@ class TheoreticalPerf:
         gate_weights = c.hidden_size * c.intermediate_size
         up_weights = c.hidden_size * c.intermediate_size
         down_weights = c.intermediate_size * c.hidden_size
-        # 2 RMSNorm weights per layer
         norm_weights = 2 * c.hidden_size
 
         total_params = qkv_weights + o_proj_weights + gate_weights + up_weights + down_weights + norm_weights
@@ -330,7 +321,6 @@ def _run_hf_benchmark(
             cur_token = out.logits[:, -1:, :].argmax(dim=-1)
 
         times_ms_sorted = sorted(times_ms)
-        # Trim top/bottom 10% for robust mean
         trim = max(1, len(times_ms_sorted) // 10)
         trimmed = times_ms_sorted[trim:-trim] if len(times_ms_sorted) > 2 * trim else times_ms_sorted
         mean_ms = sum(trimmed) / len(trimmed)
@@ -341,7 +331,6 @@ def _run_hf_benchmark(
         theory = TheoreticalPerf(cfg, actual_seq_len)
         total_flops = theory.total_flops()
         total_bytes = theory.total_memory_bytes()
-
         achieved_tflops = total_flops / (mean_ms / 1000.0) / 1e12
         achieved_bw_gb_s = total_bytes / (mean_ms / 1000.0) / 1e9
 
@@ -447,7 +436,6 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
 
 
 def _attention_theoretical_metrics(cfg: ModelConfig, seq_len: int, causal: bool = True) -> dict:
-    # Causal attention uses triangular score matrix; non-causal uses full matrix.
     pairs = seq_len * (seq_len + 1) // 2 if causal else seq_len * seq_len
     flops_qk = 2 * cfg.num_q_heads * cfg.head_dim * pairs
     flops_pv = 2 * cfg.num_q_heads * cfg.head_dim * pairs
@@ -503,7 +491,6 @@ def _run_attention_kernels_benchmark(
     fmha_attention, zigzag_attention = _build_attention_kernel_modules(gpu, kernels)
 
     def _sdpa_math_context():
-        # Prefer the newer API; fallback to legacy CUDA backend selector.
         try:
             from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -527,7 +514,6 @@ def _run_attention_kernels_benchmark(
         K_b = K.unsqueeze(0)
         V_b = V.unsqueeze(0)
 
-        # SDPA reference used for correctness deltas.
         with torch.no_grad():
             ref_out = F.scaled_dot_product_attention(Q_b, K_b, V_b, is_causal=True, enable_gqa=True).squeeze(0)
 
@@ -689,7 +675,6 @@ def _run_megakernel_benchmark(
 
     import torch
 
-    # Make /workspace importable so `from src.python.Qwen3.xxx import ...` works.
     sys.path.insert(0, "/workspace")
     os.chdir("/workspace")
 
@@ -709,15 +694,11 @@ def _run_megakernel_benchmark(
     for seq_len in seq_lens:
         print(f"\n--- Megakernel benchmarking seq_len={seq_len} ---")
 
-        # Simulate having already decoded seq_len tokens: set the position counter
-        # directly and leave the KV cache zeroed (all-zero KV is fine for timing).
         dec.reset()
         dec._position = seq_len
-
-        dummy_token = 1  # arbitrary non-EOS token id
+        dummy_token = 1
 
         def _run_once():
-            # Reset position so every timed call measures decode at the same depth.
             dec._position = seq_len
             return dec.step(dummy_token)
 
@@ -783,6 +764,329 @@ def _run_megakernel_benchmark(
     }
 
 
+def _run_vm_benchmark(
+    model_cfg: dict,
+    seq_lens: list[int],
+    warmup_iters: int,
+    bench_iters: int,
+) -> dict:
+    import os
+    import sys
+
+    import torch
+
+    sys.path.insert(0, "/workspace")
+    os.chdir("/workspace")
+
+    cfg = ModelConfig(**model_cfg)
+    device_name = torch.cuda.get_device_name(0)
+    print(f"Device: {device_name}")
+
+    print("Loading Decoder (JIT compile + weight load)...")
+    from src.python.Qwen3.decoder import Decoder
+
+    dec = Decoder(verbose=True)
+    print("Decoder ready.")
+
+    print("\n=== Correctness check: 20 tokens, baseline vs VM ===")
+    dec.reset()
+    dec._vm_enabled = False
+    baseline_toks = []
+    tok = dec.step(1)  # arbitrary start token
+    baseline_toks.append(tok)
+    for _ in range(19):
+        tok = dec.step(tok)
+        baseline_toks.append(tok)
+
+    dec.reset()
+    dec._vm_enabled = True
+    vm_toks = []
+    tok = dec.step(1)
+    vm_toks.append(tok)
+    for _ in range(19):
+        tok = dec.step(tok)
+        vm_toks.append(tok)
+
+    match = baseline_toks == vm_toks
+    print(f"  Baseline tokens: {baseline_toks[:10]}...")
+    print(f"  VM tokens:       {vm_toks[:10]}...")
+    print(f"  Match: {match}")
+    if not match:
+        mismatches = [(i, b, v) for i, (b, v) in enumerate(zip(baseline_toks, vm_toks)) if b != v]
+        print(f"  First mismatches: {mismatches[:5]}")
+
+    results: dict[int, dict] = {}
+    for seq_len in seq_lens:
+        print(f"\n--- Benchmarking seq_len={seq_len} ---")
+        dummy_token = 1
+
+        row: dict = {"seq_len": seq_len}
+        theory = TheoreticalPerf(cfg, seq_len)
+        total_flops = theory.total_flops()
+        total_bytes = theory.total_memory_bytes()
+
+        for label, use_vm in [("baseline", False), ("vm", True)]:
+            dec.reset()
+            dec._position = seq_len
+            dec._vm_enabled = use_vm
+
+            for _ in range(warmup_iters):
+                dec._position = seq_len
+                dec.step(dummy_token)
+            torch.cuda.synchronize()
+
+            times_ms = []
+            for _ in range(bench_iters):
+                dec._position = seq_len
+                torch.cuda.synchronize()
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record()
+                dec.step(dummy_token)
+                e.record()
+                torch.cuda.synchronize()
+                times_ms.append(s.elapsed_time(e))
+
+            times_ms.sort()
+            trim = max(1, len(times_ms) // 10)
+            trimmed = times_ms[trim:-trim] if len(times_ms) > 2 * trim else times_ms
+            mean_ms = sum(trimmed) / len(trimmed)
+            median_ms = times_ms[len(times_ms) // 2]
+            min_ms = times_ms[0]
+            tok_s = 1000.0 / mean_ms
+            tflops = total_flops / (mean_ms / 1000.0) / 1e12
+            bw_gb_s = total_bytes / (mean_ms / 1000.0) / 1e9
+
+            row[f"{label}_mean_ms"] = mean_ms
+            row[f"{label}_median_ms"] = median_ms
+            row[f"{label}_min_ms"] = min_ms
+            row[f"{label}_tok_s"] = tok_s
+            row[f"{label}_tflops"] = tflops
+            row[f"{label}_bw_gb_s"] = bw_gb_s
+            print(
+                f"  [{label:>8}] mean={mean_ms:.3f}ms  median={median_ms:.3f}ms"
+                f"  min={min_ms:.3f}ms  {tok_s:.0f} tok/s  {bw_gb_s:.0f} GB/s"
+            )
+
+        speedup = row["baseline_mean_ms"] / row["vm_mean_ms"] if row["vm_mean_ms"] > 0 else 0
+        row["speedup"] = speedup
+        print(f"  → VM speedup: {speedup:.2f}x")
+
+        results[seq_len] = row
+
+    return {
+        "device": device_name,
+        "model": cfg.name,
+        "correctness_match": match,
+        "results": results,
+    }
+
+
+def _prompt_ids_ttft(tokenizer, n_tokens: int) -> list[int]:
+    base_ids = tokenizer.encode(_TTFT_BASE, add_special_tokens=False)
+    reps = (n_tokens // len(base_ids)) + 2
+    return (base_ids * reps)[:n_tokens]
+
+
+def _run_ttft_benchmark(
+    model_cfg: dict,
+    prompt_lens: list[int],
+    warmup_iters: int,
+    bench_iters: int,
+) -> dict:
+    import time as _time
+
+    import torch
+
+    cfg = ModelConfig(**model_cfg)
+    device_name = torch.cuda.get_device_name(0)
+    print(f"Device: {device_name}")
+
+    results: dict[str, dict] = {}
+
+    print("\n[megakernel] CUDA graph prefill (cuBLAS GEMM + Flash SDPA)")
+    from src.python.Qwen3.decoder import Decoder
+
+    dec = Decoder(verbose=False)
+    dec._fused_prefill_max_n = 0
+    tokenizer = dec.tokenizer
+    mk_results: dict[int, float] = {}
+
+    for n in prompt_lens:
+        ids = _prompt_ids_ttft(tokenizer, n)
+        ids_t = torch.tensor(ids, dtype=torch.long, device="cuda")  # pre-create GPU tensor
+        for _ in range(warmup_iters):
+            dec.reset()
+            dec.prefill(ids_t)
+        torch.cuda.synchronize()
+
+        times_ms = []
+        for _ in range(bench_iters):
+            dec.reset()
+            torch.cuda.synchronize()
+            t0 = _time.perf_counter()
+            dec.prefill(ids_t)
+            torch.cuda.synchronize()
+            times_ms.append((_time.perf_counter() - t0) * 1000)
+
+        mean_ms = sum(times_ms) / len(times_ms)
+        mk_results[n] = mean_ms
+        print(f"  n={n:5d} → {mean_ms:8.1f} ms  ({n / (mean_ms / 1000):.0f} tok/s prefill)")
+
+    results["megakernel"] = mk_results
+
+    print("\n[fused] persistent cooperative kernel prefill (thin-GEMM, single launch)")
+    dec._fused_prefill_max_n = 32
+    fused_results: dict[int, float] = {}
+
+    for n in prompt_lens:
+        if n > 32:
+            continue
+        ids = _prompt_ids_ttft(tokenizer, n)
+        for _ in range(warmup_iters):
+            dec.reset()
+            dec.prefill_fused(ids)
+        torch.cuda.synchronize()
+
+        times_ms = []
+        for _ in range(bench_iters):
+            dec.reset()
+            torch.cuda.synchronize()
+            t0 = _time.perf_counter()
+            dec.prefill_fused(ids)
+            torch.cuda.synchronize()
+            times_ms.append((_time.perf_counter() - t0) * 1000)
+
+        mean_ms = sum(times_ms) / len(times_ms)
+        fused_results[n] = mean_ms
+        print(f"  n={n:5d} → {mean_ms:8.1f} ms  ({n / (mean_ms / 1000):.0f} tok/s prefill)")
+
+    if fused_results:
+        results["fused"] = fused_results
+
+    del dec
+
+    print("\n[HuggingFace] batched prefill")
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        hf_tokenizer = AutoTokenizer.from_pretrained(cfg.hf_id, trust_remote_code=True)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            cfg.hf_id, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True
+        )
+        hf_model.eval()
+        hf_results: dict[int, float] = {}
+
+        for n in prompt_lens:
+            ids = _prompt_ids_ttft(hf_tokenizer, n)
+            input_ids = torch.tensor([ids], device="cuda")
+
+            for _ in range(warmup_iters):
+                with torch.no_grad():
+                    hf_model.generate(
+                        input_ids,
+                        max_new_tokens=1,
+                        do_sample=False,
+                        use_cache=True,
+                        pad_token_id=hf_tokenizer.pad_token_id,
+                    )
+            torch.cuda.synchronize()
+
+            times_ms = []
+            for _ in range(bench_iters):
+                torch.cuda.synchronize()
+                t0 = _time.perf_counter()
+                with torch.no_grad():
+                    hf_model.generate(
+                        input_ids,
+                        max_new_tokens=1,
+                        do_sample=False,
+                        use_cache=True,
+                        pad_token_id=hf_tokenizer.pad_token_id,
+                    )
+                torch.cuda.synchronize()
+                times_ms.append((_time.perf_counter() - t0) * 1000)
+
+            mean_ms = sum(times_ms) / len(times_ms)
+            hf_results[n] = mean_ms
+            print(f"  n={n:5d} → {mean_ms:8.1f} ms")
+
+        results["HuggingFace"] = hf_results
+        del hf_model
+    except Exception as e:
+        print(f"  HuggingFace benchmark failed: {e}")
+
+    print("\n[vLLM] optimized prefill")
+    try:
+        from vllm import LLM, SamplingParams
+
+        vllm_tokenizer = tokenizer
+        llm = LLM(model=cfg.hf_id, dtype="bfloat16", max_model_len=max(prompt_lens) + 64)
+        vllm_params = SamplingParams(temperature=0.0, max_tokens=1)
+        vllm_results: dict[int, float] = {}
+
+        for n in prompt_lens:
+            ids = _prompt_ids_ttft(vllm_tokenizer, n)
+            prompt_text = vllm_tokenizer.decode(ids, skip_special_tokens=True)
+            for _ in range(warmup_iters):
+                llm.generate([prompt_text], vllm_params)
+            times_ms = []
+            for _ in range(bench_iters):
+                t0 = _time.perf_counter()
+                llm.generate([prompt_text], vllm_params)
+                times_ms.append((_time.perf_counter() - t0) * 1000)
+            mean_ms = sum(times_ms) / len(times_ms)
+            vllm_results[n] = mean_ms
+            print(f"  n={n:5d} → {mean_ms:8.1f} ms")
+
+        results["vLLM"] = vllm_results
+        del llm
+    except ImportError:
+        print("  vLLM not installed — skipping.")
+    except Exception as e:
+        print(f"  vLLM benchmark failed: {e}")
+
+    print("\n[SGLang] optimized prefill")
+    try:
+        import sglang as sgl
+        from sglang.srt.sampling.sampling_params import SamplingParams as SGLParams
+
+        sgl_tokenizer = tokenizer
+        engine = sgl.Engine(model_path=cfg.hf_id, dtype="bfloat16", tp_size=1)
+        sgl_params = SGLParams(max_new_tokens=1, temperature=0.0)
+        sgl_results: dict[int, float] = {}
+
+        for n in prompt_lens:
+            ids = _prompt_ids_ttft(sgl_tokenizer, n)
+            prompt_text = sgl_tokenizer.decode(ids, skip_special_tokens=True)
+            for _ in range(warmup_iters):
+                engine.generate(prompts=[prompt_text], sampling_params=sgl_params)
+            times_ms = []
+            for _ in range(bench_iters):
+                t0 = _time.perf_counter()
+                engine.generate(prompts=[prompt_text], sampling_params=sgl_params)
+                times_ms.append((_time.perf_counter() - t0) * 1000)
+            mean_ms = sum(times_ms) / len(times_ms)
+            sgl_results[n] = mean_ms
+            print(f"  n={n:5d} → {mean_ms:8.1f} ms")
+
+        results["SGLang"] = sgl_results
+        engine.shutdown()
+    except ImportError:
+        print("  SGLang not installed — skipping.")
+    except Exception as e:
+        print(f"  SGLang benchmark failed: {e}")
+
+    return {
+        "device": device_name,
+        "model": cfg.name,
+        "prompt_lens": prompt_lens,
+        "warmup_iters": warmup_iters,
+        "bench_iters": bench_iters,
+        "results": results,
+    }
+
+
 @app.function(
     image=bench_image,
     gpu=GPU_CONFIGS[_target_gpu]["modal_gpu"],
@@ -802,6 +1106,160 @@ def run_megakernel_benchmark(
         print(f"Device: {torch.cuda.get_device_name(0)}")
 
     return _run_megakernel_benchmark(model_cfg, seq_lens, warmup_iters, bench_iters)
+
+
+@app.function(
+    image=bench_image,
+    gpu=GPU_CONFIGS[_target_gpu]["modal_gpu"],
+    timeout=3600,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def run_ttft_benchmark(
+    model_cfg: dict,
+    prompt_lens: list[int],
+    warmup_iters: int = WARMUP_ITERS,
+    bench_iters: int = BENCH_ITERS,
+) -> dict:
+    import torch
+
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"Device: {torch.cuda.get_device_name(0)}")
+
+    return _run_ttft_benchmark(model_cfg, prompt_lens, warmup_iters, bench_iters)
+
+
+@app.function(
+    image=vllm_image,
+    gpu=GPU_CONFIGS[_target_gpu]["modal_gpu"],
+    timeout=3600,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def run_ttft_vllm(
+    model_cfg: dict,
+    prompt_lens: list[int],
+    warmup_iters: int = WARMUP_ITERS,
+    bench_iters: int = BENCH_ITERS,
+) -> dict:
+    import time as _time
+
+    import torch
+    from transformers import AutoTokenizer
+
+    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
+    print(f"[vLLM runner] Device: {device_name}")
+
+    cfg = ModelConfig(**model_cfg)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.hf_id, trust_remote_code=True)
+    vllm_results: dict[int, float] = {}
+
+    try:
+        from vllm import LLM, SamplingParams
+
+        llm = LLM(model=cfg.hf_id, dtype="bfloat16", max_model_len=max(prompt_lens) + 64)
+        vllm_params = SamplingParams(temperature=0.0, max_tokens=1)
+
+        for n in prompt_lens:
+            ids = _prompt_ids_ttft(tokenizer, n)
+            prompt_text = tokenizer.decode(ids, skip_special_tokens=True)
+            for _ in range(warmup_iters):
+                llm.generate([prompt_text], vllm_params)
+            times_ms = []
+            for _ in range(bench_iters):
+                t0 = _time.perf_counter()
+                llm.generate([prompt_text], vllm_params)
+                times_ms.append((_time.perf_counter() - t0) * 1000)
+            mean_ms = sum(times_ms) / len(times_ms)
+            vllm_results[n] = mean_ms
+            print(f"  n={n:5d} → {mean_ms:8.1f} ms")
+
+        del llm
+    except Exception as e:
+        print(f"  vLLM benchmark failed: {e}")
+
+    return {
+        "device": device_name,
+        "model": cfg.name,
+        "prompt_lens": prompt_lens,
+        "results": {"vLLM": vllm_results},
+    }
+
+
+@app.function(
+    image=sglang_image,
+    gpu=GPU_CONFIGS[_target_gpu]["modal_gpu"],
+    timeout=3600,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def run_ttft_sglang(
+    model_cfg: dict,
+    prompt_lens: list[int],
+    warmup_iters: int = WARMUP_ITERS,
+    bench_iters: int = BENCH_ITERS,
+) -> dict:
+    import time as _time
+
+    import torch
+    from transformers import AutoTokenizer
+
+    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
+    print(f"[SGLang runner] Device: {device_name}")
+
+    cfg = ModelConfig(**model_cfg)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.hf_id, trust_remote_code=True)
+    sgl_results: dict[int, float] = {}
+
+    try:
+        import sglang as sgl
+
+        engine = sgl.Engine(model_path=cfg.hf_id, dtype="bfloat16", tp_size=1)
+        sgl_params = {"max_new_tokens": 1, "temperature": 0.0}
+
+        for n in prompt_lens:
+            ids = _prompt_ids_ttft(tokenizer, n)
+            prompt_text = tokenizer.decode(ids, skip_special_tokens=True)
+            for _ in range(warmup_iters):
+                engine.generate([prompt_text], sgl_params)
+            times_ms = []
+            for _ in range(bench_iters):
+                t0 = _time.perf_counter()
+                engine.generate([prompt_text], sgl_params)
+                times_ms.append((_time.perf_counter() - t0) * 1000)
+            mean_ms = sum(times_ms) / len(times_ms)
+            sgl_results[n] = mean_ms
+            print(f"  n={n:5d} → {mean_ms:8.1f} ms")
+
+        engine.shutdown()
+    except Exception as e:
+        print(f"  SGLang benchmark failed: {e}")
+
+    return {
+        "device": device_name,
+        "model": cfg.name,
+        "prompt_lens": prompt_lens,
+        "results": {"SGLang": sgl_results},
+    }
+
+
+@app.function(
+    image=bench_image,
+    gpu=GPU_CONFIGS[_target_gpu]["modal_gpu"],
+    timeout=3600,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def run_vm_benchmark(
+    model_cfg: dict,
+    seq_lens: list[int],
+    warmup_iters: int = WARMUP_ITERS,
+    bench_iters: int = BENCH_ITERS,
+) -> dict:
+    import torch
+
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"Device: {torch.cuda.get_device_name(0)}")
+
+    return _run_vm_benchmark(model_cfg, seq_lens, warmup_iters, bench_iters)
 
 
 @app.function(
@@ -1132,8 +1590,8 @@ def main(
         return
 
     mode = mode.lower()
-    if mode not in ("model", "kernels", "megakernel"):
-        print("Unknown mode. Use 'model', 'kernels', or 'megakernel'.")
+    if mode not in ("model", "kernels", "megakernel", "ttft", "vm"):
+        print("Unknown mode. Use 'model', 'kernels', 'megakernel', 'ttft', or 'vm'.")
         return
 
     requested_kernels = [k.strip() for k in kernels.split(",") if k.strip()]
@@ -1254,6 +1712,125 @@ def main(
                     f"{sl:>8} {r['mean_ms']:>10.3f} {r['tokens_per_sec']:>8.1f} "
                     f"{r['achieved_tflops']:>9.3f} {r['achieved_bw_gb_s']:>10.1f}"
                 )
+        return
+
+    if mode == "vm":
+        vm_seq_lens = [1, 64, 256, 1024, 2048]
+        print(f"\n{'='*70}")
+        print(f"VM Kernel A/B Benchmark: {model_cfg.name} on {gpu_name}")
+        print(f"Seq lengths: {vm_seq_lens}")
+        print(f"{'='*70}")
+        vm_results = run_vm_benchmark.remote(model_cfg_dict, vm_seq_lens, warmup_iters, bench_iters)
+
+        correct = vm_results.get("correctness_match", "N/A")
+        print(f"\nCorrectness match: {correct}")
+
+        vm_data = vm_results.get("results", {})
+        peak_bw_gb_s = gpu_config["peak_bandwidth_tb_s"] * 1000
+
+        print(f"\n{'='*90}")
+        print(
+            f"{'seq_len':>8} {'baseline':>10} {'VM':>10} {'speedup':>8}"
+            f" {'BL BW':>10} {'VM BW':>10} {'BL util':>8} {'VM util':>8}"
+        )
+        print("-" * 90)
+        for sl in vm_seq_lens:
+            r = vm_data.get(sl) or vm_data.get(str(sl))
+            if not r:
+                continue
+            bl_ms = r["baseline_mean_ms"]
+            vm_ms = r["vm_mean_ms"]
+            sp = r["speedup"]
+            bl_bw = r["baseline_bw_gb_s"]
+            vm_bw = r["vm_bw_gb_s"]
+            bl_util = bl_bw / peak_bw_gb_s * 100
+            vm_util = vm_bw / peak_bw_gb_s * 100
+            print(
+                f"{sl:>8} {bl_ms:>9.3f}ms {vm_ms:>9.3f}ms {sp:>7.2f}x"
+                f" {bl_bw:>9.0f} {vm_bw:>9.0f} {bl_util:>7.1f}% {vm_util:>7.1f}%"
+            )
+        print(f"{'='*90}")
+
+        results_path = ref_dir / f"vm_benchmark_{model_slug}_{gpu}_{timestamp}.json"
+        with open(results_path, "w") as f:
+            json.dump({"gpu": gpu_name, "model": model_cfg.name, **vm_results}, f, indent=2, default=str)
+        print(f"\nVM benchmark results saved to {results_path}")
+        return
+
+    if mode == "ttft":
+        print(f"\n{'='*70}")
+        print(f"TTFT Benchmark: {model_cfg.name} on {gpu_name}")
+        print(f"Prompt lengths: {TTFT_PROMPT_LENS}")
+        print(f"{'='*70}")
+
+        ttft_handle = run_ttft_benchmark.spawn(model_cfg_dict, TTFT_PROMPT_LENS, warmup_iters, bench_iters)
+        vllm_handle = None
+        sglang_handle = None
+        try:
+            vllm_handle = run_ttft_vllm.spawn(model_cfg_dict, TTFT_PROMPT_LENS, warmup_iters, bench_iters)
+        except Exception as e:
+            print(f"[WARN] Failed to spawn vLLM benchmark: {e}")
+        try:
+            sglang_handle = run_ttft_sglang.spawn(model_cfg_dict, TTFT_PROMPT_LENS, warmup_iters, bench_iters)
+        except Exception as e:
+            print(f"[WARN] Failed to spawn SGLang benchmark: {e}")
+
+        ttft_results = ttft_handle.get()
+        vllm_results: dict = {}
+        sglang_results: dict = {}
+        if vllm_handle is not None:
+            try:
+                vllm_results = vllm_handle.get()
+            except Exception as e:
+                print(f"[WARN] vLLM benchmark failed: {e}")
+        if sglang_handle is not None:
+            try:
+                sglang_results = sglang_handle.get()
+            except Exception as e:
+                print(f"[WARN] SGLang benchmark failed: {e}")
+
+        backends_data: dict = ttft_results.get("results", {})
+        for ext_results in (vllm_results, sglang_results):
+            for backend, timings in ext_results.get("results", {}).items():
+                backends_data[backend] = timings
+        active_backends = [b for b in backends_data if backends_data[b]]
+
+        print(f"\n{'='*70}")
+        print("TTFT RESULTS (mean ms, lower is better)")
+        print(f"{'='*70}")
+
+        print(f"{'prompt_len':>10}", end="")
+        for b in active_backends:
+            print(f"  {b:>14}", end="")
+        mk_data = backends_data.get("megakernel")
+        others = [b for b in active_backends if b != "megakernel"]
+        if mk_data and others:
+            for b in others:
+                print(f"  {'MK/' + b:>12}", end="")
+        print()
+        print("-" * (10 + 16 * len(active_backends) + (13 * len(others) if mk_data else 0)))
+
+        for n in TTFT_PROMPT_LENS:
+            print(f"{n:>10}", end="")
+            for b in active_backends:
+                val = backends_data[b].get(n) if backends_data[b] else None
+                print(f"  {(f'{val:.1f}' if val is not None else 'N/A'):>14}", end="")
+            if mk_data and others:
+                for b in others:
+                    val = backends_data[b].get(n) if backends_data[b] else None
+                    mk_val = mk_data.get(n) if mk_data else None
+                    if val and mk_val:
+                        print(f"  {mk_val / val:>11.2f}x", end="")
+                    else:
+                        print(f"  {'N/A':>12}", end="")
+            print()
+
+        print(f"{'='*70}")
+
+        results_path = ref_dir / f"ttft_{model_slug}_{gpu}_{timestamp}.json"
+        with open(results_path, "w") as f:
+            json.dump({"gpu": gpu_name, "model": model_cfg.name, **ttft_results}, f, indent=2, default=str)
+        print(f"\nTTFT results saved to {results_path}")
         return
 
     print(f"\n{'='*70}")

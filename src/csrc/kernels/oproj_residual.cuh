@@ -4,29 +4,16 @@
 #include "utils.cuh"
 #include "../profiler/gpu_profiler.cuh"
 
-// Profiler event IDs
 namespace oproj_events {
 enum : int {
     EV_MATVEC = 0,
     EV_MATVEC_END = 1,
 };
-} // namespace oproj_events
+}
 
-/*
- * O-Projection + Residual Add
- *
- * proj = o_proj_weight @ attn_out   (matvec: [QWEN3_1_7B.hidden_size, QWEN3_1_7B.hidden_size] @
- * [QWEN3_1_7B.hidden_size]) hidden_states += proj             (residual)
- *
- * Shared memory layout:
- *   s_attn[QWEN3_1_7B.hidden_size]  = 2048 floats = 8 KB
- *   prof                = profiler state
- */
-__device__ void oproj_residual_device(
-    float* hidden_states,                       // [QWEN3_1_7B.hidden_size] — in/out (residual added in-place)
-    const float* __restrict__ attn_out,         // [QWEN3_1_7B.hidden_size]
-    const __nv_bfloat16* __restrict__ o_proj_w, // [QWEN3_1_7B.hidden_size, QWEN3_1_7B.hidden_size] bf16
-    profiler::event_record* g_events, int* g_counts) {
+__device__ void oproj_residual_device(float* hidden_states, const float* __restrict__ attn_out,
+                                      const __nv_bfloat16* __restrict__ o_proj_w, profiler::event_record* g_events,
+                                      int* g_counts) {
     using namespace oproj_events;
     bool has_profiler = (g_events != nullptr);
 
@@ -41,7 +28,6 @@ __device__ void oproj_residual_device(
         prof->init();
     __syncthreads();
 
-    // Load attn_out into shared memory
     for (int i = tid; i < QWEN3_1_7B.hidden_size; i += num_threads) {
         s_attn[i] = attn_out[i];
     }
@@ -50,9 +36,6 @@ __device__ void oproj_residual_device(
     if (tid == 0 && has_profiler)
         prof->record(EV_MATVEC);
 
-    // MatVec: proj = o_proj_w @ attn_out, then residual add
-    // Warp-reduce GEMV: each warp owns one output row via lane reduction.
-    // With 128 blocks × 8 warps = 1024 total warps, all blocks stay active.
     {
         const float4* input4 = reinterpret_cast<const float4*>(s_attn);
         int lane = threadIdx.x & 31;

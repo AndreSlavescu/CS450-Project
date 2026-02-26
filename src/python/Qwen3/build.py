@@ -1,14 +1,3 @@
-"""JIT compilation of qwen3_kernels CUDA extension.
-
-Detects GPU architecture automatically; caches the loaded module so it is
-only compiled once per process.
-
-Usage:
-    from src.python.Qwen3.build import get_kernels
-    kernels = get_kernels()
-    logits = kernels.qwen3_decode_persistent_forward(hidden, ...)
-"""
-
 from pathlib import Path
 
 from torch.utils.cpp_extension import load
