@@ -330,9 +330,6 @@ __global__ void __launch_bounds__(512, 1)
     constexpr int hidden_size = QWEN3_1_7B.hidden_size;
     constexpr int intermediate_size = QWEN3_1_7B.intermediate_size;
 
-    extern __shared__ char smem_raw[];
-    __nv_bfloat16* s_buf = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-
     unsigned int local_epoch = 0u;
 
     for (int layer = 0; layer < num_layers; layer++) {
@@ -341,7 +338,7 @@ __global__ void __launch_bounds__(512, 1)
         prefill_rmsnorm_all(g_normed, hidden, w.attn_ln_w, N, hidden_size);
         grid_barrier_sync(bar, 128u, local_epoch);
 
-        prefill_qkv_thin_gemm_bf16(g_q, g_k, g_v, g_normed, w.qkv_w, N, s_buf);
+        prefill_qkv_thin_gemm(g_q, g_k, g_v, g_normed, w.qkv_w, N);
         grid_barrier_sync(bar, 128u, local_epoch);
 
         prefill_qknorm_rope_kvcache(g_q, g_k, g_v, w.k_cache, w.v_cache, w.q_norm_w, w.k_norm_w, cos_cache, sin_cache,
@@ -363,16 +360,16 @@ __global__ void __launch_bounds__(512, 1)
         }
         grid_barrier_sync(bar, 128u, local_epoch);
 
-        prefill_thin_gemm_residual_bf16(hidden, g_attn_out, w.o_proj_w, N, hidden_size, hidden_size, s_buf);
+        prefill_thin_gemm_residual(hidden, g_attn_out, w.o_proj_w, N, hidden_size, hidden_size);
         grid_barrier_sync(bar, 128u, local_epoch);
 
         prefill_rmsnorm_all(g_normed, hidden, w.mlp_ln_w, N, hidden_size);
         grid_barrier_sync(bar, 128u, local_epoch);
 
-        prefill_upgate_silu_thin_gemm_bf16(g_silu, g_normed, w.gate_w, w.up_w, N, s_buf);
+        prefill_upgate_silu_thin_gemm(g_silu, g_normed, w.gate_w, w.up_w, N);
         grid_barrier_sync(bar, 128u, local_epoch);
 
-        prefill_thin_gemm_residual_bf16(hidden, g_silu, w.down_proj_w, N, hidden_size, intermediate_size, s_buf);
+        prefill_thin_gemm_residual(hidden, g_silu, w.down_proj_w, N, hidden_size, intermediate_size);
         grid_barrier_sync(bar, 128u, local_epoch);
     }
 }
@@ -437,13 +434,7 @@ torch::Tensor qwen3_prefill_persistent_forward(torch::Tensor hidden, torch::Tens
 
     const int block_size = 512;
     const int grid_size = 128;
-    size_t smem_bytes = (size_t)N * SMEM_CHUNK * sizeof(__nv_bfloat16) + kernels::WARP_SIZE * sizeof(float);
-
-    static size_t last_smem_configured = 0;
-    if (smem_bytes > last_smem_configured) {
-        cudaFuncSetAttribute(qwen3_prefill_persistent, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        last_smem_configured = smem_bytes;
-    }
+    size_t smem_bytes = kernels::WARP_SIZE * sizeof(float);
 
     float* hidden_ptr = output_hidden.data_ptr<float>();
     float* normed_ptr = g_normed.data_ptr<float>();
@@ -461,7 +452,11 @@ torch::Tensor qwen3_prefill_persistent_forward(torch::Tensor hidden, torch::Tens
                     &d_weights_prefill, &cos_ptr,    &sin_ptr, &n_val,   &sp_val,  &attn_scale_val, &d_bar_prefill};
 
     dim3 grid(grid_size), block(block_size);
-    cudaLaunchCooperativeKernel((void*)qwen3_prefill_persistent, grid, block, args, smem_bytes, stream);
+    cudaError_t launch_err =
+        cudaLaunchCooperativeKernel((void*)qwen3_prefill_persistent, grid, block, args, smem_bytes, stream);
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "prefill launch FAILED (N=%d, smem=%zu): %s\n", N, smem_bytes, cudaGetErrorString(launch_err));
+    }
 
     const int lm_blocks = 512;
     const int lm_threads = 256;

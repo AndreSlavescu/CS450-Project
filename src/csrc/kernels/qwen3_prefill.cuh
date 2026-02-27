@@ -11,6 +11,8 @@ static constexpr int PREFILL_TILE = 16;
 
 static constexpr int SMEM_CHUNK = 2048;
 
+static constexpr int SMEM_MAX_N = 32;
+
 __device__ __forceinline__ void prefill_load_bf16_chunk(__nv_bfloat16* __restrict__ s_buf,
                                                         const float* __restrict__ g_input, int N, int input_dim,
                                                         int col_start, int chunk_cols) {
@@ -487,30 +489,34 @@ __device__ __forceinline__ void prefill_qkv_thin_gemm_bf16(float* __restrict__ g
     const int global_warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int total_warps = (blockDim.x * gridDim.x) >> 5;
 
-    prefill_load_bf16_chunk(s_buf, input, N, hidden_size, 0, hidden_size);
-    __syncthreads();
+    for (int t_base = 0; t_base < N; t_base += SMEM_MAX_N) {
+        const int bn = min(SMEM_MAX_N, N - t_base);
 
-    for (int out_row = global_warp; out_row < qkv_dim; out_row += total_warps) {
-        float* out_buf;
-        int out_stride, local_row;
-        if (out_row < q_dim) {
-            out_buf = g_q;
-            out_stride = q_dim;
-            local_row = out_row;
-        } else if (out_row < q_dim + kv_dim) {
-            out_buf = g_k;
-            out_stride = kv_dim;
-            local_row = out_row - q_dim;
-        } else {
-            out_buf = g_v;
-            out_stride = kv_dim;
-            local_row = out_row - q_dim - kv_dim;
+        prefill_load_bf16_chunk(s_buf, input + (long long)t_base * hidden_size, bn, hidden_size, 0, hidden_size);
+        __syncthreads();
+
+        for (int out_row = global_warp; out_row < qkv_dim; out_row += total_warps) {
+            float* out_buf;
+            int out_stride, local_row;
+            if (out_row < q_dim) {
+                out_buf = g_q + (long long)t_base * q_dim;
+                out_stride = q_dim;
+                local_row = out_row;
+            } else if (out_row < q_dim + kv_dim) {
+                out_buf = g_k + (long long)t_base * kv_dim;
+                out_stride = kv_dim;
+                local_row = out_row - q_dim;
+            } else {
+                out_buf = g_v + (long long)t_base * kv_dim;
+                out_stride = kv_dim;
+                local_row = out_row - q_dim - kv_dim;
+            }
+
+            const __nv_bfloat16* w_row = qkv_w + (long long)out_row * hidden_size;
+            bf16_thin_gemm_row<false>(out_buf, s_buf, w_row, bn, out_stride, local_row, hidden_size, lane);
         }
-
-        const __nv_bfloat16* w_row = qkv_w + (long long)out_row * hidden_size;
-        bf16_thin_gemm_row<false>(out_buf, s_buf, w_row, N, out_stride, local_row, hidden_size, lane);
+        __syncthreads();
     }
-    __syncthreads();
 }
 
 __device__ __forceinline__ void prefill_thin_gemm_residual_bf16(float* __restrict__ output,
@@ -522,18 +528,23 @@ __device__ __forceinline__ void prefill_thin_gemm_residual_bf16(float* __restric
     const int global_warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int total_warps = (blockDim.x * gridDim.x) >> 5;
 
-    for (int col_base = 0; col_base < input_dim; col_base += SMEM_CHUNK) {
-        const int chunk_cols = min(SMEM_CHUNK, input_dim - col_base);
+    for (int t_base = 0; t_base < N; t_base += SMEM_MAX_N) {
+        const int bn = min(SMEM_MAX_N, N - t_base);
 
-        prefill_load_bf16_chunk(s_buf, input, N, input_dim, col_base, chunk_cols);
-        __syncthreads();
+        for (int col_base = 0; col_base < input_dim; col_base += SMEM_CHUNK) {
+            const int chunk_cols = min(SMEM_CHUNK, input_dim - col_base);
 
-        for (int out_row = global_warp; out_row < output_dim; out_row += total_warps) {
-            const __nv_bfloat16* w_row = weight + (long long)out_row * input_dim + col_base;
+            prefill_load_bf16_chunk(s_buf, input + (long long)t_base * input_dim, bn, input_dim, col_base, chunk_cols);
+            __syncthreads();
 
-            bf16_thin_gemm_row<true>(output, s_buf, w_row, N, output_dim, out_row, chunk_cols, lane);
+            for (int out_row = global_warp; out_row < output_dim; out_row += total_warps) {
+                const __nv_bfloat16* w_row = weight + (long long)out_row * input_dim + col_base;
+
+                bf16_thin_gemm_row<true>(output + (long long)t_base * output_dim, s_buf, w_row, bn, output_dim, out_row,
+                                         chunk_cols, lane);
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 }
 
@@ -550,79 +561,83 @@ __device__ __forceinline__ void prefill_upgate_silu_thin_gemm_bf16(float* __rest
     const int global_warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int total_warps = (blockDim.x * gridDim.x) >> 5;
 
-    prefill_load_bf16_chunk(s_buf, input, N, hidden_size, 0, hidden_size);
-    __syncthreads();
+    for (int t_base = 0; t_base < N; t_base += SMEM_MAX_N) {
+        const int bn = min(SMEM_MAX_N, N - t_base);
 
-    for (int out_row = global_warp; out_row < intermediate_size; out_row += total_warps) {
-        const uint4* gr8 = reinterpret_cast<const uint4*>(gate_w + (long long)out_row * hidden_size);
-        const uint4* ur8 = reinterpret_cast<const uint4*>(up_w + (long long)out_row * hidden_size);
+        prefill_load_bf16_chunk(s_buf, input + (long long)t_base * hidden_size, bn, hidden_size, 0, hidden_size);
+        __syncthreads();
 
-        for (int t0 = 0; t0 < N; t0 += PREFILL_TILE) {
-            const int tile_end = min(t0 + PREFILL_TILE, N);
-            const int tile_n = tile_end - t0;
+        for (int out_row = global_warp; out_row < intermediate_size; out_row += total_warps) {
+            const uint4* gr8 = reinterpret_cast<const uint4*>(gate_w + (long long)out_row * hidden_size);
+            const uint4* ur8 = reinterpret_cast<const uint4*>(up_w + (long long)out_row * hidden_size);
 
-            __nv_bfloat162 ga0[PREFILL_TILE], ga1[PREFILL_TILE];
-            __nv_bfloat162 ga2[PREFILL_TILE], ga3[PREFILL_TILE];
-            __nv_bfloat162 ua0[PREFILL_TILE], ua1[PREFILL_TILE];
-            __nv_bfloat162 ua2[PREFILL_TILE], ua3[PREFILL_TILE];
+            for (int t0 = 0; t0 < bn; t0 += PREFILL_TILE) {
+                const int tile_end = min(t0 + PREFILL_TILE, bn);
+                const int tile_n = tile_end - t0;
+
+                __nv_bfloat162 ga0[PREFILL_TILE], ga1[PREFILL_TILE];
+                __nv_bfloat162 ga2[PREFILL_TILE], ga3[PREFILL_TILE];
+                __nv_bfloat162 ua0[PREFILL_TILE], ua1[PREFILL_TILE];
+                __nv_bfloat162 ua2[PREFILL_TILE], ua3[PREFILL_TILE];
 #pragma unroll
-            for (int i = 0; i < PREFILL_TILE; i++) {
-                ga0[i] = ga1[i] = ga2[i] = ga3[i] = __float2bfloat162_rn(0.f);
-                ua0[i] = ua1[i] = ua2[i] = ua3[i] = __float2bfloat162_rn(0.f);
-            }
+                for (int i = 0; i < PREFILL_TILE; i++) {
+                    ga0[i] = ga1[i] = ga2[i] = ga3[i] = __float2bfloat162_rn(0.f);
+                    ua0[i] = ua1[i] = ua2[i] = ua3[i] = __float2bfloat162_rn(0.f);
+                }
 
-            for (int k = lane; k < hs8; k += 32) {
-                uint4 graw = __ldcg(gr8 + k);
-                __nv_bfloat162 gw01 = *reinterpret_cast<const __nv_bfloat162*>(&graw.x);
-                __nv_bfloat162 gw23 = *reinterpret_cast<const __nv_bfloat162*>(&graw.y);
-                __nv_bfloat162 gw45 = *reinterpret_cast<const __nv_bfloat162*>(&graw.z);
-                __nv_bfloat162 gw67 = *reinterpret_cast<const __nv_bfloat162*>(&graw.w);
+                for (int k = lane; k < hs8; k += 32) {
+                    uint4 graw = __ldcg(gr8 + k);
+                    __nv_bfloat162 gw01 = *reinterpret_cast<const __nv_bfloat162*>(&graw.x);
+                    __nv_bfloat162 gw23 = *reinterpret_cast<const __nv_bfloat162*>(&graw.y);
+                    __nv_bfloat162 gw45 = *reinterpret_cast<const __nv_bfloat162*>(&graw.z);
+                    __nv_bfloat162 gw67 = *reinterpret_cast<const __nv_bfloat162*>(&graw.w);
 
-                uint4 uraw = __ldcg(ur8 + k);
-                __nv_bfloat162 uw01 = *reinterpret_cast<const __nv_bfloat162*>(&uraw.x);
-                __nv_bfloat162 uw23 = *reinterpret_cast<const __nv_bfloat162*>(&uraw.y);
-                __nv_bfloat162 uw45 = *reinterpret_cast<const __nv_bfloat162*>(&uraw.z);
-                __nv_bfloat162 uw67 = *reinterpret_cast<const __nv_bfloat162*>(&uraw.w);
+                    uint4 uraw = __ldcg(ur8 + k);
+                    __nv_bfloat162 uw01 = *reinterpret_cast<const __nv_bfloat162*>(&uraw.x);
+                    __nv_bfloat162 uw23 = *reinterpret_cast<const __nv_bfloat162*>(&uraw.y);
+                    __nv_bfloat162 uw45 = *reinterpret_cast<const __nv_bfloat162*>(&uraw.z);
+                    __nv_bfloat162 uw67 = *reinterpret_cast<const __nv_bfloat162*>(&uraw.w);
+
+                    for (int t = 0; t < tile_n; t++) {
+                        const uint4* x8 = reinterpret_cast<const uint4*>(s_buf + (long long)(t0 + t) * hidden_size);
+                        uint4 rx = x8[k];
+                        __nv_bfloat162 x01 = *reinterpret_cast<const __nv_bfloat162*>(&rx.x);
+                        __nv_bfloat162 x23 = *reinterpret_cast<const __nv_bfloat162*>(&rx.y);
+                        __nv_bfloat162 x45 = *reinterpret_cast<const __nv_bfloat162*>(&rx.z);
+                        __nv_bfloat162 x67 = *reinterpret_cast<const __nv_bfloat162*>(&rx.w);
+
+                        ga0[t] = __hfma2(gw01, x01, ga0[t]);
+                        ga1[t] = __hfma2(gw23, x23, ga1[t]);
+                        ga2[t] = __hfma2(gw45, x45, ga2[t]);
+                        ga3[t] = __hfma2(gw67, x67, ga3[t]);
+
+                        ua0[t] = __hfma2(uw01, x01, ua0[t]);
+                        ua1[t] = __hfma2(uw23, x23, ua1[t]);
+                        ua2[t] = __hfma2(uw45, x45, ua2[t]);
+                        ua3[t] = __hfma2(uw67, x67, ua3[t]);
+                    }
+                }
 
                 for (int t = 0; t < tile_n; t++) {
-                    const uint4* x8 = reinterpret_cast<const uint4*>(s_buf + (long long)(t0 + t) * hidden_size);
-                    uint4 rx = x8[k];
-                    __nv_bfloat162 x01 = *reinterpret_cast<const __nv_bfloat162*>(&rx.x);
-                    __nv_bfloat162 x23 = *reinterpret_cast<const __nv_bfloat162*>(&rx.y);
-                    __nv_bfloat162 x45 = *reinterpret_cast<const __nv_bfloat162*>(&rx.z);
-                    __nv_bfloat162 x67 = *reinterpret_cast<const __nv_bfloat162*>(&rx.w);
+                    float2 gf0 = __bfloat1622float2(ga0[t]), gf1 = __bfloat1622float2(ga1[t]);
+                    float2 gf2 = __bfloat1622float2(ga2[t]), gf3 = __bfloat1622float2(ga3[t]);
+                    float gate_dot = gf0.x + gf0.y + gf1.x + gf1.y + gf2.x + gf2.y + gf3.x + gf3.y;
 
-                    ga0[t] = __hfma2(gw01, x01, ga0[t]);
-                    ga1[t] = __hfma2(gw23, x23, ga1[t]);
-                    ga2[t] = __hfma2(gw45, x45, ga2[t]);
-                    ga3[t] = __hfma2(gw67, x67, ga3[t]);
-
-                    ua0[t] = __hfma2(uw01, x01, ua0[t]);
-                    ua1[t] = __hfma2(uw23, x23, ua1[t]);
-                    ua2[t] = __hfma2(uw45, x45, ua2[t]);
-                    ua3[t] = __hfma2(uw67, x67, ua3[t]);
-                }
-            }
-
-            for (int t = 0; t < tile_n; t++) {
-                float2 gf0 = __bfloat1622float2(ga0[t]), gf1 = __bfloat1622float2(ga1[t]);
-                float2 gf2 = __bfloat1622float2(ga2[t]), gf3 = __bfloat1622float2(ga3[t]);
-                float gate_dot = gf0.x + gf0.y + gf1.x + gf1.y + gf2.x + gf2.y + gf3.x + gf3.y;
-
-                float2 uf0 = __bfloat1622float2(ua0[t]), uf1 = __bfloat1622float2(ua1[t]);
-                float2 uf2 = __bfloat1622float2(ua2[t]), uf3 = __bfloat1622float2(ua3[t]);
-                float up_dot = uf0.x + uf0.y + uf1.x + uf1.y + uf2.x + uf2.y + uf3.x + uf3.y;
+                    float2 uf0 = __bfloat1622float2(ua0[t]), uf1 = __bfloat1622float2(ua1[t]);
+                    float2 uf2 = __bfloat1622float2(ua2[t]), uf3 = __bfloat1622float2(ua3[t]);
+                    float up_dot = uf0.x + uf0.y + uf1.x + uf1.y + uf2.x + uf2.y + uf3.x + uf3.y;
 
 #pragma unroll
-                for (int s = 16; s > 0; s >>= 1) {
-                    gate_dot += __shfl_down_sync(0xffffffff, gate_dot, s);
-                    up_dot += __shfl_down_sync(0xffffffff, up_dot, s);
+                    for (int s = 16; s > 0; s >>= 1) {
+                        gate_dot += __shfl_down_sync(0xffffffff, gate_dot, s);
+                        up_dot += __shfl_down_sync(0xffffffff, up_dot, s);
+                    }
+                    if (lane == 0)
+                        silu_out[(long long)(t_base + t0 + t) * intermediate_size + out_row] =
+                            kernels::silu_multiply(gate_dot, up_dot);
                 }
-                if (lane == 0)
-                    silu_out[(long long)(t0 + t) * intermediate_size + out_row] =
-                        kernels::silu_multiply(gate_dot, up_dot);
             }
         }
+        __syncthreads();
     }
-    __syncthreads();
 }
