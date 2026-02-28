@@ -88,6 +88,9 @@ Below is a command on how to run our TTFT benchmark that compares against 3 majo
 ```bash
 # builds our container + runs the TTFT path comparing our persistent megakernel with the above engines.
 modal run modal_tests/test_benchmark_modal.py --gpu b200 --mode ttft
+
+# benchmarking TTFT with multi-gpu setup. Simple case demo for tp=2
+modal run modal_tests/test_distributed_modal.py --tp 2
 ```
 
 ## Relevant Links
