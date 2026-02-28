@@ -109,7 +109,7 @@ inline void destroy_multicast_buffer(MulticastConfig& cfg) {
     for (int i = 0; i < cfg.num_devices; i++) {
         cuMemRelease(cfg.phys_handles[i]);
     }
-    cuMulticastDestroy(cfg.mc_handle);
+    cuMemRelease(cfg.mc_handle);
     delete[] cfg.phys_handles;
     cfg.initialized = false;
 }

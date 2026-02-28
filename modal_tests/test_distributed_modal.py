@@ -48,6 +48,13 @@ def _worker(rank: int, world_size: int, results_dict: dict):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
+    # NCCL tuning for low-latency small-message allreduce on NVLink
+    os.environ.setdefault("NCCL_P2P_LEVEL", "NVL")
+    os.environ.setdefault("NCCL_SHM_DISABLE", "0")
+    os.environ.setdefault("NCCL_IB_DISABLE", "1")
+    os.environ.setdefault("NCCL_PROTO", "LL")
+    os.environ.setdefault("NCCL_ALGO", "Ring")
+
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend="nccl",
@@ -55,6 +62,35 @@ def _worker(rank: int, world_size: int, results_dict: dict):
         world_size=world_size,
         device_id=torch.device(f"cuda:{rank}"),
     )
+
+    # P2P access diagnostic
+    if rank == 0:
+        for i in range(world_size):
+            for j in range(world_size):
+                if i != j:
+                    can = torch.cuda.can_device_access_peer(i, j)
+                    print(f"  P2P access GPU {i} -> GPU {j}: {can}", flush=True)
+
+    # Standalone NCCL allreduce latency microbenchmark
+    if rank == 0:
+        print("\nNCCL allreduce latency microbenchmark:", flush=True)
+    dist.barrier()
+    for msg_elems, label in [(2048, "4KB"), (2048 * 16, "64KB"), (2048 * 512, "2MB")]:
+        buf = torch.randn(msg_elems, dtype=torch.bfloat16, device="cuda")
+        # warmup
+        for _ in range(5):
+            dist.all_reduce(buf)
+        torch.cuda.synchronize()
+        dist.barrier()
+        t0 = time.perf_counter()
+        for _ in range(50):
+            dist.all_reduce(buf)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        lat_us = (t1 - t0) / 50 * 1e6
+        if rank == 0:
+            print(f"  {label:>6}: {lat_us:.0f} us/call", flush=True)
+    dist.barrier()
 
     sys.path.insert(0, "/workspace")
     os.chdir("/workspace")
@@ -96,8 +132,60 @@ def _worker(rank: int, world_size: int, results_dict: dict):
 
     if rank == 0:
         text = dec.tokenizer.decode(gen_ids, skip_special_tokens=True)
-        print(f"  Generated ids: {gen_ids}")
-        print(f"  Generated text: {text!r}")
+        print(f"  TP={world_size} ids: {gen_ids}")
+        print(f"  TP={world_size} text: {text!r}")
+
+        # Fair reference: same DistributedDecoder code path with tp_size=1 (no sharding/allreduce)
+        ref = DistributedDecoder(tp_size=1, tp_rank=0, weights=weights, tokenizer=tokenizer, verbose=False)
+        ref.reset()
+        ref_ids_in = ref.tokenizer.encode(PROMPT, add_special_tokens=True)
+        if len(ref_ids_in) > 1:
+            ref.prefill(ref_ids_in[:-1])
+        ref_gen = []
+        ref_tok = ref_ids_in[-1]
+        for _ in range(CORRECTNESS_TOKENS):
+            ref_tok = ref.step(ref_tok)
+            ref_gen.append(ref_tok)
+        ref_text = ref.tokenizer.decode(ref_gen, skip_special_tokens=True)
+        print(f"  1-GPU bf16 ids: {ref_gen}")
+        print(f"  1-GPU bf16 text: {ref_text!r}")
+        match = gen_ids == ref_gen
+        print(f"  TP vs bf16-ref match: {match}")
+        if not match:
+            print("  WARNING: TP output differs from 1-GPU bf16 reference!")
+        del ref
+        torch.cuda.empty_cache()
+
+        # HuggingFace model.generate() reference (ground truth)
+        print("\n  HuggingFace reference (model.generate):", flush=True)
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen3-1.7B", torch_dtype=torch.bfloat16, device_map="cuda:0"
+        )
+        hf_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+        hf_input = hf_tokenizer(PROMPT, return_tensors="pt").to("cuda:0")
+        with torch.no_grad():
+            hf_out = hf_model.generate(
+                **hf_input,
+                max_new_tokens=CORRECTNESS_TOKENS,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+            )
+        hf_gen_ids = hf_out[0, hf_input["input_ids"].shape[1] :].tolist()
+        hf_text = hf_tokenizer.decode(hf_gen_ids, skip_special_tokens=True)
+        print(f"  HF ids: {hf_gen_ids}")
+        print(f"  HF text: {hf_text!r}")
+        hf_match = gen_ids == hf_gen_ids
+        print(f"  TP vs HF match: {hf_match}")
+        if not hf_match:
+            bf16_hf_match = ref_gen == hf_gen_ids
+            print(f"  bf16-ref vs HF match: {bf16_hf_match}")
+            if not bf16_hf_match:
+                print("  NOTE: bf16 path diverges from HF — likely precision difference")
+        del hf_model
+        torch.cuda.empty_cache()
 
     dist.barrier()
 
@@ -248,25 +336,23 @@ def _worker(rank: int, world_size: int, results_dict: dict):
             print(f"{plen:>12} {mean_s:>12.2f} {tps_s:>14.1f}")
 
         # Decode throughput for single-GPU
+        # Use step-by-step prefill (not batched prefill) because Decoder.prefill()
+        # writes to _k_cache_pf (bf16) while Decoder.step() reads _k_cache (f32).
         single_dec.reset()
         s_ids = single_dec.tokenizer.encode(PROMPT, add_special_tokens=True)
-        s_tensor = torch.tensor(s_ids[:-1], dtype=torch.long, device="cuda")
-        single_dec.prefill(s_tensor)
+        for tid in s_ids[:-1]:
+            single_dec.step(tid)
         stok = s_ids[-1]
 
         for _ in range(WARMUP):
             sp = single_dec._position
             skc = single_dec._k_cache.clone()
             svc = single_dec._v_cache.clone()
-            skc_pf = single_dec._k_cache_pf.clone()
-            svc_pf = single_dec._v_cache_pf.clone()
             for __ in range(GEN_TOKENS):
                 stok = single_dec.step(stok)
             single_dec._position = sp
             single_dec._k_cache.copy_(skc)
             single_dec._v_cache.copy_(svc)
-            single_dec._k_cache_pf.copy_(skc_pf)
-            single_dec._v_cache_pf.copy_(svc_pf)
             stok = s_ids[-1]
 
         torch.cuda.synchronize()
@@ -275,8 +361,6 @@ def _worker(rank: int, world_size: int, results_dict: dict):
             sp = single_dec._position
             skc = single_dec._k_cache.clone()
             svc = single_dec._v_cache.clone()
-            skc_pf = single_dec._k_cache_pf.clone()
-            svc_pf = single_dec._v_cache_pf.clone()
             stok_l = s_ids[-1]
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -288,8 +372,6 @@ def _worker(rank: int, world_size: int, results_dict: dict):
             single_dec._position = sp
             single_dec._k_cache.copy_(skc)
             single_dec._v_cache.copy_(svc)
-            single_dec._k_cache_pf.copy_(skc_pf)
-            single_dec._v_cache_pf.copy_(svc_pf)
 
         sdtimes.sort()
         trim = max(1, len(sdtimes) // 5)

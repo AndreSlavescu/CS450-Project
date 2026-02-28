@@ -183,7 +183,7 @@ class DistributedDecoder:
         down_ws_3d = weights["down_ws"].view(NUM_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
         self._down_ws = down_ws_3d[:, :, inter_start:inter_end].contiguous()
 
-        # Fused gate+up for prefill (same pattern as single-GPU decoder)
+        # Fused gate+up for both prefill and decode
         self._gate_up_ws = torch.cat(
             [
                 self._gate_ws.view(NUM_LAYERS, inter_per_rank, HIDDEN_SIZE),
@@ -218,10 +218,15 @@ class DistributedDecoder:
         self._norm_w_bf16 = self._norm_w.to(torch.bfloat16)
         self._embed_w_bf16 = self._embed_w.to(torch.bfloat16)
 
-        # Try to initialize multimem kernels for faster allreduce
+        # Pre-allocate decode scratch buffers (reused every step)
+        self._decode_hidden = torch.empty(1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        self._decode_o_buf = torch.empty(1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        self._decode_down_buf = torch.empty(1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+
+        # Pre-compile tp_sp kernels + init allreduce
         self._tp_kernels = None
         if tp_size > 1:
-            self._init_multimem(verbose)
+            self._init_multimem(max_seq_len, verbose)
 
         if verbose:
             q_params = self._qkv_ws[0].numel()
@@ -232,57 +237,43 @@ class DistributedDecoder:
                 f"[rank {tp_rank}] Sharded weight bytes: {total_sharded / 1e6:.1f} MB "
                 f"({self._q_heads_local}Q/{self._kv_heads_local}KV heads, "
                 f"{self._inter_local} intermediate)"
-                f" multimem={'ON' if self._use_multimem else 'OFF'}"
             )
 
-    def _init_multimem(self, verbose: bool):
-        """Initialize multimem/NVLS allreduce kernels if available."""
+    def _init_multimem(self, max_seq_len: int, verbose: bool):
+        """Pre-compile tp_sp kernels (serialized across ranks to avoid race)."""
         try:
             from .build import get_tp_kernels
 
-            self._tp_kernels = get_tp_kernels()
+            # Serialize JIT compilation across ranks to avoid race condition
+            # where both processes compile simultaneously and clobber the .so
+            for r in range(self.tp_size):
+                if self.tp_rank == r:
+                    self._tp_kernels = get_tp_kernels()
+                dist.barrier()
 
-            # Buffer must hold the largest tensor we allreduce.
-            # That's HIDDEN_SIZE (2048) bf16 elements, aligned up.
-            buf_elems = _align_to_multimem(HIDDEN_SIZE)
-            buf_bytes = buf_elems * 2  # bf16 = 2 bytes
-            self._multimem_elems = buf_elems
-
-            self._tp_kernels.init_distributed(self.tp_size, self.tp_rank, buf_bytes)
-            self._use_multimem = True
             if verbose:
-                print(f"[rank {self.tp_rank}] Multimem initialized " f"(buf={buf_bytes} bytes, {buf_elems} bf16 elems)")
+                print(f"[rank {self.tp_rank}] tp_sp kernels compiled OK")
+
+            # NOTE: Multicast (NVLS) allreduce requires all processes to share
+            # the SAME multicast handle via IPC fd export/import. With mp.spawn
+            # each process creates independent multicast objects, so the
+            # multimem barrier deadlocks. Using NCCL allreduce instead.
+            self._use_multimem = False
         except Exception as e:
             if verbose:
-                print(f"[rank {self.tp_rank}] Multimem init failed, falling back to NCCL: {e}")
+                print(f"[rank {self.tp_rank}] tp_sp compilation failed: {e}")
             self._use_multimem = False
 
     def _allreduce(self, tensor: torch.Tensor):
-        """All-reduce a tensor across TP ranks using multimem or NCCL fallback."""
+        """All-reduce a tensor across TP ranks via NCCL."""
         if self.tp_size <= 1:
             return
+        dist.all_reduce(tensor)
 
-        if self._use_multimem:
-            numel = tensor.numel()
-            aligned = _align_to_multimem(numel)
-            if aligned > self._multimem_elems:
-                # Tensor too large for multimem buffer, use NCCL
-                dist.all_reduce(tensor)
-                return
-
-            # Copy into multimem buffer, allreduce in-place, copy back
-            if numel < aligned:
-                buf = torch.zeros(aligned, dtype=torch.bfloat16, device=tensor.device)
-                buf[:numel] = tensor.view(-1)
-                self._tp_kernels.copy_to_mc_buffer(buf)
-            else:
-                self._tp_kernels.copy_to_mc_buffer(tensor.view(-1).contiguous())
-
-            self._tp_kernels.multimem_allreduce(aligned)
-            result = self._tp_kernels.read_mc_buffer(aligned)
-            tensor.view(-1).copy_(result[:numel])
-        else:
-            dist.all_reduce(tensor)
+    def _allreduce_mm(self, mat: torch.Tensor, weight: torch.Tensor, out: torch.Tensor):
+        """Fused matmul -> allreduce: writes matmul result into out, then allreduces in-place."""
+        torch.mm(mat, weight, out=out)
+        self._allreduce(out)
 
     def _apply_rope_fast(self, x, cos_dup, sin_dup, num_heads):
         half = HEAD_DIM // 2
@@ -292,10 +283,15 @@ class DistributedDecoder:
 
     def step(self, token_id: int) -> int:
         pos = self._position
-        hidden = self._embed_w_bf16[token_id].unsqueeze(0)
+        # Copy embedding into pre-allocated buffer (avoids allocation + enables in-place)
+        self._decode_hidden[0].copy_(self._embed_w_bf16[token_id])
+        hidden = self._decode_hidden
 
         cos_dup = self._cos_dup[pos : pos + 1]
         sin_dup = self._sin_dup[pos : pos + 1]
+
+        o_buf = self._decode_o_buf
+        down_buf = self._decode_down_buf
 
         for layer in range(NUM_LAYERS):
             normed = F.rms_norm(hidden, (HIDDEN_SIZE,), self._attn_ln_ws_bf16[layer], eps=RMS_EPS)
@@ -332,18 +328,18 @@ class DistributedDecoder:
             attn = F.scaled_dot_product_attention(q_4d, k_all, v_all, is_causal=False, enable_gqa=True)
             attn_out = attn.transpose(1, 2).reshape(1, self._q_dim_local)
 
-            o_partial = torch.mm(attn_out, self._o_proj_ws[layer].t())
-            self._allreduce(o_partial)
-            hidden = hidden + o_partial
+            # matmul -> allreduce -> in-place residual add
+            self._allreduce_mm(attn_out, self._o_proj_ws[layer].t(), o_buf)
+            hidden.add_(o_buf)
 
             normed = F.rms_norm(hidden, (HIDDEN_SIZE,), self._mlp_ln_ws_bf16[layer], eps=RMS_EPS)
-            gate = torch.mm(normed, self._gate_ws[layer].t())
-            up = torch.mm(normed, self._up_ws[layer].t())
-            mlp_act = F.silu(gate) * up
+            # Fused gate+up (single matmul instead of two)
+            gate_up = torch.mm(normed, self._gate_up_ws[layer].t())
+            gate = gate_up[:, : self._inter_local]
+            up = gate_up[:, self._inter_local :]
 
-            down_partial = torch.mm(mlp_act, self._down_ws[layer].t())
-            self._allreduce(down_partial)
-            hidden = hidden + down_partial
+            self._allreduce_mm(F.silu(gate) * up, self._down_ws[layer].t(), down_buf)
+            hidden.add_(down_buf)
 
         last_hidden = F.rms_norm(hidden, (HIDDEN_SIZE,), self._norm_w_bf16, eps=RMS_EPS)
         logits = torch.mm(last_hidden, self._lm_head_w.t())
@@ -353,10 +349,14 @@ class DistributedDecoder:
 
     def _prefill_forward(self, token_ids: torch.Tensor, n: int) -> torch.Tensor:
         """Batched prefill: process all n tokens at once through each layer."""
-        hidden = self._embed_w_bf16[token_ids]  # (n, HIDDEN_SIZE)
+        hidden = self._embed_w_bf16[token_ids]  # (n, HIDDEN_SIZE) — advanced indexing = new tensor
 
         cos_dup = self._cos_dup[:n]
         sin_dup = self._sin_dup[:n]
+
+        # Pre-allocate reusable output buffers for this prefill size
+        o_buf = torch.empty(n, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        down_buf = torch.empty(n, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
 
         for layer in range(NUM_LAYERS):
             normed = F.rms_norm(hidden, (HIDDEN_SIZE,), self._attn_ln_ws_bf16[layer], eps=RMS_EPS)
@@ -392,18 +392,17 @@ class DistributedDecoder:
             attn = F.scaled_dot_product_attention(q_4d, k_all, v_all, is_causal=True, enable_gqa=True)
             attn_out = attn.transpose(1, 2).reshape(n, self._q_dim_local)
 
-            o_partial = torch.mm(attn_out, self._o_proj_ws[layer].t())
-            self._allreduce(o_partial)
-            hidden = hidden + o_partial
+            # matmul -> allreduce -> in-place residual add
+            self._allreduce_mm(attn_out, self._o_proj_ws[layer].t(), o_buf)
+            hidden.add_(o_buf)
 
             normed = F.rms_norm(hidden, (HIDDEN_SIZE,), self._mlp_ln_ws_bf16[layer], eps=RMS_EPS)
             gate_up = torch.mm(normed, self._gate_up_ws[layer].t())
             gate = gate_up[:, : self._inter_local]
             up = gate_up[:, self._inter_local :]
 
-            down_partial = torch.mm(F.silu(gate) * up, self._down_ws[layer].t())
-            self._allreduce(down_partial)
-            hidden = hidden + down_partial
+            self._allreduce_mm(F.silu(gate) * up, self._down_ws[layer].t(), down_buf)
+            hidden.add_(down_buf)
 
         last_hidden = F.rms_norm(hidden[-1:], (HIDDEN_SIZE,), self._norm_w_bf16, eps=RMS_EPS)
         logits = torch.mm(last_hidden, self._lm_head_w.t())

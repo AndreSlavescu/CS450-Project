@@ -108,6 +108,19 @@ torch::Tensor read_mc_buffer(int64_t num_elems) {
     return out;
 }
 
+torch::Tensor wrap_mc_buffer(int64_t num_elems) {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    TORCH_CHECK(static_cast<size_t>(num_elems) * sizeof(__nv_bfloat16) <= g_dist_state.data_mc.buf_size,
+                "Requested size exceeds multicast buffer");
+    auto options = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA, g_dist_state.local_rank);
+    return torch::from_blob(reinterpret_cast<void*>(g_dist_state.data_mc.local_addr), {num_elems}, options);
+}
+
+int64_t get_mc_buf_size_elems() {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    return static_cast<int64_t>(g_dist_state.data_mc.buf_size / sizeof(__nv_bfloat16));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Distributed TP/SP via multimem/NVLS";
 
@@ -117,6 +130,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_local_data_ptr", &get_local_data_ptr);
     m.def("copy_to_mc_buffer", &copy_to_mc_buffer);
     m.def("read_mc_buffer", &read_mc_buffer);
+    m.def("wrap_mc_buffer", &wrap_mc_buffer);
+    m.def("get_mc_buf_size_elems", &get_mc_buf_size_elems);
     m.def("multimem_allreduce", &multimem_allreduce_op);
     m.def("multimem_allreduce_two_shot", &multimem_allreduce_two_shot_op);
     m.def("multimem_reduce_scatter", &multimem_reduce_scatter_op);
