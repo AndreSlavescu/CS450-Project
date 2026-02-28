@@ -40,7 +40,7 @@ TARGETS = tp_sp$(EXT_SUFFIX) fmha_attention$(EXT_SUFFIX) zigzag_attention$(EXT_S
 
 all: $(TARGETS)
 
-tp_sp$(EXT_SUFFIX): tp_sp.cu tp_sp.cuh qwen3.cuh
+tp_sp$(EXT_SUFFIX): tp_sp.cu tp_sp.cuh multimem.cuh distributed.cuh qwen3.cuh
 	$(NVCC) tp_sp.cu $(ALL_NVCCFLAGS) -o $@
 
 fmha_attention$(EXT_SUFFIX): fmha_attention.cu fmha_attention.cuh qwen3.cuh

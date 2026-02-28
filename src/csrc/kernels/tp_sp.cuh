@@ -5,125 +5,200 @@
 #include <cstdint>
 #include <cstdio>
 
-#define CUDA_CHECK(cmd)                                                                                                \
-    do {                                                                                                               \
-        cudaError_t e = cmd;                                                                                           \
-        if (e != cudaSuccess) {                                                                                        \
-            printf("CUDA error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e));                              \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
+#include "multimem.cuh"
+
+#define CUDA_CHECK(cmd)                                                                \
+    do {                                                                               \
+        cudaError_t e = cmd;                                                           \
+        if (e != cudaSuccess) {                                                        \
+            printf("CUDA error %s:%d '%s'\n", __FILE__, __LINE__,                      \
+                   cudaGetErrorString(e));                                              \
+            exit(EXIT_FAILURE);                                                        \
+        }                                                                              \
     } while (0)
 
-struct P2PState {
-    __nv_bfloat16** all_gather_ptrs;
-    __nv_bfloat16** reduce_scatter_ptrs;
-    int tp_size;
-    int tp_rank;
+constexpr int MULTIMEM_BF16_ELEMS_PER_OP = 8;
+constexpr int MULTIMEM_BYTES_PER_OP = 16;
+
+__global__ void multimem_allreduce_kernel(void* __restrict__ mc_ptr,
+                                          uint32_t* __restrict__ flag_mc_ptr,
+                                          uint32_t* __restrict__ flag_local_ptr,
+                                          int num_elems, int local_rank, int world_size) {
+    int num_ops = num_elems / MULTIMEM_BF16_ELEMS_PER_OP;
+    int total_threads = gridDim.x * blockDim.x;
+    char* base = static_cast<char*>(mc_ptr);
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_ops; i += total_threads) {
+        void* addr = base + static_cast<size_t>(i) * MULTIMEM_BYTES_PER_OP;
+        multimem::uint128_t val = multimem::ld_reduce_add_bf16x8(addr);
+        multimem::st_b128(addr, val);
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        multimem::red_release_sys_add1(flag_mc_ptr + blockIdx.x);
+        multimem::spin_wait_eq_reset(
+            flag_local_ptr + blockIdx.x,
+            static_cast<uint32_t>(world_size), 0u);
+    }
+}
+
+__global__ void multimem_reduce_scatter_kernel(void* __restrict__ mc_ptr,
+                                               void* __restrict__ dst_local,
+                                               uint32_t* __restrict__ flag_mc_ptr,
+                                               uint32_t* __restrict__ flag_local_ptr,
+                                               int total_elems, int local_rank,
+                                               int world_size) {
+    int shard_elems = total_elems / world_size;
+    int shard_ops = shard_elems / MULTIMEM_BF16_ELEMS_PER_OP;
+    int shard_offset_bytes = local_rank * shard_elems * 2;
+    int total_threads = gridDim.x * blockDim.x;
+    char* mc_base = static_cast<char*>(mc_ptr) + shard_offset_bytes;
+    char* dst_base = static_cast<char*>(dst_local);
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < shard_ops; i += total_threads) {
+        size_t byte_off = static_cast<size_t>(i) * MULTIMEM_BYTES_PER_OP;
+        multimem::uint128_t val = multimem::ld_reduce_add_bf16x8(mc_base + byte_off);
+        uint32_t* out = reinterpret_cast<uint32_t*>(dst_base + byte_off);
+        out[0] = val.x;
+        out[1] = val.y;
+        out[2] = val.z;
+        out[3] = val.w;
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        multimem::red_release_sys_add1(flag_mc_ptr + blockIdx.x);
+        multimem::spin_wait_eq_reset(
+            flag_local_ptr + blockIdx.x,
+            static_cast<uint32_t>(world_size), 0u);
+    }
+}
+
+__global__ void multimem_reduce_scatter_residual_kernel(
+    void* __restrict__ mc_ptr,
+    void* __restrict__ dst_local,
+    const __nv_bfloat16* __restrict__ residual,
+    uint32_t* __restrict__ flag_mc_ptr,
+    uint32_t* __restrict__ flag_local_ptr,
+    int total_elems, int local_rank, int world_size) {
+    int shard_elems = total_elems / world_size;
+    int shard_ops = shard_elems / MULTIMEM_BF16_ELEMS_PER_OP;
+    int shard_offset_bytes = local_rank * shard_elems * 2;
+    int total_threads = gridDim.x * blockDim.x;
+    char* mc_base = static_cast<char*>(mc_ptr) + shard_offset_bytes;
+    char* dst_base = static_cast<char*>(dst_local);
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < shard_ops; i += total_threads) {
+        size_t byte_off = static_cast<size_t>(i) * MULTIMEM_BYTES_PER_OP;
+        multimem::uint128_t val = multimem::ld_reduce_add_bf16x8(mc_base + byte_off);
+
+        int elem_base = i * MULTIMEM_BF16_ELEMS_PER_OP;
+        __nv_bfloat162 r0 = *reinterpret_cast<const __nv_bfloat162*>(&residual[elem_base + 0]);
+        __nv_bfloat162 r1 = *reinterpret_cast<const __nv_bfloat162*>(&residual[elem_base + 2]);
+        __nv_bfloat162 r2 = *reinterpret_cast<const __nv_bfloat162*>(&residual[elem_base + 4]);
+        __nv_bfloat162 r3 = *reinterpret_cast<const __nv_bfloat162*>(&residual[elem_base + 6]);
+
+        __nv_bfloat162 v0 = *reinterpret_cast<__nv_bfloat162*>(&val.x);
+        __nv_bfloat162 v1 = *reinterpret_cast<__nv_bfloat162*>(&val.y);
+        __nv_bfloat162 v2 = *reinterpret_cast<__nv_bfloat162*>(&val.z);
+        __nv_bfloat162 v3 = *reinterpret_cast<__nv_bfloat162*>(&val.w);
+
+        v0 = __hadd2(v0, r0);
+        v1 = __hadd2(v1, r1);
+        v2 = __hadd2(v2, r2);
+        v3 = __hadd2(v3, r3);
+
+        uint32_t* out = reinterpret_cast<uint32_t*>(dst_base + byte_off);
+        out[0] = *reinterpret_cast<uint32_t*>(&v0);
+        out[1] = *reinterpret_cast<uint32_t*>(&v1);
+        out[2] = *reinterpret_cast<uint32_t*>(&v2);
+        out[3] = *reinterpret_cast<uint32_t*>(&v3);
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        multimem::red_release_sys_add1(flag_mc_ptr + blockIdx.x);
+        multimem::spin_wait_eq_reset(
+            flag_local_ptr + blockIdx.x,
+            static_cast<uint32_t>(world_size), 0u);
+    }
+}
+
+__global__ void multimem_allreduce_two_shot_kernel(void* __restrict__ mc_ptr,
+                                                   uint32_t* __restrict__ flag_mc_ptr,
+                                                   uint32_t* __restrict__ flag_local_ptr,
+                                                   int num_elems, int local_rank,
+                                                   int world_size) {
+    int chunk_elems = num_elems / world_size;
+    int chunk_ops = chunk_elems / MULTIMEM_BF16_ELEMS_PER_OP;
+    int chunk_offset_bytes = local_rank * chunk_elems * 2;
+    int total_threads = gridDim.x * blockDim.x;
+    char* base = static_cast<char*>(mc_ptr) + chunk_offset_bytes;
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_ops; i += total_threads) {
+        size_t byte_off = static_cast<size_t>(i) * MULTIMEM_BYTES_PER_OP;
+        multimem::uint128_t val = multimem::ld_reduce_add_bf16x8(base + byte_off);
+        multimem::st_b128(base + byte_off, val);
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        multimem::red_release_sys_add1(flag_mc_ptr + blockIdx.x);
+        multimem::spin_wait_eq_reset(
+            flag_local_ptr + blockIdx.x,
+            static_cast<uint32_t>(world_size), 0u);
+    }
+}
+
+struct MultimemLaunchConfig {
+    int grid_size;
+    int block_size;
 };
 
-__global__ void p2p_all_gather_kernel(__nv_bfloat16** __restrict__ dst_ptrs, const __nv_bfloat16* __restrict__ src,
-                                      int shard_size, int my_rank, int tp_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= shard_size)
-        return;
-
-    __nv_bfloat16 val = src[idx];
-
-    int offset = my_rank * shard_size + idx;
-    for (int r = 0; r < tp_size; r++) {
-        dst_ptrs[r][offset] = val;
-    }
-}
-
-__global__ void p2p_reduce_scatter_kernel(__nv_bfloat16* __restrict__ dst, __nv_bfloat16** __restrict__ src_ptrs,
-                                          int shard_size, int my_rank, int tp_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= shard_size)
-        return;
-
-    int offset = my_rank * shard_size + idx;
-
-    float sum = 0.0f;
-    for (int r = 0; r < tp_size; r++) {
-        sum += __bfloat162float(src_ptrs[r][offset]);
-    }
-
-    dst[idx] = __float2bfloat16(sum);
-}
-
-__global__ void residual_add_bf16_kernel(__nv_bfloat16* __restrict__ dst, const __nv_bfloat16* __restrict__ a,
-                                         const __nv_bfloat16* __restrict__ b, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] = __float2bfloat16(__bfloat162float(a[idx]) + __bfloat162float(b[idx]));
-    }
-}
-
-__global__ void p2p_reduce_scatter_residual_kernel(__nv_bfloat16* __restrict__ dst,
-                                                   __nv_bfloat16** __restrict__ src_ptrs,
-                                                   const __nv_bfloat16* __restrict__ residual, int shard_size,
-                                                   int my_rank, int tp_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= shard_size)
-        return;
-
-    int offset = my_rank * shard_size + idx;
-
-    float sum = 0.0f;
-    for (int r = 0; r < tp_size; r++) {
-        sum += __bfloat162float(src_ptrs[r][offset]);
-    }
-    sum += __bfloat162float(residual[idx]);
-
-    dst[idx] = __float2bfloat16(sum);
-}
-
-inline void tp_all_gather_p2p(P2PState& state, const __nv_bfloat16* local_shard, int shard_size, cudaStream_t stream) {
-    if (state.tp_size == 1)
-        return;
-
+inline MultimemLaunchConfig get_multimem_launch_config(int num_elems) {
+    int num_ops = num_elems / MULTIMEM_BF16_ELEMS_PER_OP;
     int block = 256;
-    int grid = (shard_size + block - 1) / block;
-    p2p_all_gather_kernel<<<grid, block, 0, stream>>>(state.all_gather_ptrs, local_shard, shard_size, state.tp_rank,
-                                                      state.tp_size);
+    int grid = (num_ops + block - 1) / block;
+    grid = min(grid, 132);
+    return {grid, block};
 }
 
-inline void tp_reduce_scatter_p2p(P2PState& state, __nv_bfloat16* dst, int shard_size, cudaStream_t stream) {
-    if (state.tp_size == 1)
-        return;
-
-    int block = 256;
-    int grid = (shard_size + block - 1) / block;
-    p2p_reduce_scatter_kernel<<<grid, block, 0, stream>>>(dst, state.reduce_scatter_ptrs, shard_size, state.tp_rank,
-                                                          state.tp_size);
+inline void multimem_allreduce(void* mc_ptr, uint32_t* flag_mc, uint32_t* flag_local,
+                                int num_elems, int local_rank, int world_size,
+                                cudaStream_t stream) {
+    auto cfg = get_multimem_launch_config(num_elems);
+    multimem_allreduce_kernel<<<cfg.grid_size, cfg.block_size, 0, stream>>>(
+        mc_ptr, flag_mc, flag_local, num_elems, local_rank, world_size);
 }
 
-inline void tp_reduce_scatter_residual_p2p(P2PState& state, __nv_bfloat16* dst, const __nv_bfloat16* residual,
-                                           int shard_size, cudaStream_t stream) {
-    if (state.tp_size == 1) {
-        int block = 256;
-        int grid = (shard_size + block - 1) / block;
-        residual_add_bf16_kernel<<<grid, block, 0, stream>>>(dst, dst, residual, shard_size);
-        return;
-    }
-
-    int block = 256;
-    int grid = (shard_size + block - 1) / block;
-    p2p_reduce_scatter_residual_kernel<<<grid, block, 0, stream>>>(dst, state.reduce_scatter_ptrs, residual, shard_size,
-                                                                   state.tp_rank, state.tp_size);
+inline void multimem_allreduce_two_shot(void* mc_ptr, uint32_t* flag_mc,
+                                         uint32_t* flag_local, int num_elems,
+                                         int local_rank, int world_size,
+                                         cudaStream_t stream) {
+    auto cfg = get_multimem_launch_config(num_elems / world_size);
+    multimem_allreduce_two_shot_kernel<<<cfg.grid_size, cfg.block_size, 0, stream>>>(
+        mc_ptr, flag_mc, flag_local, num_elems, local_rank, world_size);
 }
 
-inline void enable_p2p_access(int tp_size, int tp_rank) {
-    for (int r = 0; r < tp_size; r++) {
-        if (r == tp_rank)
-            continue;
-        int can_access = 0;
-        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, tp_rank, r));
-        if (can_access) {
-            cudaError_t err = cudaDeviceEnablePeerAccess(r, 0);
-            if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
-                CUDA_CHECK(err);
-            }
-        }
-    }
+inline void multimem_reduce_scatter(void* mc_ptr, void* dst_local,
+                                     uint32_t* flag_mc, uint32_t* flag_local,
+                                     int total_elems, int local_rank, int world_size,
+                                     cudaStream_t stream) {
+    int shard_elems = total_elems / world_size;
+    auto cfg = get_multimem_launch_config(shard_elems);
+    multimem_reduce_scatter_kernel<<<cfg.grid_size, cfg.block_size, 0, stream>>>(
+        mc_ptr, dst_local, flag_mc, flag_local, total_elems, local_rank, world_size);
+}
+
+inline void multimem_reduce_scatter_residual(void* mc_ptr, void* dst_local,
+                                              const __nv_bfloat16* residual,
+                                              uint32_t* flag_mc, uint32_t* flag_local,
+                                              int total_elems, int local_rank,
+                                              int world_size, cudaStream_t stream) {
+    int shard_elems = total_elems / world_size;
+    auto cfg = get_multimem_launch_config(shard_elems);
+    multimem_reduce_scatter_residual_kernel<<<cfg.grid_size, cfg.block_size, 0, stream>>>(
+        mc_ptr, dst_local, residual, flag_mc, flag_local,
+        total_elems, local_rank, world_size);
 }

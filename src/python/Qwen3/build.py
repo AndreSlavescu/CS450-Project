@@ -3,6 +3,7 @@ from pathlib import Path
 from torch.utils.cpp_extension import load
 
 _module = None
+_tp_module = None
 
 _REPO_ROOT = Path(__file__).parent.parent.parent.parent  # CS450-Project/
 _KERNELS_DIR = _REPO_ROOT / "src" / "csrc" / "kernels"
@@ -51,3 +52,31 @@ def get_kernels():
     )
     print("qwen3_kernels compiled OK.")
     return _module
+
+
+def get_tp_kernels():
+    """Build (or return cached) the tp_sp distributed kernels extension."""
+    global _tp_module
+    if _tp_module is not None:
+        return _tp_module
+
+    arch = _detect_arch()
+    print(f"Compiling tp_sp kernels for {arch}...")
+
+    _tp_module = load(
+        name="tp_sp",
+        sources=[str(_KERNELS_DIR / "tp_sp.cu")],
+        extra_include_paths=[str(_KERNELS_DIR)],
+        extra_cuda_cflags=[
+            "-std=c++20",
+            "-O3",
+            "--use_fast_math",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            f"-arch={arch}",
+        ],
+        extra_ldflags=["-lcuda"],
+        verbose=False,
+    )
+    print("tp_sp kernels compiled OK.")
+    return _tp_module

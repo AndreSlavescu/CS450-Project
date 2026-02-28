@@ -3,83 +3,139 @@
 #include <cuda_bf16.h>
 
 #include "tp_sp.cuh"
+#include "distributed.cuh"
 #include "qwen3.cuh"
 
-static P2PState g_p2p_state = {};
-static bool g_p2p_initialized = false;
+static DistributedState g_dist_state = {};
+static bool g_dist_initialized = false;
+static constexpr int MAX_SMS = 148;
 
-void init_p2p_state(int64_t tp_size, int64_t tp_rank, int64_t all_gather_ptrs_addr, int64_t reduce_scatter_ptrs_addr) {
-    g_p2p_state.tp_size = static_cast<int>(tp_size);
-    g_p2p_state.tp_rank = static_cast<int>(tp_rank);
-    g_p2p_state.all_gather_ptrs = reinterpret_cast<__nv_bfloat16**>(all_gather_ptrs_addr);
-    g_p2p_state.reduce_scatter_ptrs = reinterpret_cast<__nv_bfloat16**>(reduce_scatter_ptrs_addr);
-
-    enable_p2p_access(g_p2p_state.tp_size, g_p2p_state.tp_rank);
-    g_p2p_initialized = true;
+void init_distributed_state(int64_t world_size, int64_t local_rank, int64_t data_buf_size) {
+    TORCH_CHECK(!g_dist_initialized, "Distributed state already initialized");
+    g_dist_state = create_distributed_state(
+        static_cast<int>(world_size), static_cast<int>(local_rank),
+        static_cast<size_t>(data_buf_size), MAX_SMS);
+    g_dist_initialized = true;
 }
 
-void destroy_p2p_state() {
-    g_p2p_state = {};
-    g_p2p_initialized = false;
+void destroy_distributed_state_op() {
+    if (!g_dist_initialized) return;
+    destroy_distributed_state(g_dist_state);
+    g_dist_initialized = false;
 }
 
-void tp_all_gather_op(torch::Tensor local_shard) {
-    TORCH_CHECK(g_p2p_initialized, "P2P state not initialized");
-    TORCH_CHECK(local_shard.is_cuda(), "input must be a CUDA tensor");
-    TORCH_CHECK(local_shard.dtype() == torch::kBFloat16, "input must be bfloat16");
-    TORCH_CHECK(local_shard.is_contiguous(), "input must be contiguous");
+int64_t get_mc_data_ptr() {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    return static_cast<int64_t>(g_dist_state.data_mc.mc_addr);
+}
 
-    if (g_p2p_state.tp_size == 1)
-        return;
+int64_t get_local_data_ptr() {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    return static_cast<int64_t>(g_dist_state.data_mc.local_addr);
+}
 
+void copy_to_mc_buffer(torch::Tensor src) {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    TORCH_CHECK(src.is_cuda() && src.dtype() == torch::kBFloat16 && src.is_contiguous());
+    size_t nbytes = src.numel() * sizeof(__nv_bfloat16);
+    TORCH_CHECK(nbytes <= g_dist_state.data_mc.buf_size,
+                "Source tensor exceeds multicast buffer size");
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
-    tp_all_gather_p2p(g_p2p_state, reinterpret_cast<const __nv_bfloat16*>(local_shard.data_ptr()), local_shard.numel(),
-                      stream);
+    cudaMemcpyAsync(reinterpret_cast<void*>(g_dist_state.data_mc.local_addr),
+                    src.data_ptr(), nbytes, cudaMemcpyDeviceToDevice, stream);
 }
 
-torch::Tensor tp_reduce_scatter_op(int64_t shard_size) {
-    TORCH_CHECK(g_p2p_initialized, "P2P state not initialized");
-
-    auto options = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA, g_p2p_state.tp_rank);
-    auto dst = torch::empty({shard_size}, options);
-
-    if (g_p2p_state.tp_size == 1)
-        return dst;
-
+void multimem_allreduce_op(int64_t num_elems) {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    TORCH_CHECK(num_elems % MULTIMEM_BF16_ELEMS_PER_OP == 0,
+                "num_elems must be divisible by ", MULTIMEM_BF16_ELEMS_PER_OP);
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
-    tp_reduce_scatter_p2p(g_p2p_state, reinterpret_cast<__nv_bfloat16*>(dst.data_ptr()), static_cast<int>(shard_size),
-                          stream);
+    multimem_allreduce(
+        reinterpret_cast<void*>(g_dist_state.data_mc.mc_addr),
+        reinterpret_cast<uint32_t*>(g_dist_state.flag_mc.mc_addr),
+        reinterpret_cast<uint32_t*>(g_dist_state.flag_mc.local_addr),
+        static_cast<int>(num_elems),
+        g_dist_state.local_rank, g_dist_state.world_size, stream);
+}
 
+void multimem_allreduce_two_shot_op(int64_t num_elems) {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    TORCH_CHECK(num_elems % (MULTIMEM_BF16_ELEMS_PER_OP * g_dist_state.world_size) == 0,
+                "num_elems must be divisible by elems_per_op * world_size");
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    multimem_allreduce_two_shot(
+        reinterpret_cast<void*>(g_dist_state.data_mc.mc_addr),
+        reinterpret_cast<uint32_t*>(g_dist_state.flag_mc.mc_addr),
+        reinterpret_cast<uint32_t*>(g_dist_state.flag_mc.local_addr),
+        static_cast<int>(num_elems),
+        g_dist_state.local_rank, g_dist_state.world_size, stream);
+}
+
+torch::Tensor multimem_reduce_scatter_op(int64_t total_elems) {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    int ws = g_dist_state.world_size;
+    TORCH_CHECK(total_elems % (MULTIMEM_BF16_ELEMS_PER_OP * ws) == 0);
+    int shard = static_cast<int>(total_elems) / ws;
+    auto options = torch::TensorOptions().dtype(torch::kBFloat16)
+                       .device(torch::kCUDA, g_dist_state.local_rank);
+    auto dst = torch::empty({shard}, options);
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    multimem_reduce_scatter(
+        reinterpret_cast<void*>(g_dist_state.data_mc.mc_addr),
+        dst.data_ptr(),
+        reinterpret_cast<uint32_t*>(g_dist_state.flag_mc.mc_addr),
+        reinterpret_cast<uint32_t*>(g_dist_state.flag_mc.local_addr),
+        static_cast<int>(total_elems),
+        g_dist_state.local_rank, ws, stream);
     return dst;
 }
 
-torch::Tensor tp_reduce_scatter_residual_op(torch::Tensor residual, int64_t shard_size) {
-    TORCH_CHECK(g_p2p_initialized, "P2P state not initialized");
-    TORCH_CHECK(residual.is_cuda(), "residual must be a CUDA tensor");
-    TORCH_CHECK(residual.dtype() == torch::kBFloat16, "residual must be bfloat16");
-    TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
-    TORCH_CHECK(residual.numel() == shard_size, "residual size must match shard_size");
-
+torch::Tensor multimem_reduce_scatter_residual_op(torch::Tensor residual,
+                                                   int64_t total_elems) {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    TORCH_CHECK(residual.is_cuda() && residual.dtype() == torch::kBFloat16 &&
+                residual.is_contiguous());
+    int ws = g_dist_state.world_size;
+    TORCH_CHECK(total_elems % (MULTIMEM_BF16_ELEMS_PER_OP * ws) == 0);
+    int shard = static_cast<int>(total_elems) / ws;
+    TORCH_CHECK(residual.numel() == shard);
     auto dst = torch::empty_like(residual);
-
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
-    tp_reduce_scatter_residual_p2p(g_p2p_state, reinterpret_cast<__nv_bfloat16*>(dst.data_ptr()),
-                                   reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
-                                   static_cast<int>(shard_size), stream);
-
+    multimem_reduce_scatter_residual(
+        reinterpret_cast<void*>(g_dist_state.data_mc.mc_addr),
+        dst.data_ptr(),
+        reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        reinterpret_cast<uint32_t*>(g_dist_state.flag_mc.mc_addr),
+        reinterpret_cast<uint32_t*>(g_dist_state.flag_mc.local_addr),
+        static_cast<int>(total_elems),
+        g_dist_state.local_rank, ws, stream);
     return dst;
+}
+
+torch::Tensor read_mc_buffer(int64_t num_elems) {
+    TORCH_CHECK(g_dist_initialized, "Distributed state not initialized");
+    auto options = torch::TensorOptions().dtype(torch::kBFloat16)
+                       .device(torch::kCUDA, g_dist_state.local_rank);
+    auto out = torch::empty({num_elems}, options);
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    cudaMemcpyAsync(out.data_ptr(),
+                    reinterpret_cast<void*>(g_dist_state.data_mc.local_addr),
+                    num_elems * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, stream);
+    return out;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "TP+SP P2P communication primitives for Qwen3";
+    m.doc() = "Distributed TP/SP via multimem/NVLS";
 
-    m.def("init_p2p_state", &init_p2p_state, "Initialize P2P state with peer buffer pointers", py::arg("tp_size"),
-          py::arg("tp_rank"), py::arg("all_gather_ptrs_addr"), py::arg("reduce_scatter_ptrs_addr"));
-    m.def("destroy_p2p_state", &destroy_p2p_state, "Reset P2P state");
-
-    m.def("all_gather", &tp_all_gather_op, "P2P all-gather: write local shard to all peers", py::arg("local_shard"));
-    m.def("reduce_scatter", &tp_reduce_scatter_op, "P2P reduce-scatter: read shards from all peers and sum",
-          py::arg("shard_size"));
-    m.def("reduce_scatter_residual", &tp_reduce_scatter_residual_op, "Fused P2P reduce-scatter + residual add",
-          py::arg("residual"), py::arg("shard_size"));
+    m.def("init_distributed", &init_distributed_state);
+    m.def("destroy_distributed", &destroy_distributed_state_op);
+    m.def("get_mc_data_ptr", &get_mc_data_ptr);
+    m.def("get_local_data_ptr", &get_local_data_ptr);
+    m.def("copy_to_mc_buffer", &copy_to_mc_buffer);
+    m.def("read_mc_buffer", &read_mc_buffer);
+    m.def("multimem_allreduce", &multimem_allreduce_op);
+    m.def("multimem_allreduce_two_shot", &multimem_allreduce_two_shot_op);
+    m.def("multimem_reduce_scatter", &multimem_reduce_scatter_op);
+    m.def("multimem_reduce_scatter_residual", &multimem_reduce_scatter_residual_op);
 }
