@@ -1,12 +1,21 @@
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from .decoder import (
-    NUM_LAYERS, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM,
-    HIDDEN_SIZE, INTERMEDIATE_SIZE, KV_DIM, Q_DIM,
-    GQA_RATIO, RMS_EPS, VOCAB_SIZE, DEFAULT_MODEL, DEFAULT_MAX_SEQ,
-    ROPE_THETA, _precompute_rope,
+    DEFAULT_MAX_SEQ,
+    DEFAULT_MODEL,
+    HEAD_DIM,
+    HIDDEN_SIZE,
+    INTERMEDIATE_SIZE,
+    KV_DIM,
+    NUM_KV_HEADS,
+    NUM_LAYERS,
+    NUM_Q_HEADS,
+    Q_DIM,
+    RMS_EPS,
+    ROPE_THETA,
+    _precompute_rope,
 )
 
 MULTIMEM_BF16_ALIGN = 8  # multimem ops work on 8 bf16 elements at a time
@@ -25,7 +34,9 @@ def load_weights_for_rank(rank, model_name=DEFAULT_MODEL, max_seq_len=DEFAULT_MA
         print(f"Loading {model_name} to {device}...", flush=True)
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16, device_map=device,
+        model_name,
+        dtype=torch.bfloat16,
+        device_map=device,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     state = model.state_dict()
@@ -34,44 +45,48 @@ def load_weights_for_rank(rank, model_name=DEFAULT_MODEL, max_seq_len=DEFAULT_MA
     tie_embeddings = getattr(model.config, "tie_word_embeddings", True)
 
     def f32(key):
-        return state[key].float().contiguous()
+        return state[key].float().contiguous()  # noqa: F821
 
     def bf16(key):
-        return state[key].to(torch.bfloat16).contiguous()
+        return state[key].to(torch.bfloat16).contiguous()  # noqa: F821
 
     if verbose:
         print("Stacking per-layer weights...", flush=True)
 
     attn_ln_ws = torch.stack([f32(f"model.layers.{i}.input_layernorm.weight") for i in range(NUM_LAYERS)])
-    qkv_ws = torch.stack([
-        torch.cat([
-            bf16(f"model.layers.{i}.self_attn.q_proj.weight"),
-            bf16(f"model.layers.{i}.self_attn.k_proj.weight"),
-            bf16(f"model.layers.{i}.self_attn.v_proj.weight"),
-        ], dim=0)
-        for i in range(NUM_LAYERS)
-    ]).view(NUM_LAYERS, -1)
+    qkv_ws = torch.stack(
+        [
+            torch.cat(
+                [
+                    bf16(f"model.layers.{i}.self_attn.q_proj.weight"),
+                    bf16(f"model.layers.{i}.self_attn.k_proj.weight"),
+                    bf16(f"model.layers.{i}.self_attn.v_proj.weight"),
+                ],
+                dim=0,
+            )
+            for i in range(NUM_LAYERS)
+        ]
+    ).view(NUM_LAYERS, -1)
     q_norm_ws = torch.stack([f32(f"model.layers.{i}.self_attn.q_norm.weight") for i in range(NUM_LAYERS)])
     k_norm_ws = torch.stack([f32(f"model.layers.{i}.self_attn.k_norm.weight") for i in range(NUM_LAYERS)])
-    o_proj_ws = torch.stack(
-        [bf16(f"model.layers.{i}.self_attn.o_proj.weight") for i in range(NUM_LAYERS)]
-    ).view(NUM_LAYERS, -1)
+    o_proj_ws = torch.stack([bf16(f"model.layers.{i}.self_attn.o_proj.weight") for i in range(NUM_LAYERS)]).view(
+        NUM_LAYERS, -1
+    )
     mlp_ln_ws = torch.stack([f32(f"model.layers.{i}.post_attention_layernorm.weight") for i in range(NUM_LAYERS)])
-    gate_ws = torch.stack(
-        [bf16(f"model.layers.{i}.mlp.gate_proj.weight") for i in range(NUM_LAYERS)]
-    ).view(NUM_LAYERS, -1)
-    up_ws = torch.stack(
-        [bf16(f"model.layers.{i}.mlp.up_proj.weight") for i in range(NUM_LAYERS)]
-    ).view(NUM_LAYERS, -1)
-    down_ws = torch.stack(
-        [bf16(f"model.layers.{i}.mlp.down_proj.weight") for i in range(NUM_LAYERS)]
-    ).view(NUM_LAYERS, -1)
+    gate_ws = torch.stack([bf16(f"model.layers.{i}.mlp.gate_proj.weight") for i in range(NUM_LAYERS)]).view(
+        NUM_LAYERS, -1
+    )
+    up_ws = torch.stack([bf16(f"model.layers.{i}.mlp.up_proj.weight") for i in range(NUM_LAYERS)]).view(NUM_LAYERS, -1)
+    down_ws = torch.stack([bf16(f"model.layers.{i}.mlp.down_proj.weight") for i in range(NUM_LAYERS)]).view(
+        NUM_LAYERS, -1
+    )
 
     norm_w = f32("model.norm.weight")
     embed_w = f32("model.embed_tokens.weight")
     lm_head_w = (
         (state["model.embed_tokens.weight"] if tie_embeddings else state["lm_head.weight"])
-        .to(torch.bfloat16).contiguous()
+        .to(torch.bfloat16)
+        .contiguous()
     )
 
     cos_table, sin_table = _precompute_rope(max_seq_len, rope_theta)
@@ -82,13 +97,25 @@ def load_weights_for_rank(rank, model_name=DEFAULT_MODEL, max_seq_len=DEFAULT_MA
     if verbose:
         print("Weights loaded.", flush=True)
 
-    return dict(
-        embed_w=embed_w, attn_ln_ws=attn_ln_ws, qkv_ws=qkv_ws,
-        q_norm_ws=q_norm_ws, k_norm_ws=k_norm_ws, o_proj_ws=o_proj_ws,
-        mlp_ln_ws=mlp_ln_ws, gate_ws=gate_ws, up_ws=up_ws, down_ws=down_ws,
-        norm_w=norm_w, lm_head_w=lm_head_w,
-        cos_table=cos_table, sin_table=sin_table,
-    ), tokenizer
+    return (
+        dict(
+            embed_w=embed_w,
+            attn_ln_ws=attn_ln_ws,
+            qkv_ws=qkv_ws,
+            q_norm_ws=q_norm_ws,
+            k_norm_ws=k_norm_ws,
+            o_proj_ws=o_proj_ws,
+            mlp_ln_ws=mlp_ln_ws,
+            gate_ws=gate_ws,
+            up_ws=up_ws,
+            down_ws=down_ws,
+            norm_w=norm_w,
+            lm_head_w=lm_head_w,
+            cos_table=cos_table,
+            sin_table=sin_table,
+        ),
+        tokenizer,
+    )
 
 
 class DistributedDecoder:
@@ -134,8 +161,8 @@ class DistributedDecoder:
 
         qkv_ws_3d = weights["qkv_ws"].view(NUM_LAYERS, Q_DIM + 2 * KV_DIM, HIDDEN_SIZE)
         q_w = qkv_ws_3d[:, :Q_DIM, :][:, q_start:q_end, :]
-        k_w = qkv_ws_3d[:, Q_DIM:Q_DIM + KV_DIM, :][:, kv_start:kv_end, :]
-        v_w = qkv_ws_3d[:, Q_DIM + KV_DIM:, :][:, kv_start:kv_end, :]
+        k_w = qkv_ws_3d[:, Q_DIM : Q_DIM + KV_DIM, :][:, kv_start:kv_end, :]
+        v_w = qkv_ws_3d[:, Q_DIM + KV_DIM :, :][:, kv_start:kv_end, :]
         self._qkv_ws = torch.cat([q_w, k_w, v_w], dim=1).contiguous()
 
         self._q_norm_ws = weights["q_norm_ws"]
@@ -157,14 +184,20 @@ class DistributedDecoder:
         self._down_ws = down_ws_3d[:, :, inter_start:inter_end].contiguous()
 
         # Fused gate+up for prefill (same pattern as single-GPU decoder)
-        self._gate_up_ws = torch.cat([
-            self._gate_ws.view(NUM_LAYERS, inter_per_rank, HIDDEN_SIZE),
-            self._up_ws.view(NUM_LAYERS, inter_per_rank, HIDDEN_SIZE),
-        ], dim=1)
+        self._gate_up_ws = torch.cat(
+            [
+                self._gate_ws.view(NUM_LAYERS, inter_per_rank, HIDDEN_SIZE),
+                self._up_ws.view(NUM_LAYERS, inter_per_rank, HIDDEN_SIZE),
+            ],
+            dim=1,
+        )
 
         self._k_cache = torch.zeros(
-            NUM_LAYERS, max_seq_len, self._kv_dim_local,
-            dtype=torch.bfloat16, device="cuda",
+            NUM_LAYERS,
+            max_seq_len,
+            self._kv_dim_local,
+            dtype=torch.bfloat16,
+            device="cuda",
         )
         self._v_cache = torch.zeros_like(self._k_cache)
 
@@ -195,15 +228,18 @@ class DistributedDecoder:
             o_params = self._o_proj_ws[0].numel()
             g_params = self._gate_ws[0].numel() + self._up_ws[0].numel() + self._down_ws[0].numel()
             total_sharded = (q_params + o_params + g_params) * NUM_LAYERS * 2
-            print(f"[rank {tp_rank}] Sharded weight bytes: {total_sharded / 1e6:.1f} MB "
-                  f"({self._q_heads_local}Q/{self._kv_heads_local}KV heads, "
-                  f"{self._inter_local} intermediate)"
-                  f" multimem={'ON' if self._use_multimem else 'OFF'}")
+            print(
+                f"[rank {tp_rank}] Sharded weight bytes: {total_sharded / 1e6:.1f} MB "
+                f"({self._q_heads_local}Q/{self._kv_heads_local}KV heads, "
+                f"{self._inter_local} intermediate)"
+                f" multimem={'ON' if self._use_multimem else 'OFF'}"
+            )
 
     def _init_multimem(self, verbose: bool):
         """Initialize multimem/NVLS allreduce kernels if available."""
         try:
             from .build import get_tp_kernels
+
             self._tp_kernels = get_tp_kernels()
 
             # Buffer must hold the largest tensor we allreduce.
@@ -215,8 +251,7 @@ class DistributedDecoder:
             self._tp_kernels.init_distributed(self.tp_size, self.tp_rank, buf_bytes)
             self._use_multimem = True
             if verbose:
-                print(f"[rank {self.tp_rank}] Multimem initialized "
-                      f"(buf={buf_bytes} bytes, {buf_elems} bf16 elems)")
+                print(f"[rank {self.tp_rank}] Multimem initialized " f"(buf={buf_bytes} bytes, {buf_elems} bf16 elems)")
         except Exception as e:
             if verbose:
                 print(f"[rank {self.tp_rank}] Multimem init failed, falling back to NCCL: {e}")
@@ -259,24 +294,28 @@ class DistributedDecoder:
         pos = self._position
         hidden = self._embed_w_bf16[token_id].unsqueeze(0)
 
-        cos_dup = self._cos_dup[pos:pos + 1]
-        sin_dup = self._sin_dup[pos:pos + 1]
+        cos_dup = self._cos_dup[pos : pos + 1]
+        sin_dup = self._sin_dup[pos : pos + 1]
 
         for layer in range(NUM_LAYERS):
             normed = F.rms_norm(hidden, (HIDDEN_SIZE,), self._attn_ln_ws_bf16[layer], eps=RMS_EPS)
 
             qkv = torch.mm(normed, self._qkv_ws[layer].t())
-            q = qkv[:, :self._q_dim_local]
-            k = qkv[:, self._q_dim_local:self._q_dim_local + self._kv_dim_local]
-            v = qkv[:, self._q_dim_local + self._kv_dim_local:]
+            q = qkv[:, : self._q_dim_local]
+            k = qkv[:, self._q_dim_local : self._q_dim_local + self._kv_dim_local]
+            v = qkv[:, self._q_dim_local + self._kv_dim_local :]
 
             q = F.rms_norm(
-                q.view(1, self._q_heads_local, HEAD_DIM), (HEAD_DIM,),
-                self._q_norm_ws_bf16[layer], eps=RMS_EPS,
+                q.view(1, self._q_heads_local, HEAD_DIM),
+                (HEAD_DIM,),
+                self._q_norm_ws_bf16[layer],
+                eps=RMS_EPS,
             ).view(1, -1)
             k = F.rms_norm(
-                k.view(1, self._kv_heads_local, HEAD_DIM), (HEAD_DIM,),
-                self._k_norm_ws_bf16[layer], eps=RMS_EPS,
+                k.view(1, self._kv_heads_local, HEAD_DIM),
+                (HEAD_DIM,),
+                self._k_norm_ws_bf16[layer],
+                eps=RMS_EPS,
             ).view(1, -1)
 
             q = self._apply_rope_fast(q, cos_dup, sin_dup, self._q_heads_local)
@@ -323,17 +362,21 @@ class DistributedDecoder:
             normed = F.rms_norm(hidden, (HIDDEN_SIZE,), self._attn_ln_ws_bf16[layer], eps=RMS_EPS)
 
             qkv = torch.mm(normed, self._qkv_ws[layer].t())
-            q = qkv[:, :self._q_dim_local]
-            k = qkv[:, self._q_dim_local:self._q_dim_local + self._kv_dim_local]
-            v = qkv[:, self._q_dim_local + self._kv_dim_local:]
+            q = qkv[:, : self._q_dim_local]
+            k = qkv[:, self._q_dim_local : self._q_dim_local + self._kv_dim_local]
+            v = qkv[:, self._q_dim_local + self._kv_dim_local :]
 
             q = F.rms_norm(
-                q.view(n, self._q_heads_local, HEAD_DIM), (HEAD_DIM,),
-                self._q_norm_ws_bf16[layer], eps=RMS_EPS,
+                q.view(n, self._q_heads_local, HEAD_DIM),
+                (HEAD_DIM,),
+                self._q_norm_ws_bf16[layer],
+                eps=RMS_EPS,
             ).view(n, -1)
             k = F.rms_norm(
-                k.view(n, self._kv_heads_local, HEAD_DIM), (HEAD_DIM,),
-                self._k_norm_ws_bf16[layer], eps=RMS_EPS,
+                k.view(n, self._kv_heads_local, HEAD_DIM),
+                (HEAD_DIM,),
+                self._k_norm_ws_bf16[layer],
+                eps=RMS_EPS,
             ).view(n, -1)
 
             q = self._apply_rope_fast(q, cos_dup, sin_dup, self._q_heads_local)
@@ -355,8 +398,8 @@ class DistributedDecoder:
 
             normed = F.rms_norm(hidden, (HIDDEN_SIZE,), self._mlp_ln_ws_bf16[layer], eps=RMS_EPS)
             gate_up = torch.mm(normed, self._gate_up_ws[layer].t())
-            gate = gate_up[:, :self._inter_local]
-            up = gate_up[:, self._inter_local:]
+            gate = gate_up[:, : self._inter_local]
+            up = gate_up[:, self._inter_local :]
 
             down_partial = torch.mm(F.silu(gate) * up, self._down_ws[layer].t())
             self._allreduce(down_partial)

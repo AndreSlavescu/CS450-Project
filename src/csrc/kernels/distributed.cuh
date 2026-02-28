@@ -9,15 +9,15 @@
 
 #include "multimem.cuh"
 
-#define CU_CHECK(cmd)                                                                 \
-    do {                                                                              \
-        CUresult e = cmd;                                                             \
-        if (e != CUDA_SUCCESS) {                                                      \
-            const char* err_str;                                                      \
-            cuGetErrorString(e, &err_str);                                            \
-            printf("CUDA driver error %s:%d '%s'\n", __FILE__, __LINE__, err_str);    \
-            exit(EXIT_FAILURE);                                                       \
-        }                                                                             \
+#define CU_CHECK(cmd)                                                                                                  \
+    do {                                                                                                               \
+        CUresult e = cmd;                                                                                              \
+        if (e != CUDA_SUCCESS) {                                                                                       \
+            const char* err_str;                                                                                       \
+            cuGetErrorString(e, &err_str);                                                                             \
+            printf("CUDA driver error %s:%d '%s'\n", __FILE__, __LINE__, err_str);                                     \
+            exit(EXIT_FAILURE);                                                                                        \
+        }                                                                                                              \
     } while (0)
 
 struct MulticastConfig {
@@ -100,7 +100,8 @@ inline void bind_local_view(MulticastConfig& cfg, int rank, CUdevice device) {
 }
 
 inline void destroy_multicast_buffer(MulticastConfig& cfg) {
-    if (!cfg.initialized) return;
+    if (!cfg.initialized)
+        return;
     cuMemUnmap(cfg.local_addr, cfg.buf_size);
     cuMemAddressFree(cfg.local_addr, cfg.buf_size);
     cuMemUnmap(cfg.mc_addr, cfg.buf_size);
@@ -114,7 +115,7 @@ inline void destroy_multicast_buffer(MulticastConfig& cfg) {
 }
 
 inline DistributedState create_distributed_state(int world_size, int local_rank, size_t data_buf_size,
-                                                  int num_sms_for_flags) {
+                                                 int num_sms_for_flags) {
     DistributedState state = {};
     state.world_size = world_size;
     state.local_rank = local_rank;

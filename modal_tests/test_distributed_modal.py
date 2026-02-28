@@ -50,7 +50,9 @@ def _worker(rank: int, world_size: int, results_dict: dict):
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size,
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
         device_id=torch.device(f"cuda:{rank}"),
     )
 
@@ -109,7 +111,7 @@ def _worker(rank: int, world_size: int, results_dict: dict):
     ttft_results = {}
 
     for plen in TTFT_PROMPT_LENS:
-        prompt_text = (base_text * ((plen // 10) + 1))[:plen * 5]
+        prompt_text = (base_text * ((plen // 10) + 1))[: plen * 5]
         prompt_ids = dec.tokenizer.encode(prompt_text, add_special_tokens=True)[:plen]
         if len(prompt_ids) < plen:
             prompt_ids = prompt_ids + [prompt_ids[-1]] * (plen - len(prompt_ids))
@@ -204,17 +206,18 @@ def _worker(rank: int, world_size: int, results_dict: dict):
     mk_results = {}
     if rank == 0:
         print(f"\n{'='*60}")
-        print(f"Single-GPU megakernel baseline (rank 0)")
+        print("Single-GPU megakernel baseline (rank 0)")
         print(f"{'='*60}")
 
         from src.python.Qwen3.decoder import Decoder as SingleDecoder
+
         single_dec = SingleDecoder(verbose=False)
 
         print(f"\n{'Prompt len':>12} {'TTFT (ms)':>12} {'Prefill tok/s':>14}")
         print(f"{'─'*60}")
 
         for plen in TTFT_PROMPT_LENS:
-            prompt_text = (base_text * ((plen // 10) + 1))[:plen * 5]
+            prompt_text = (base_text * ((plen // 10) + 1))[: plen * 5]
             prompt_ids = single_dec.tokenizer.encode(prompt_text, add_special_tokens=True)[:plen]
             if len(prompt_ids) < plen:
                 prompt_ids = prompt_ids + [prompt_ids[-1]] * (plen - len(prompt_ids))
@@ -309,7 +312,7 @@ def _worker(rank: int, world_size: int, results_dict: dict):
                 speedup = sg / tp if tp > 0 else 0
                 print(f"{plen:>8} {sg:>12.2f} {tp:>12.2f} {speedup:>9.2f}x")
 
-        print(f"\nDecode throughput:")
+        print("\nDecode throughput:")
         mk_tps = GEN_TOKENS / (mean_sd / 1000.0)
         print(f"  1-GPU megakernel: {mk_tps:.1f} tok/s ({mean_sd / GEN_TOKENS:.2f} ms/tok)")
         print(f"  TP={world_size} distributed: {decode_tps:.1f} tok/s ({ms_per_tok:.2f} ms/tok)")
@@ -345,6 +348,7 @@ def run_distributed_benchmark_8():
 
 def _run_benchmark(tp_size: int):
     import torch.multiprocessing as mp
+
     manager = mp.Manager()
     results = manager.dict()
     mp.spawn(_worker, args=(tp_size, results), nprocs=tp_size, join=True)
@@ -353,11 +357,9 @@ def _run_benchmark(tp_size: int):
 
 @app.local_entrypoint()
 def main(tp: int = 2):
-    fn = {2: run_distributed_benchmark_2,
-          4: run_distributed_benchmark_4,
-          8: run_distributed_benchmark_8}.get(tp)
+    fn = {2: run_distributed_benchmark_2, 4: run_distributed_benchmark_4, 8: run_distributed_benchmark_8}.get(tp)
     if fn is None:
         print(f"Unsupported --tp {tp}. Use 2, 4, or 8.")
         return
-    results = fn.remote()
+    fn.remote()
     print("\nBenchmark complete.")
