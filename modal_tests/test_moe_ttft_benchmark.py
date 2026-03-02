@@ -92,6 +92,7 @@ download_image = modal.Image.debian_slim(python_version="3.12").pip_install(
 # Weight download (one-time, runs on cheap CPU instance)
 # ══════════════════════════════════════════════════════════════════
 
+
 @app.function(
     image=download_image,
     timeout=7200,  # 2 hours for ~960GB
@@ -119,6 +120,7 @@ def download_model():
 
 # ── Prompt construction ──
 
+
 def _make_prompt(tokenizer, n_tokens: int) -> str:
     """Build a prompt of approximately n_tokens tokens."""
     base_ids = tokenizer.encode(_PROMPT_BASE, add_special_tokens=False)
@@ -130,6 +132,7 @@ def _make_prompt(tokenizer, n_tokens: int) -> str:
 # ══════════════════════════════════════════════════════════════════
 # Backend 1: Our custom engine (TP=8 + EP=8)
 # ══════════════════════════════════════════════════════════════════
+
 
 def _ours_worker(rank: int, world_size: int, results_dict: dict, prompt_lens: list):
     import time
@@ -165,19 +168,36 @@ def _ours_worker(rank: int, world_size: int, results_dict: dict, prompt_lens: li
         import subprocess
 
         torch_incs = subprocess.check_output(
-            ["python3", "-c", "from torch.utils.cpp_extension import include_paths; print(' '.join('-I' + p for p in include_paths()))"],
+            [
+                "python3",
+                "-c",
+                "from torch.utils.cpp_extension import include_paths; "
+                "print(' '.join('-I' + p for p in include_paths()))",
+            ],
             text=True,
         ).strip()
         torch_libs = subprocess.check_output(
-            ["python3", "-c", "from torch.utils.cpp_extension import library_paths; print(' '.join('-L' + p for p in library_paths()))"],
+            [
+                "python3",
+                "-c",
+                "from torch.utils.cpp_extension import library_paths; "
+                "print(' '.join('-L' + p for p in library_paths()))",
+            ],
             text=True,
         ).strip()
         extra_flags = f"{torch_incs} {torch_libs} -ltorch -ltorch_cpu -lc10 -ltorch_python"
 
         print("[Ours] Building MoE kernel...", flush=True)
         result = subprocess.run(
-            ["make", "-C", "/workspace/src/csrc/kernels", f"EXTRA_NVCCFLAGS={extra_flags}", "moe_expert.cpython-312-x86_64-linux-gnu.so"],
-            capture_output=True, text=True,
+            [
+                "make",
+                "-C",
+                "/workspace/src/csrc/kernels",
+                f"EXTRA_NVCCFLAGS={extra_flags}",
+                "moe_expert.cpython-312-x86_64-linux-gnu.so",
+            ],
+            capture_output=True,
+            text=True,
         )
         if result.returncode != 0:
             raise RuntimeError(f"MoE kernel build failed:\n{result.stderr[:1000]}")
@@ -200,7 +220,7 @@ def _ours_worker(rank: int, world_size: int, results_dict: dict, prompt_lens: li
     )
 
     if rank == 0:
-        print(f"[Ours] Loading model...", flush=True)
+        print("[Ours] Loading model...", flush=True)
 
     t_load = time.perf_counter()
     model = Qwen3ForCausalLM.from_pretrained(
@@ -216,6 +236,7 @@ def _ours_worker(rank: int, world_size: int, results_dict: dict, prompt_lens: li
         print(f"[Ours] Model loaded in {t_load:.1f}s", flush=True)
 
     from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     # ── TTFT measurement (model loading excluded) ──
@@ -333,6 +354,7 @@ def run_ours(prompt_lens: list[int]) -> dict:
 # Backend 2: vLLM (TP=8)
 # ══════════════════════════════════════════════════════════════════
 
+
 @app.function(
     image=vllm_image,
     gpu="B200:8",
@@ -391,8 +413,10 @@ def run_vllm(prompt_lens: list[int]) -> dict:
                 n_gen = len(output.outputs[0].token_ids)
                 if (
                     n_gen > 1
-                    and hasattr(m, "last_token_time") and m.last_token_time
-                    and hasattr(m, "first_token_time") and m.first_token_time
+                    and hasattr(m, "last_token_time")
+                    and m.last_token_time
+                    and hasattr(m, "first_token_time")
+                    and m.first_token_time
                 ):
                     decode_total = (m.last_token_time - m.first_token_time) * 1000.0
                     decode_ms_per_tok_list.append(decode_total / (n_gen - 1))
@@ -418,6 +442,7 @@ def run_vllm(prompt_lens: list[int]) -> dict:
 
     except Exception as e:
         import traceback
+
         print(f"[vLLM] FAILED: {e}", flush=True)
         traceback.print_exc()
         return {"error": str(e), "ttft": {}, "decode_ms_per_tok": {}}
@@ -428,6 +453,7 @@ def run_vllm(prompt_lens: list[int]) -> dict:
 # ══════════════════════════════════════════════════════════════════
 # Backend 3: SGLang (TP=8)
 # ══════════════════════════════════════════════════════════════════
+
 
 @app.function(
     image=sglang_image,
@@ -497,6 +523,7 @@ def run_sglang(prompt_lens: list[int]) -> dict:
 
     except Exception as e:
         import traceback
+
         print(f"[SGLang] FAILED: {e}", flush=True)
         traceback.print_exc()
         return {"error": str(e), "ttft": {}, "decode_ms_per_tok": {}}
@@ -507,6 +534,7 @@ def run_sglang(prompt_lens: list[int]) -> dict:
 # ══════════════════════════════════════════════════════════════════
 # Entrypoint: run sequentially, collect & compare
 # ══════════════════════════════════════════════════════════════════
+
 
 def _print_table(title: str, all_results: dict[str, dict], prompt_lens: list[int], key: str, fmt: str = ".1f"):
     """Print a comparison table for one metric across backends."""
@@ -560,28 +588,28 @@ def orchestrate(prompt_lens: list[int]) -> dict:
 
     print(f"\n{'='*70}")
     print(f"TTFT Benchmark: {MODEL_NAME}")
-    print(f"Hardware: 8x B200 per backend")
+    print("Hardware: 8x B200 per backend")
     print(f"Prompt lengths: {prompt_lens}")
     print(f"Decode tokens: {GEN_TOKENS}")
-    print(f"Note: Model loading time is NOT included in TTFT measurements")
+    print("Note: Model loading time is NOT included in TTFT measurements")
     print(f"{'='*70}")
 
     # Run backends sequentially
-    print(f"\n--- Running: Our custom engine (TP=8, EP=8) ---", flush=True)
+    print("\n--- Running: Our custom engine (TP=8, EP=8) ---", flush=True)
     try:
         all_results["Ours"] = run_ours.remote(prompt_lens)
     except Exception as e:
         print(f"[WARN] Our engine failed: {e}")
         all_results["Ours"] = {"ttft": {}, "decode_ms_per_tok": {}}
 
-    print(f"\n--- Running: vLLM (TP=8, EP=8) ---", flush=True)
+    print("\n--- Running: vLLM (TP=8, EP=8) ---", flush=True)
     try:
         all_results["vLLM"] = run_vllm.remote(prompt_lens)
     except Exception as e:
         print(f"[WARN] vLLM failed: {e}")
         all_results["vLLM"] = {"ttft": {}, "decode_ms_per_tok": {}}
 
-    print(f"\n--- Running: SGLang (TP=8) ---", flush=True)
+    print("\n--- Running: SGLang (TP=8) ---", flush=True)
     try:
         all_results["SGLang"] = run_sglang.remote(prompt_lens)
     except Exception as e:
@@ -590,14 +618,10 @@ def orchestrate(prompt_lens: list[int]) -> dict:
 
     # Print comparison tables
     _print_table(
-        "TTFT (median ms, lower is better — model loading excluded)",
-        all_results, prompt_lens, "ttft", fmt=".1f"
+        "TTFT (median ms, lower is better — model loading excluded)", all_results, prompt_lens, "ttft", fmt=".1f"
     )
 
-    _print_table(
-        "DECODE (ms/tok, lower is better)",
-        all_results, prompt_lens, "decode_ms_per_tok", fmt=".2f"
-    )
+    _print_table("DECODE (ms/tok, lower is better)", all_results, prompt_lens, "decode_ms_per_tok", fmt=".2f")
 
     # Errors
     for name, res in all_results.items():
@@ -624,14 +648,8 @@ def main(download_only: bool = False):
     results = orchestrate.remote(PROMPT_LENS)
 
     # Reprint the comparison tables locally for convenience
-    _print_table(
-        "TTFT (median ms, lower is better — model loading excluded)",
-        results, PROMPT_LENS, "ttft", fmt=".1f"
-    )
-    _print_table(
-        "DECODE (ms/tok, lower is better)",
-        results, PROMPT_LENS, "decode_ms_per_tok", fmt=".2f"
-    )
+    _print_table("TTFT (median ms, lower is better — model loading excluded)", results, PROMPT_LENS, "ttft", fmt=".1f")
+    _print_table("DECODE (ms/tok, lower is better)", results, PROMPT_LENS, "decode_ms_per_tok", fmt=".2f")
 
     for name, res in results.items():
         if "error" in res:

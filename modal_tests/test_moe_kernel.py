@@ -47,8 +47,10 @@ def run_moe_kernel_test():
     print("=" * 60)
 
     drv_info = subprocess.run(
-        ["nvidia-smi", "--query-gpu=name,driver_version,compute_cap,memory.total",
-         "--format=csv,noheader"], capture_output=True, text=True)
+        ["nvidia-smi", "--query-gpu=name,driver_version,compute_cap,memory.total", "--format=csv,noheader"],
+        capture_output=True,
+        text=True,
+    )
     print(f"  GPU: {drv_info.stdout.strip()}")
 
     cuda_ver = subprocess.run(["nvcc", "--version"], capture_output=True, text=True)
@@ -73,23 +75,35 @@ def run_moe_kernel_test():
     print("=" * 60)
 
     torch_incs = subprocess.check_output(
-        ["python3", "-c", "from torch.utils.cpp_extension import include_paths; print(' '.join('-I' + p for p in include_paths()))"],
+        [
+            "python3",
+            "-c",
+            "from torch.utils.cpp_extension import include_paths; print(' '.join('-I' + p for p in include_paths()))",
+        ],
         text=True,
     ).strip()
     torch_libs = subprocess.check_output(
-        ["python3", "-c", "from torch.utils.cpp_extension import library_paths; print(' '.join('-L' + p for p in library_paths()))"],
+        [
+            "python3",
+            "-c",
+            "from torch.utils.cpp_extension import library_paths; print(' '.join('-L' + p for p in library_paths()))",
+        ],
         text=True,
     ).strip()
     extra_flags = f"{torch_incs} {torch_libs} -ltorch -ltorch_cpu -lc10 -ltorch_python"
 
     build_result = subprocess.run(
         [
-            "make", "-C", "/workspace/src/csrc/kernels",
+            "make",
+            "-C",
+            "/workspace/src/csrc/kernels",
             "GPU=B200",
             f"EXTRA_NVCCFLAGS={extra_flags}",
             "moe_expert.cpython-312-x86_64-linux-gnu.so",
         ],
-        capture_output=True, text=True, timeout=300,
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
 
     print("STDOUT:", build_result.stdout[-2000:] if len(build_result.stdout) > 2000 else build_result.stdout)
@@ -119,7 +133,7 @@ def run_moe_kernel_test():
     device = "cuda:0"
 
     # Test dimensions (Qwen3-480B scale)
-    T = 256          # tokens
+    T = 256  # tokens
     hidden_size = 6144
     num_experts = 160
     num_local_experts = 20
@@ -133,8 +147,12 @@ def run_moe_kernel_test():
     # 2a. Router + top-k + sort
     print("  Testing moe_router_topk...", end=" ", flush=True)
     sorted_ids, sorted_weights, expert_offsets = moe.moe_router_topk(
-        hidden_states, router_weight, top_k, True,
-        local_expert_offset, num_local_experts,
+        hidden_states,
+        router_weight,
+        top_k,
+        True,
+        local_expert_offset,
+        num_local_experts,
     )
     total_assignments = sorted_ids.shape[0]
     print(f"OK  (total_assignments={total_assignments})")
@@ -174,7 +192,11 @@ def run_moe_kernel_test():
     print("  Testing moe_scatter_accumulate...", end=" ", flush=True)
     down_fake = torch.randn(total_assignments, hidden_size, dtype=torch.bfloat16, device=device)
     scatter_out = moe.moe_scatter_accumulate(
-        down_fake, sorted_ids, sorted_weights, T, hidden_size,
+        down_fake,
+        sorted_ids,
+        sorted_weights,
+        T,
+        hidden_size,
     )
     assert scatter_out.shape == (T, hidden_size)
     ref_scatter = torch.zeros(T, hidden_size, dtype=torch.float32, device=device)
@@ -200,13 +222,19 @@ def run_moe_kernel_test():
     print("  Testing moe_gate_up_gemm...", end=" ", flush=True)
     gate_up_width = 2 * intermediate_size  # 5120
     gate_up_weights = torch.randn(
-        num_local_experts, gate_up_width, hidden_size,
-        dtype=torch.bfloat16, device=device,
+        num_local_experts,
+        gate_up_width,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
     )
 
     gate_up_out = moe.moe_gate_up_gemm(
-        sorted_hidden, gate_up_weights, expert_offsets,
-        hidden_size, gate_up_width,
+        sorted_hidden,
+        gate_up_weights,
+        expert_offsets,
+        hidden_size,
+        gate_up_width,
     )
     assert gate_up_out.shape == (total_assignments, gate_up_width)
 
@@ -232,17 +260,25 @@ def run_moe_kernel_test():
     # 3b. Down GEMM: [T_sorted, 2560] x [20, 6144, 2560]^T -> [T_sorted, 6144]
     print("  Testing moe_down_gemm...", end=" ", flush=True)
     intermediate_in = torch.randn(
-        total_assignments, intermediate_size,
-        dtype=torch.bfloat16, device=device,
+        total_assignments,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device=device,
     )
     down_weights = torch.randn(
-        num_local_experts, hidden_size, intermediate_size,
-        dtype=torch.bfloat16, device=device,
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device=device,
     )
 
     down_out = moe.moe_down_gemm(
-        intermediate_in, down_weights, expert_offsets,
-        hidden_size, intermediate_size,
+        intermediate_in,
+        down_weights,
+        expert_offsets,
+        hidden_size,
+        intermediate_size,
     )
     assert down_out.shape == (total_assignments, hidden_size)
 
@@ -271,9 +307,9 @@ def run_moe_kernel_test():
     print("Step 4: End-to-end MoE layer (cuBLAS kernel vs PyTorch)")
     print("=" * 60)
 
-    def pytorch_moe_from_routing(hidden, experts_gate_up, experts_down,
-                                 sorted_ids, sorted_weights_t, expert_offsets_t,
-                                 n_local, T_in):
+    def pytorch_moe_from_routing(
+        hidden, experts_gate_up, experts_down, sorted_ids, sorted_weights_t, expert_offsets_t, n_local, T_in
+    ):
         """PyTorch MoE compute using pre-computed routing (same as CUDA path)."""
         H = hidden.shape[1]
         inter_size = experts_down.shape[2]
@@ -304,14 +340,18 @@ def run_moe_kernel_test():
 
         return output.bfloat16()
 
-    def cuda_moe_forward(hidden, router_w, experts_gate_up, experts_down,
-                         top_k, local_offset, n_local, norm_topk):
+    def cuda_moe_forward(hidden, router_w, experts_gate_up, experts_down, top_k, local_offset, n_local, norm_topk):
         """MoE forward using cuBLAS GEMM + custom fusion kernel pipeline."""
         T_in, H = hidden.shape
         inter_size = experts_down.shape[2]
 
         sorted_ids, sorted_w, exp_offs = moe.moe_router_topk(
-            hidden, router_w, top_k, norm_topk, local_offset, n_local,
+            hidden,
+            router_w,
+            top_k,
+            norm_topk,
+            local_offset,
+            n_local,
         )
 
         n_assign = sorted_ids.shape[0]
@@ -340,12 +380,18 @@ def run_moe_kernel_test():
     # 4a. Router accuracy: compare CUDA router vs PyTorch router
     print("  4a. Router comparison (CUDA vs PyTorch)...", flush=True)
     import torch.nn.functional as F
+
     pt_logits = hidden_e2e.float() @ router_w_e2e.float().T
     pt_probs = F.softmax(pt_logits, dim=-1)
     _, pt_topk_experts = torch.topk(pt_probs, top_k_e2e, dim=-1)
 
     sorted_ids_e2e, sorted_w_e2e, exp_offs_e2e = moe.moe_router_topk(
-        hidden_e2e, router_w_e2e, top_k_e2e, True, 0, n_local_e2e,
+        hidden_e2e,
+        router_w_e2e,
+        top_k_e2e,
+        True,
+        0,
+        n_local_e2e,
     )
     print(f"    CUDA total_assignments = {sorted_ids_e2e.shape[0]}")
 
@@ -365,9 +411,14 @@ def run_moe_kernel_test():
 
     print("    Running PyTorch reference (shared routing)...", flush=True)
     ref_out = pytorch_moe_from_routing(
-        hidden_e2e, gate_up_w_e2e, down_w_e2e,
-        sorted_ids_e2e, sorted_w_e2e, exp_offs_e2e,
-        n_local_e2e, T_e2e,
+        hidden_e2e,
+        gate_up_w_e2e,
+        down_w_e2e,
+        sorted_ids_e2e,
+        sorted_w_e2e,
+        exp_offs_e2e,
+        n_local_e2e,
+        T_e2e,
     )
 
     print("    Running cuBLAS kernel pipeline (shared routing)...", flush=True)
@@ -437,7 +488,7 @@ def run_moe_kernel_test():
         results[f"gate_up_gemm_T{T_bench}"] = {"ms": ms, "tflops": tflops}
 
     # 5b. Down GEMM benchmark
-    print(f"\n  Down GEMM: [T_sorted, 2560] x [6144, 2560]^T -> [T_sorted, 6144]")
+    print("\n  Down GEMM: [T_sorted, 2560] x [6144, 2560]^T -> [T_sorted, 6144]")
     for T_bench in [256, 512, 1024, 2048, 4096]:
         tokens_per_expert = T_bench // num_local_experts
         if tokens_per_expert < 1:
@@ -468,22 +519,34 @@ def run_moe_kernel_test():
         results[f"down_gemm_T{T_bench}"] = {"ms": ms, "tflops": tflops}
 
     # 5c. Full MoE layer benchmark (end-to-end)
-    print(f"\n  Full MoE layer (router + gather + gate_up + silu + down + scatter):")
+    print("\n  Full MoE layer (router + gather + gate_up + silu + down + scatter):")
     for T_bench in [256, 512, 1024, 2048, 4096]:
         hidden_bench = torch.randn(T_bench, hidden_size, dtype=torch.bfloat16, device=device) * 0.02
 
         for _ in range(WARMUP):
             cuda_moe_forward(
-                hidden_bench, router_weight, gate_up_weights, down_weights,
-                top_k, 0, num_local_experts, True,
+                hidden_bench,
+                router_weight,
+                gate_up_weights,
+                down_weights,
+                top_k,
+                0,
+                num_local_experts,
+                True,
             )
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
         for _ in range(ITERS):
             cuda_moe_forward(
-                hidden_bench, router_weight, gate_up_weights, down_weights,
-                top_k, 0, num_local_experts, True,
+                hidden_bench,
+                router_weight,
+                gate_up_weights,
+                down_weights,
+                top_k,
+                0,
+                num_local_experts,
+                True,
             )
         torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -493,8 +556,9 @@ def run_moe_kernel_test():
         results[f"full_moe_T{T_bench}"] = {"ms": ms}
 
     # 5d. PyTorch baseline for comparison
-    def pytorch_moe_forward_bench(hidden, router_w, experts_gate_up, experts_down,
-                                  top_k_b, local_offset, n_local, norm_topk):
+    def pytorch_moe_forward_bench(
+        hidden, router_w, experts_gate_up, experts_down, top_k_b, local_offset, n_local, norm_topk
+    ):
         """Pure PyTorch MoE forward (for benchmarking)."""
         T_in, H = hidden.shape
         router_logits = hidden.float() @ router_w.float().T
@@ -509,7 +573,7 @@ def run_moe_kernel_test():
 
         for local_idx in range(n_local):
             global_idx = local_offset + local_idx
-            mask = (topk_experts == global_idx)
+            mask = topk_experts == global_idx
             token_mask = mask.any(dim=-1)
             if not token_mask.any():
                 continue
@@ -529,22 +593,34 @@ def run_moe_kernel_test():
 
         return output.bfloat16()
 
-    print(f"\n  PyTorch baseline (loop over experts, nn.Linear equivalent):")
+    print("\n  PyTorch baseline (loop over experts, nn.Linear equivalent):")
     for T_bench in [256, 512, 1024, 2048, 4096]:
         hidden_bench = torch.randn(T_bench, hidden_size, dtype=torch.bfloat16, device=device) * 0.02
 
         for _ in range(WARMUP):
             pytorch_moe_forward_bench(
-                hidden_bench, router_weight, gate_up_weights, down_weights,
-                top_k, 0, num_local_experts, True,
+                hidden_bench,
+                router_weight,
+                gate_up_weights,
+                down_weights,
+                top_k,
+                0,
+                num_local_experts,
+                True,
             )
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
         for _ in range(ITERS):
             pytorch_moe_forward_bench(
-                hidden_bench, router_weight, gate_up_weights, down_weights,
-                top_k, 0, num_local_experts, True,
+                hidden_bench,
+                router_weight,
+                gate_up_weights,
+                down_weights,
+                top_k,
+                0,
+                num_local_experts,
+                True,
             )
         torch.cuda.synchronize()
         t1 = time.perf_counter()

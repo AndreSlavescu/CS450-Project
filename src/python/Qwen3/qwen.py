@@ -425,9 +425,7 @@ class Qwen3MoELayer(nn.Module):
         # Only instantiate local experts for this EP rank
         self.experts_per_rank = config.num_experts // extra_config.ep_size
         self.local_expert_offset = extra_config.ep_rank * self.experts_per_rank
-        self.experts = nn.ModuleList(
-            [Qwen3MoEExpert(config, layer_idx) for _ in range(self.experts_per_rank)]
-        )
+        self.experts = nn.ModuleList([Qwen3MoEExpert(config, layer_idx) for _ in range(self.experts_per_rank)])
 
         # Packed weight buffers for tcgen05 kernel (built lazily)
         self._gate_up_weights_packed: Tensor | None = None
@@ -439,9 +437,9 @@ class Qwen3MoELayer(nn.Module):
         if cls._moe_kernel is not None:
             return cls._moe_kernel
         import importlib
+
         cls._moe_kernel = importlib.import_module("moe_expert")
-        assert cls._moe_kernel.has_tcgen05(), \
-            "moe_expert module loaded but tcgen05 (SM100) not available"
+        assert cls._moe_kernel.has_tcgen05(), "moe_expert module loaded but tcgen05 (SM100) not available"
         return cls._moe_kernel
 
     def _build_packed_weights(self) -> None:
@@ -457,12 +455,16 @@ class Qwen3MoELayer(nn.Module):
         hidden = self.config.hidden_size
 
         gate_up = torch.empty(
-            self.experts_per_rank, 2 * intermediate, hidden,
+            self.experts_per_rank,
+            2 * intermediate,
+            hidden,
             dtype=torch.bfloat16,
             device=self.experts[0].gate_proj.weight.device,
         )
         down = torch.empty(
-            self.experts_per_rank, hidden, intermediate,
+            self.experts_per_rank,
+            hidden,
+            intermediate,
             dtype=torch.bfloat16,
             device=self.experts[0].down_proj.weight.device,
         )
@@ -537,8 +539,11 @@ class Qwen3MoELayer(nn.Module):
 
             # 6. Scatter-accumulate to original token order
             expert_output = moe.moe_scatter_accumulate(
-                down_out, sorted_token_ids, sorted_weights,
-                num_tokens, hidden_size,
+                down_out,
+                sorted_token_ids,
+                sorted_weights,
+                num_tokens,
+                hidden_size,
             )
 
         # EP all-reduce: combine partial expert outputs across ranks

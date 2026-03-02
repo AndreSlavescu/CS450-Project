@@ -13,17 +13,16 @@
 // This is a tiny GEMM (N=160 output rows) — use warp-per-row pattern.
 // ---------------------------------------------------------------------------
 
-__global__ void moe_router_matmul_kernel(
-    float*                 router_logits,   // [T, num_experts]  output (fp32)
-    const __nv_bfloat16*   hidden_states,   // [T, hidden_size]  input
-    const __nv_bfloat16*   router_weight,   // [num_experts, hidden_size]  weight
-    int                    T,               // number of tokens
-    int                    hidden_size,     // 6144
-    int                    num_experts       // 160
+__device__ void moe_router_matmul_kernel(float* router_logits,               // [T, num_experts]  output (fp32)
+                                         const __nv_bfloat16* hidden_states, // [T, hidden_size]  input
+                                         const __nv_bfloat16* router_weight, // [num_experts, hidden_size]  weight
+                                         int T,                              // number of tokens
+                                         int hidden_size,                    // 6144
+                                         int num_experts                     // 160
 ) {
     // One warp per (token, expert) pair
-    const int lane   = threadIdx.x & 31;
-    const int warp   = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int nwarps = (blockDim.x * gridDim.x) >> 5;
 
     for (int idx = warp; idx < T * num_experts; idx += nwarps) {
@@ -60,12 +59,13 @@ __global__ void moe_router_matmul_kernel(
             acc += f0.x + f0.y + f1.x + f1.y + f2.x + f2.y + f3.x + f3.y;
         }
 
-        // Warp reduction
-        #pragma unroll
+// Warp reduction
+#pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             acc += __shfl_down_sync(0xffffffff, acc, offset);
 
-        if (lane == 0) router_logits[tok * num_experts + exp] = acc;
+        if (lane == 0)
+            router_logits[tok * num_experts + exp] = acc;
     }
 }
 
@@ -75,23 +75,22 @@ __global__ void moe_router_matmul_kernel(
 // One block per token.  Computes softmax in shared memory, then finds top-k.
 // ---------------------------------------------------------------------------
 
-__global__ void moe_softmax_topk_kernel(
-    int*       selected_experts,   // [T, top_k]  output — global expert index
-    float*     routing_weights,    // [T, top_k]  output — normalized weights
-    const float* router_logits,    // [T, num_experts]  input
-    int        T,
-    int        num_experts,        // 160
-    int        top_k,              // 8
-    bool       norm_topk_prob
-) {
+__device__ void moe_softmax_topk_kernel(int* selected_experts,      // [T, top_k]  output — global expert index
+                                        float* routing_weights,     // [T, top_k]  output — normalized weights
+                                        const float* router_logits, // [T, num_experts]  input
+                                        int T,
+                                        int num_experts, // 160
+                                        int top_k,       // 8
+                                        bool norm_topk_prob) {
     extern __shared__ float smem[];
-    float* logits = smem;                      // [num_experts]
-    float* topk_vals = smem + num_experts;     // [top_k]
-    int*   topk_ids  = (int*)(topk_vals + top_k); // [top_k]
+    float* logits = smem;                                      // [num_experts]
+    float* topk_vals = smem + num_experts;                     // [top_k]
+    int* topk_ids = reinterpret_cast<int*>(topk_vals + top_k); // [top_k]
 
     int tid = threadIdx.x;
     int tok = blockIdx.x;
-    if (tok >= T) return;
+    if (tok >= T)
+        return;
 
     const float* src = router_logits + tok * num_experts;
 
@@ -106,7 +105,8 @@ __global__ void moe_softmax_topk_kernel(
     __shared__ float shared_max;
     for (int offset = 16; offset > 0; offset >>= 1)
         local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
-    if (tid == 0) shared_max = local_max;
+    if (tid == 0)
+        shared_max = local_max;
     __syncthreads();
     float max_val = shared_max;
 
@@ -120,7 +120,8 @@ __global__ void moe_softmax_topk_kernel(
     __shared__ float shared_sum;
     for (int offset = 16; offset > 0; offset >>= 1)
         local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
-    if (tid == 0) shared_sum = local_sum;
+    if (tid == 0)
+        shared_sum = local_sum;
     __syncthreads();
     float sum_val = shared_sum;
 
@@ -133,7 +134,7 @@ __global__ void moe_softmax_topk_kernel(
     if (tid == 0) {
         for (int k = 0; k < top_k; k++) {
             float best_val = -1.0f;
-            int   best_idx = -1;
+            int best_idx = -1;
             for (int i = 0; i < num_experts; i++) {
                 if (logits[i] > best_val) {
                     best_val = logits[i];
@@ -141,21 +142,23 @@ __global__ void moe_softmax_topk_kernel(
                 }
             }
             topk_vals[k] = best_val;
-            topk_ids[k]  = best_idx;
+            topk_ids[k] = best_idx;
             logits[best_idx] = -1.0f; // mask out selected
         }
 
         // Normalize top-k weights if requested
         if (norm_topk_prob) {
             float wsum = 0.0f;
-            for (int k = 0; k < top_k; k++) wsum += topk_vals[k];
-            for (int k = 0; k < top_k; k++) topk_vals[k] /= wsum;
+            for (int k = 0; k < top_k; k++)
+                wsum += topk_vals[k];
+            for (int k = 0; k < top_k; k++)
+                topk_vals[k] /= wsum;
         }
 
         // Write outputs
         for (int k = 0; k < top_k; k++) {
             selected_experts[tok * top_k + k] = topk_ids[k];
-            routing_weights[tok * top_k + k]  = topk_vals[k];
+            routing_weights[tok * top_k + k] = topk_vals[k];
         }
     }
 }
@@ -171,22 +174,20 @@ __global__ void moe_softmax_topk_kernel(
 // Sort by local_expert_idx so that all tokens for expert 0 come first, then 1, etc.
 // ---------------------------------------------------------------------------
 
-__global__ void moe_build_assignment_kernel(
+__device__ void moe_build_assignment_kernel(
     // Outputs (per-assignment)
-    int*   assignment_token_ids,  // [max_assignments]
-    int*   assignment_expert_ids, // [max_assignments]  (local expert index)
-    float* assignment_weights,    // [max_assignments]
-    int*   num_assignments_out,   // [1] — atomic counter
+    int* assignment_token_ids,  // [max_assignments]
+    int* assignment_expert_ids, // [max_assignments]  (local expert index)
+    float* assignment_weights,  // [max_assignments]
+    int* num_assignments_out,   // [1] — atomic counter
     // Inputs
-    const int*   selected_experts,  // [T, top_k]  (global expert indices)
-    const float* routing_weights,   // [T, top_k]
-    int T, int top_k,
-    int local_expert_offset,
-    int num_local_experts
-) {
+    const int* selected_experts,  // [T, top_k]  (global expert indices)
+    const float* routing_weights, // [T, top_k]
+    int T, int top_k, int local_expert_offset, int num_local_experts) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = T * top_k;
-    if (tid >= total) return;
+    if (tid >= total)
+        return;
 
     int tok = tid / top_k;
     int sel = tid % top_k;
@@ -196,9 +197,9 @@ __global__ void moe_build_assignment_kernel(
     int local_idx = global_expert - local_expert_offset;
     if (local_idx >= 0 && local_idx < num_local_experts) {
         int slot = atomicAdd(num_assignments_out, 1);
-        assignment_token_ids[slot]  = tok;
+        assignment_token_ids[slot] = tok;
         assignment_expert_ids[slot] = local_idx;
-        assignment_weights[slot]    = routing_weights[tok * top_k + sel];
+        assignment_weights[slot] = routing_weights[tok * top_k + sel];
     }
 }
 
@@ -210,34 +211,31 @@ __global__ void moe_build_assignment_kernel(
 // ---------------------------------------------------------------------------
 
 // Phase 1: Count tokens per expert
-__global__ void moe_histogram_kernel(
-    int*       expert_counts,            // [num_local_experts] — output
-    const int* assignment_expert_ids,    // [num_assignments]
-    int        num_assignments
-) {
+__device__ void moe_histogram_kernel(int* expert_counts,               // [num_local_experts] — output
+                                     const int* assignment_expert_ids, // [num_assignments]
+                                     int num_assignments) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_assignments) return;
+    if (tid >= num_assignments)
+        return;
     atomicAdd(&expert_counts[assignment_expert_ids[tid]], 1);
 }
 
 // Phase 2: Scatter assignments into sorted order using prefix-sum offsets
-__global__ void moe_scatter_kernel(
-    int*       sorted_token_ids,         // output [num_assignments]
-    float*     sorted_weights,           // output [num_assignments]
-    int*       scatter_counters,         // [num_local_experts] — atomic per-expert slot
-    const int* expert_offsets,           // [num_local_experts + 1] — prefix sum
-    const int* assignment_token_ids,     // input
-    const int* assignment_expert_ids,
-    const float* assignment_weights,
-    int        num_assignments
-) {
+__device__ void moe_scatter_kernel(int* sorted_token_ids,           // output [num_assignments]
+                                   float* sorted_weights,           // output [num_assignments]
+                                   int* scatter_counters,           // [num_local_experts] — atomic per-expert slot
+                                   const int* expert_offsets,       // [num_local_experts + 1] — prefix sum
+                                   const int* assignment_token_ids, // input
+                                   const int* assignment_expert_ids, const float* assignment_weights,
+                                   int num_assignments) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_assignments) return;
+    if (tid >= num_assignments)
+        return;
 
     int expert = assignment_expert_ids[tid];
     int slot = expert_offsets[expert] + atomicAdd(&scatter_counters[expert], 1);
     sorted_token_ids[slot] = assignment_token_ids[tid];
-    sorted_weights[slot]   = assignment_weights[tid];
+    sorted_weights[slot] = assignment_weights[tid];
 }
 
 // ---------------------------------------------------------------------------
@@ -245,23 +243,20 @@ __global__ void moe_scatter_kernel(
 //   sorted_hidden[i] = hidden_states[sorted_token_ids[i]]
 // ---------------------------------------------------------------------------
 
-__global__ void moe_gather_tokens_kernel(
-    __nv_bfloat16*       sorted_hidden,   // [total_assignments, hidden_size]
-    const __nv_bfloat16* hidden_states,   // [T, hidden_size]
-    const int*           sorted_token_ids,// [total_assignments]
-    int                  total_assignments,
-    int                  hidden_size
-) {
+__device__ void moe_gather_tokens_kernel(__nv_bfloat16* sorted_hidden,       // [total_assignments, hidden_size]
+                                         const __nv_bfloat16* hidden_states, // [T, hidden_size]
+                                         const int* sorted_token_ids,        // [total_assignments]
+                                         int total_assignments, int hidden_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elems = total_assignments * hidden_size;
-    if (idx >= total_elems) return;
+    if (idx >= total_elems)
+        return;
 
     int assignment = idx / hidden_size;
-    int col        = idx % hidden_size;
-    int src_tok    = sorted_token_ids[assignment];
+    int col = idx % hidden_size;
+    int src_tok = sorted_token_ids[assignment];
 
-    sorted_hidden[assignment * hidden_size + col] =
-        hidden_states[src_tok * hidden_size + col];
+    sorted_hidden[assignment * hidden_size + col] = hidden_states[src_tok * hidden_size + col];
 }
 
 // ---------------------------------------------------------------------------
@@ -274,21 +269,21 @@ __global__ void moe_gather_tokens_kernel(
 //   columns [intermediate_size, 2*intermediate_size) = up output
 // ---------------------------------------------------------------------------
 
-__global__ void moe_silu_fusion_kernel(
-    __nv_bfloat16*       intermediate,   // [total_assignments, intermediate_size]
-    const __nv_bfloat16* gate_up_out,    // [total_assignments, 2 * intermediate_size]
-    int                  total_assignments,
-    int                  intermediate_size  // 2560
+__device__ void moe_silu_fusion_kernel(__nv_bfloat16* intermediate,      // [total_assignments, intermediate_size]
+                                       const __nv_bfloat16* gate_up_out, // [total_assignments, 2 * intermediate_size]
+                                       int total_assignments,
+                                       int intermediate_size // 2560
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elems = total_assignments * intermediate_size;
-    if (idx >= total_elems) return;
+    if (idx >= total_elems)
+        return;
 
     int row = idx / intermediate_size;
     int col = idx % intermediate_size;
 
     float gate_val = __bfloat162float(gate_up_out[row * 2 * intermediate_size + col]);
-    float up_val   = __bfloat162float(gate_up_out[row * 2 * intermediate_size + intermediate_size + col]);
+    float up_val = __bfloat162float(gate_up_out[row * 2 * intermediate_size + intermediate_size + col]);
 
     // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
     float silu = gate_val / (1.0f + expf(-gate_val));
@@ -304,22 +299,20 @@ __global__ void moe_silu_fusion_kernel(
 // Uses BF16 atomic add (SM100 native).
 // ---------------------------------------------------------------------------
 
-__global__ void moe_scatter_accumulate_kernel(
-    float*               output,            // [T, hidden_size] — FP32 accumulated output
-    const __nv_bfloat16* down_out,          // [total_assignments, hidden_size]
-    const int*           sorted_token_ids,  // [total_assignments]
-    const float*         sorted_weights,    // [total_assignments]
-    int                  total_assignments,
-    int                  hidden_size
-) {
+__device__ void moe_scatter_accumulate_kernel(float* output, // [T, hidden_size] — FP32 accumulated output
+                                              const __nv_bfloat16* down_out, // [total_assignments, hidden_size]
+                                              const int* sorted_token_ids,   // [total_assignments]
+                                              const float* sorted_weights,   // [total_assignments]
+                                              int total_assignments, int hidden_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elems = total_assignments * hidden_size;
-    if (idx >= total_elems) return;
+    if (idx >= total_elems)
+        return;
 
     int assignment = idx / hidden_size;
-    int col        = idx % hidden_size;
-    int src_tok    = sorted_token_ids[assignment];
-    float weight   = sorted_weights[assignment];
+    int col = idx % hidden_size;
+    int src_tok = sorted_token_ids[assignment];
+    float weight = sorted_weights[assignment];
 
     float val = __bfloat162float(down_out[assignment * hidden_size + col]);
     float weighted = val * weight;
@@ -332,7 +325,65 @@ __global__ void moe_scatter_accumulate_kernel(
 // Zero-initialize a float buffer
 // ---------------------------------------------------------------------------
 
-__global__ void moe_zero_kernel(float* buf, int n) {
+__device__ void moe_zero_kernel(float* buf, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) buf[idx] = 0.0f;
+    if (idx < n)
+        buf[idx] = 0.0f;
+}
+
+// ---------------------------------------------------------------------------
+// __global__ wrappers for standalone kernel launches
+// (Thin shims — the megakernel calls the __device__ functions directly)
+// ---------------------------------------------------------------------------
+
+__global__ void moe_router_matmul_kernel_launch(float* router_logits, const __nv_bfloat16* hidden_states,
+                                                const __nv_bfloat16* router_weight, int T, int hidden_size,
+                                                int num_experts) {
+    moe_router_matmul_kernel(router_logits, hidden_states, router_weight, T, hidden_size, num_experts);
+}
+
+__global__ void moe_softmax_topk_kernel_launch(int* selected_experts, float* routing_weights,
+                                               const float* router_logits, int T, int num_experts, int top_k,
+                                               bool norm_topk_prob) {
+    moe_softmax_topk_kernel(selected_experts, routing_weights, router_logits, T, num_experts, top_k, norm_topk_prob);
+}
+
+__global__ void moe_build_assignment_kernel_launch(int* assignment_token_ids, int* assignment_expert_ids,
+                                                   float* assignment_weights, int* num_assignments_out,
+                                                   const int* selected_experts, const float* routing_weights, int T,
+                                                   int top_k, int local_expert_offset, int num_local_experts) {
+    moe_build_assignment_kernel(assignment_token_ids, assignment_expert_ids, assignment_weights, num_assignments_out,
+                                selected_experts, routing_weights, T, top_k, local_expert_offset, num_local_experts);
+}
+
+__global__ void moe_histogram_kernel_launch(int* expert_counts, const int* assignment_expert_ids, int num_assignments) {
+    moe_histogram_kernel(expert_counts, assignment_expert_ids, num_assignments);
+}
+
+__global__ void moe_scatter_kernel_launch(int* sorted_token_ids, float* sorted_weights, int* scatter_counters,
+                                          const int* expert_offsets, const int* assignment_token_ids,
+                                          const int* assignment_expert_ids, const float* assignment_weights,
+                                          int num_assignments) {
+    moe_scatter_kernel(sorted_token_ids, sorted_weights, scatter_counters, expert_offsets, assignment_token_ids,
+                       assignment_expert_ids, assignment_weights, num_assignments);
+}
+
+__global__ void moe_gather_tokens_kernel_launch(__nv_bfloat16* sorted_hidden, const __nv_bfloat16* hidden_states,
+                                                const int* sorted_token_ids, int total_assignments, int hidden_size) {
+    moe_gather_tokens_kernel(sorted_hidden, hidden_states, sorted_token_ids, total_assignments, hidden_size);
+}
+
+__global__ void moe_silu_fusion_kernel_launch(__nv_bfloat16* intermediate, const __nv_bfloat16* gate_up_out,
+                                              int total_assignments, int intermediate_size) {
+    moe_silu_fusion_kernel(intermediate, gate_up_out, total_assignments, intermediate_size);
+}
+
+__global__ void moe_scatter_accumulate_kernel_launch(float* output, const __nv_bfloat16* down_out,
+                                                     const int* sorted_token_ids, const float* sorted_weights,
+                                                     int total_assignments, int hidden_size) {
+    moe_scatter_accumulate_kernel(output, down_out, sorted_token_ids, sorted_weights, total_assignments, hidden_size);
+}
+
+__global__ void moe_zero_kernel_launch(float* buf, int n) {
+    moe_zero_kernel(buf, n);
 }

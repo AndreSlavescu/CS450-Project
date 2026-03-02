@@ -99,19 +99,36 @@ def _worker(rank: int, world_size: int, results_dict: dict):
         import subprocess
 
         torch_incs = subprocess.check_output(
-            ["python3", "-c", "from torch.utils.cpp_extension import include_paths; print(' '.join('-I' + p for p in include_paths()))"],
+            [
+                "python3",
+                "-c",
+                "from torch.utils.cpp_extension import include_paths; "
+                "print(' '.join('-I' + p for p in include_paths()))",
+            ],
             text=True,
         ).strip()
         torch_libs = subprocess.check_output(
-            ["python3", "-c", "from torch.utils.cpp_extension import library_paths; print(' '.join('-L' + p for p in library_paths()))"],
+            [
+                "python3",
+                "-c",
+                "from torch.utils.cpp_extension import library_paths; "
+                "print(' '.join('-L' + p for p in library_paths()))",
+            ],
             text=True,
         ).strip()
         extra_flags = f"{torch_incs} {torch_libs} -ltorch -ltorch_cpu -lc10 -ltorch_python"
 
         print("Building tcgen05 MoE kernel...", flush=True)
         result = subprocess.run(
-            ["make", "-C", "/workspace/src/csrc/kernels", f"EXTRA_NVCCFLAGS={extra_flags}", "moe_expert.cpython-312-x86_64-linux-gnu.so"],
-            capture_output=True, text=True,
+            [
+                "make",
+                "-C",
+                "/workspace/src/csrc/kernels",
+                f"EXTRA_NVCCFLAGS={extra_flags}",
+                "moe_expert.cpython-312-x86_64-linux-gnu.so",
+            ],
+            capture_output=True,
+            text=True,
         )
         if result.returncode == 0:
             print("  MoE kernel built successfully", flush=True)
@@ -217,7 +234,7 @@ def _worker(rank: int, world_size: int, results_dict: dict):
     # ── TTFT benchmark ──
     if rank == 0:
         print(f"\n{'─'*60}")
-        print(f"TTFT benchmark (prefill)")
+        print("TTFT benchmark (prefill)")
         print(f"{'─'*60}")
 
     ids = tokenizer.encode(PROMPT, add_special_tokens=True)
@@ -318,7 +335,7 @@ def _worker(rank: int, world_size: int, results_dict: dict):
 
         mem_gb = torch.cuda.max_memory_allocated(rank) / 1e9
         print(f"\n{'='*60}")
-        print(f"Summary: Qwen3-Coder-480B  8×B200  TP=8 EP=8")
+        print("Summary: Qwen3-Coder-480B  8×B200  TP=8 EP=8")
         print(f"  Model load: {t_load:.1f}s")
         print(f"  Peak GPU memory: {mem_gb:.1f} GB / 192 GB")
         print(f"  Prefill ({len(ids)} tok): {median_ttft:.1f} ms ({tps:.0f} tok/s)")

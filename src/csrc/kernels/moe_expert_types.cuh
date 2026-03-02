@@ -8,9 +8,9 @@
 // Tile constants (shared between task scheduler and GEMM kernels)
 // ---------------------------------------------------------------------------
 
-static constexpr int MOE_TILE_M = 128;  // rows per output tile
-static constexpr int MOE_TILE_N = 256;  // cols per output tile
-static constexpr int MOE_TILE_K = 64;   // reduction dimension per iteration
+static constexpr int MOE_TILE_M = 128; // rows per output tile
+static constexpr int MOE_TILE_N = 256; // cols per output tile
+static constexpr int MOE_TILE_K = 64;  // reduction dimension per iteration
 
 // Maximum local experts (size of offset arrays)
 static constexpr int MOE_MAX_LOCAL_EXPERTS = 32;
@@ -32,12 +32,12 @@ struct MoEConfig {
 };
 
 constexpr MoEConfig QWEN3_480B_MOE = {
-    .hidden_size           = 6144,
+    .hidden_size = 6144,
     .moe_intermediate_size = 2560,
-    .num_experts           = 160,
-    .num_local_experts     = 20,
-    .top_k                 = 8,
-    .local_expert_offset   = 0,   // set at runtime per rank
+    .num_experts = 160,
+    .num_local_experts = 20,
+    .top_k = 8,
+    .local_expert_offset = 0, // set at runtime per rank
 };
 
 // ---------------------------------------------------------------------------
@@ -50,14 +50,15 @@ constexpr MoEConfig QWEN3_480B_MOE = {
 struct MoETaskScheduler {
     // Host-populated arrays (copied to device constant / global memory)
     int expert_offsets[MOE_MAX_LOCAL_EXPERTS + 1];      // prefix sum of token counts
-    int expert_tile_offsets[MOE_MAX_LOCAL_EXPERTS + 1];  // prefix sum of tile counts
-    int total_tasks;              // sum of all expert tiles
-    int n_tiles;                  // output N / MOE_TILE_N
-    int num_local_experts;        // actual number of local experts
+    int expert_tile_offsets[MOE_MAX_LOCAL_EXPERTS + 1]; // prefix sum of tile counts
+    int total_tasks;                                    // sum of all expert tiles
+    int n_tiles;                                        // output N / MOE_TILE_N
+    int num_local_experts;                              // actual number of local experts
 
     // Decode a flat task_id into (expert, m_tile, n_tile)
     __device__ int3 get_task(int task_id) const {
-        if (task_id >= total_tasks) return make_int3(-1, -1, -1);
+        if (task_id >= total_tasks)
+            return make_int3(-1, -1, -1);
 
         // Binary search for expert using actual num_local_experts
         int lo = 0, hi = num_local_experts;
@@ -83,8 +84,8 @@ struct MoETaskScheduler {
 // ---------------------------------------------------------------------------
 
 struct MoERouterOutput {
-    int*   sorted_token_ids;       // [total_assignments] — original token index
-    int*   expert_offsets;         // [num_local_experts + 1] — prefix sum
+    int* sorted_token_ids;         // [total_assignments] — original token index
+    int* expert_offsets;           // [num_local_experts + 1] — prefix sum
     float* routing_weights_sorted; // [total_assignments] — normalized gate weight
-    int    total_assignments;      // sum of tokens assigned to local experts
+    int total_assignments;         // sum of tokens assigned to local experts
 };

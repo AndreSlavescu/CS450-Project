@@ -57,11 +57,11 @@ std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor
         profile_buf.allocate(num_blocks);
 
         fmha_forward_profile(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
-                            reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()),
-                            reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
-                            reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()), num_q_heads, num_kv_heads, seq_q,
-                            seq_kv, static_cast<float>(scale), causal, static_cast<int>(q_offset),
-                            static_cast<int>(kv_offset), stream, profile_buf.d_events, profile_buf.d_counts);
+                             reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()),
+                             reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
+                             reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()), num_q_heads, num_kv_heads, seq_q,
+                             seq_kv, static_cast<float>(scale), causal, static_cast<int>(q_offset),
+                             static_cast<int>(kv_offset), stream, profile_buf.d_events, profile_buf.d_counts);
 
         cudaError_t sync_err = cudaStreamSynchronize(stream);
         TORCH_CHECK(sync_err == cudaSuccess, "cudaStreamSynchronize failed: ", cudaGetErrorString(sync_err));
@@ -71,11 +71,11 @@ std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor
         profile_buf.export_perfetto_json(trace_path.c_str(), &names, true);
         profile_buf.free();
     } else {
-        fmha_forward(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
-                    reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()),
-                    reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
-                    reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()), num_q_heads, num_kv_heads, seq_q, seq_kv,
-                    static_cast<float>(scale), causal, static_cast<int>(q_offset), static_cast<int>(kv_offset), stream);
+        fmha_forward(
+            reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
+            reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()), num_q_heads, num_kv_heads, seq_q, seq_kv,
+            static_cast<float>(scale), causal, static_cast<int>(q_offset), static_cast<int>(kv_offset), stream);
     }
 
     if (return_lse) {

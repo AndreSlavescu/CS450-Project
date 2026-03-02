@@ -38,18 +38,15 @@
 // Pipeline ring buffer helpers (inlined from ThunderKittens prototype/lcf)
 // ═══════════════════════════════════════════════════════════════════════════
 
-template<int N>
-__device__ static inline int moe_ring_advance(int ring, int distance = 1) {
+template <int N> __device__ static inline int moe_ring_advance(int ring, int distance = 1) {
     return (ring + distance) % N;
 }
 
-template<int half>
-__device__ static inline bool moe_get_phasebit(uint32_t bitfield, int ring_id) {
+template <int half> __device__ static inline bool moe_get_phasebit(uint32_t bitfield, int ring_id) {
     return (bitfield & (1 << (half * 16 + ring_id))) != 0;
 }
 
-template<int half>
-__device__ static inline void moe_update_phasebit(uint32_t &bitfield, int ring_id) {
+template <int half> __device__ static inline void moe_update_phasebit(uint32_t& bitfield, int ring_id) {
     bitfield ^= (1 << (half * 16 + ring_id));
 }
 
@@ -59,28 +56,28 @@ using namespace kittens;
 // Tile and Thread Configuration
 // ═══════════════════════════════════════════════════════════════════════════
 
-static constexpr int MOE_Mb = MOE_TILE_M;  // 128 rows per consumer tile
-static constexpr int MOE_Nb = MOE_TILE_N;  // 256 cols per output tile
-static constexpr int MOE_Kb = MOE_TILE_K;  // 64  reduction per TMA load
+static constexpr int MOE_Mb = MOE_TILE_M; // 128 rows per consumer tile
+static constexpr int MOE_Nb = MOE_TILE_N; // 256 cols per output tile
+static constexpr int MOE_Kb = MOE_TILE_K; // 64  reduction per TMA load
 
 // CLUSTER_M: rows processed per task = 4 × Mb = 512
 //   2 CTAs × 2 consumers × 128 rows = 512
-static constexpr int MOE_CLUSTER_M = 4 * MOE_Mb;   // 512
-static constexpr int MOE_CLUSTER_N = MOE_Nb;         // 256
+static constexpr int MOE_CLUSTER_M = 4 * MOE_Mb; // 512
+static constexpr int MOE_CLUSTER_N = MOE_Nb;     // 256
 
-static constexpr int MOE_NUM_CONSUMERS = 2;   // consumer warpgroups per CTA
-static constexpr int MOE_NUM_PRODUCERS = 1;   // producer warpgroup
-static constexpr int MOE_NUM_WORKERS   = (MOE_NUM_CONSUMERS + MOE_NUM_PRODUCERS) * 4;
-static constexpr int MOE_NUM_THREADS   = MOE_NUM_WORKERS * kittens::WARP_THREADS;
-static constexpr int MOE_PIPE_DEPTH    = 4;   // TMA pipeline ring buffer depth
+static constexpr int MOE_NUM_CONSUMERS = 2; // consumer warpgroups per CTA
+static constexpr int MOE_NUM_PRODUCERS = 1; // producer warpgroup
+static constexpr int MOE_NUM_WORKERS = (MOE_NUM_CONSUMERS + MOE_NUM_PRODUCERS) * 4;
+static constexpr int MOE_NUM_THREADS = MOE_NUM_WORKERS * kittens::WARP_THREADS;
+static constexpr int MOE_PIPE_DEPTH = 4; // TMA pipeline ring buffer depth
 
 // ═══════════════════════════════════════════════════════════════════════════
 // tcgen05 Constants
 // ═══════════════════════════════════════════════════════════════════════════
 
 // BF16 reduction dimension: tcgen05 MMA processes 16 BF16 elements per chunk
-static constexpr int MOE_BF16_RED_DIM  = 16;
-static constexpr int MOE_INNER_K_ITERS = MOE_Kb / MOE_BF16_RED_DIM;  // 64/16 = 4
+static constexpr int MOE_BF16_RED_DIM = 16;
+static constexpr int MOE_INNER_K_ITERS = MOE_Kb / MOE_BF16_RED_DIM; // 64/16 = 4
 
 // ═══════════════════════════════════════════════════════════════════════════
 // tcgen05 MMA Instruction Descriptor Builder
@@ -104,19 +101,15 @@ static constexpr int MOE_INNER_K_ITERS = MOE_Kb / MOE_BF16_RED_DIM;  // 64/16 = 
 //   [31:30] = B-matrix shift (00 = none)
 // ═══════════════════════════════════════════════════════════════════════════
 
-__host__ __device__ constexpr uint32_t moe_build_mma_idesc(
-    int M, int N,
-    bool trans_a = false,
-    bool trans_b = false
-) {
+__host__ __device__ constexpr uint32_t moe_build_mma_idesc(int M, int N, bool trans_a = false, bool trans_b = false) {
     uint32_t desc = 0;
-    desc |= (0b01u)  << 4;                       // D accumulator = FP32
-    desc |= (0b001u) << 7;                       // A input = BF16
-    desc |= (0b001u) << 10;                      // B input = BF16
-    desc |= (trans_a ? 1u : 0u) << 15;           // transpose A
-    desc |= (trans_b ? 1u : 0u) << 16;           // transpose B
-    desc |= ((uint32_t)(N >> 3)) << 17;          // N dimension encoding
-    desc |= ((uint32_t)(M >> 4)) << 24;          // M dimension encoding
+    desc |= (0b01u) << 4;                          // D accumulator = FP32
+    desc |= (0b001u) << 7;                         // A input = BF16
+    desc |= (0b001u) << 10;                        // B input = BF16
+    desc |= (trans_a ? 1u : 0u) << 15;             // transpose A
+    desc |= (trans_b ? 1u : 0u) << 16;             // transpose B
+    desc |= (static_cast<uint32_t>(N >> 3)) << 17; // N dimension encoding
+    desc |= (static_cast<uint32_t>(M >> 4)) << 24; // M dimension encoding
     return desc;
 }
 
@@ -125,9 +118,8 @@ __host__ __device__ constexpr uint32_t moe_build_mma_idesc(
 //   M = 128 × 2 CTAs = 256 (cta_group::2)
 //   N = 256
 //   No transposes (B pre-transposed in memory layout)
-static constexpr uint32_t MOE_MMA_IDESC = moe_build_mma_idesc(
-    MOE_Mb * 2,  // M = 256 across 2-CTA cluster
-    MOE_Nb       // N = 256
+static constexpr uint32_t MOE_MMA_IDESC = moe_build_mma_idesc(MOE_Mb * 2, // M = 256 across 2-CTA cluster
+                                                              MOE_Nb      // N = 256
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -152,39 +144,33 @@ __device__ __forceinline__ void moe_tcgen05_fence_after_sync() {
 // Template parameter:
 //   acc=false: D = A × B   (reset accumulator — first K-chunk)
 //   acc=true:  D += A × B  (accumulate — subsequent K-chunks)
-template<bool acc>
-__device__ __forceinline__ void moe_tcgen05_mma(
-    uint32_t d_addr,      // destination address in tensor memory
-    uint64_t a_desc,      // A operand: 64-bit shared memory descriptor
-    uint64_t b_desc,      // B operand: 64-bit shared memory descriptor
-    uint32_t idesc        // instruction descriptor (data types, dimensions, transposes)
+template <bool acc>
+__device__ __forceinline__ void
+moe_tcgen05_mma(uint32_t d_addr, // destination address in tensor memory
+                uint64_t a_desc, // A operand: 64-bit shared memory descriptor
+                uint64_t b_desc, // B operand: 64-bit shared memory descriptor
+                uint32_t idesc   // instruction descriptor (data types, dimensions, transposes)
 ) {
     if constexpr (acc) {
-        asm volatile(
-            "{.reg .pred p;\n"
-            " setp.eq.u32 p, 1, 1;\n"
-            " tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;}\n"
-            :: "r"(d_addr), "l"(a_desc), "l"(b_desc), "r"(idesc)
-        );
+        asm volatile("{.reg .pred p;\n"
+                     " setp.eq.u32 p, 1, 1;\n"
+                     " tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;}\n" ::"r"(d_addr),
+                     "l"(a_desc), "l"(b_desc), "r"(idesc));
     } else {
-        asm volatile(
-            "{.reg .pred p;\n"
-            " setp.eq.u32 p, 1, 0;\n"
-            " tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;}\n"
-            :: "r"(d_addr), "l"(a_desc), "l"(b_desc), "r"(idesc)
-        );
+        asm volatile("{.reg .pred p;\n"
+                     " setp.eq.u32 p, 1, 0;\n"
+                     " tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;}\n" ::"r"(d_addr),
+                     "l"(a_desc), "l"(b_desc), "r"(idesc));
     }
 }
 
 // ── tcgen05.commit ──
 // Signals an mbarrier after a batch of MMA instructions completes.
 // Multicasts the arrival to both CTAs in the 2-CTA cluster.
-__device__ __forceinline__ void moe_tcgen05_commit(kittens::semaphore &sem) {
-    asm volatile(
-        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], %1;\n"
-        :: "l"(&sem), "h"((uint16_t)(0b11))
-    );
+__device__ __forceinline__ void moe_tcgen05_commit(kittens::semaphore& sem) {
+    asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one"
+                 ".shared::cluster.multicast::cluster.b64 [%0], %1;\n" ::"l"(&sem),
+                 "h"((uint16_t)(0b11)));
 }
 
 // ── tcgen05.wait ──
@@ -214,18 +200,18 @@ __device__ __forceinline__ void moe_tcgen05_wait_st() {
 
 struct moe_gemm_globals {
     using a_tile = st_bf<MOE_Mb, MOE_Kb>;
-    using b_tile = st_bf<MOE_Nb / 2, MOE_Kb>;  // half-tile per CTA in cluster
+    using b_tile = st_bf<MOE_Nb / 2, MOE_Kb>; // half-tile per CTA in cluster
     using d_tile = st_bf<MOE_Mb, 64>;
 
     using a_gl = gl<bf16, 1, 1, -1, -1, a_tile>;
-    using b_gl = gl<bf16, 1, 1, -1, -1, b_tile>;  // 2D: [total_N_rows, K_dim]
+    using b_gl = gl<bf16, 1, 1, -1, -1, b_tile>; // 2D: [total_N_rows, K_dim]
     using d_gl = gl<bf16, 1, 1, -1, -1, d_tile>;
 
-    a_gl a;    // activations: [1, 1, padded_total, K_dim]
-    b_gl b;    // weights:     [1, 1, num_experts * N_dim, K_dim]  (flattened)
-    d_gl d;    // output:      [1, 1, padded_total, N_dim]
+    a_gl a; // activations: [1, 1, padded_total, K_dim]
+    b_gl b; // weights:     [1, 1, num_experts * N_dim, K_dim]  (flattened)
+    d_gl d; // output:      [1, 1, padded_total, N_dim]
 
-    int b_n_tile_stride;  // N_dim / b_tile_rows = tiles per expert in N dimension
+    int b_n_tile_stride; // N_dim / b_tile_rows = tiles per expert in N dimension
     const MoETaskScheduler* scheduler;
 };
 
@@ -252,11 +238,9 @@ struct moe_gemm_globals {
 // Expert tiles are flattened into a linear task queue.
 // ═══════════════════════════════════════════════════════════════════════════
 
-__global__ __cluster_dims__(2) __launch_bounds__(MOE_NUM_THREADS, 1)
-void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
-
+__device__ void moe_gemm_kernel(const moe_gemm_globals& g) {
     extern __shared__ int __shm[];
-    tma_swizzle_allocator al((int*)&__shm[0]);
+    tma_swizzle_allocator al(&__shm[0]);
     int warpid = kittens::warpid(), warpgroupid = warpgroup::groupid();
 
     const int k_dim = g.a.cols();
@@ -267,9 +251,9 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
     using d_tile = moe_gemm_globals::d_tile;
 
     // ── Allocate shared memory tiles for TMA pipeline ──
-    a_tile (&a_smem)[MOE_PIPE_DEPTH][MOE_NUM_CONSUMERS] = al.allocate<a_tile, MOE_PIPE_DEPTH, MOE_NUM_CONSUMERS>();
-    b_tile (&b_smem)[MOE_PIPE_DEPTH]                    = al.allocate<b_tile, MOE_PIPE_DEPTH>();
-    d_tile (&d_smem)                                    = al.allocate<d_tile>();
+    a_tile(&a_smem)[MOE_PIPE_DEPTH][MOE_NUM_CONSUMERS] = al.allocate<a_tile, MOE_PIPE_DEPTH, MOE_NUM_CONSUMERS>();
+    b_tile(&b_smem)[MOE_PIPE_DEPTH] = al.allocate<b_tile, MOE_PIPE_DEPTH>();
+    d_tile(&d_smem) = al.allocate<d_tile>();
 
     // ═══════════════════════════════════════════════════════════════════
     // Tensor memory allocation via tensor_allocator
@@ -281,10 +265,8 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
 
     // ── Semaphores for producer-consumer synchronization ──
     // Bitfield tracks phase bits: upper 16 = _finished (start=1), lower 16 = _arrived (start=0)
-    __shared__ kittens::semaphore inputs_arrived[MOE_PIPE_DEPTH],
-                                  inputs_finished[MOE_PIPE_DEPTH],
-                                  outputs_arrived,
-                                  outputs_finished[MOE_NUM_CONSUMERS];
+    __shared__ kittens::semaphore inputs_arrived[MOE_PIPE_DEPTH], inputs_finished[MOE_PIPE_DEPTH], outputs_arrived,
+        outputs_finished[MOE_NUM_CONSUMERS];
     uint32_t bitfield = 0xFFFF0000;
 
     if (threadIdx.x == 0) {
@@ -317,11 +299,11 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
                 if (task_id >= sched->total_tasks) {
                     // Drain pipeline
                     for (int idx = 0; idx < MOE_PIPE_DEPTH; idx++) {
-                        tma::cluster::wait(inputs_finished[input_ring],
-                                           moe_get_phasebit<1>(bitfield, input_ring));
+                        tma::cluster::wait(inputs_finished[input_ring], moe_get_phasebit<1>(bitfield, input_ring));
                         input_ring = moe_ring_advance<MOE_PIPE_DEPTH>(input_ring);
                     }
-                    if (laneid() == 0) arrive(outputs_arrived);
+                    if (laneid() == 0)
+                        arrive(outputs_arrived);
                     break;
                 }
 
@@ -341,38 +323,28 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
                 int b_col = 2 * n_tile + ctarank;
 
                 for (int idx = 0; idx < iters_per_task; idx++) {
-                    tma::cluster::wait(inputs_finished[input_ring],
-                                       moe_get_phasebit<1>(bitfield, input_ring));
+                    tma::cluster::wait(inputs_finished[input_ring], moe_get_phasebit<1>(bitfield, input_ring));
                     moe_update_phasebit<1>(bitfield, input_ring);
 
                     if (task_iter > 0 && idx == MOE_PIPE_DEPTH - 1 && laneid() == 0)
                         arrive(outputs_arrived);
 
-                    tma::cluster::expect(inputs_arrived[input_ring], 0,
-                                         a_smem[0][0], a_smem[0][1], b_smem[0]);
+                    tma::cluster::expect(inputs_arrived[input_ring], 0, a_smem[0][0], a_smem[0][1], b_smem[0]);
 
                     // TMA loads: A tiles for each consumer, B tile for this CTA
-                    tma::cluster::load_async(a_smem[input_ring][0], g.a,
-                                             {a_tile_base + 0, idx},
-                                             inputs_arrived[input_ring],
-                                             (uint16_t)(1 << ctarank), 0);
-                    tma::cluster::load_async(a_smem[input_ring][1], g.a,
-                                             {a_tile_base + 1, idx},
-                                             inputs_arrived[input_ring],
-                                             (uint16_t)(1 << ctarank), 0);
+                    tma::cluster::load_async(a_smem[input_ring][0], g.a, {a_tile_base + 0, idx},
+                                             inputs_arrived[input_ring], static_cast<uint16_t>(1 << ctarank), 0);
+                    tma::cluster::load_async(a_smem[input_ring][1], g.a, {a_tile_base + 1, idx},
+                                             inputs_arrived[input_ring], static_cast<uint16_t>(1 << ctarank), 0);
                     // 2D coordinate: flatten expert into row dimension
                     // row_tile = expert * (N_dim / b_tile_rows) + b_col
-                    tma::cluster::load_async(b_smem[input_ring], g.b,
-                                             {expert * g.b_n_tile_stride + b_col, idx},
-                                             inputs_arrived[input_ring],
-                                             (uint16_t)(1 << ctarank), 0);
+                    tma::cluster::load_async(b_smem[input_ring], g.b, {expert * g.b_n_tile_stride + b_col, idx},
+                                             inputs_arrived[input_ring], static_cast<uint16_t>(1 << ctarank), 0);
 
                     input_ring = moe_ring_advance<MOE_PIPE_DEPTH>(input_ring);
                 }
             }
-        }
-        else if (ctarank == 0 &&
-                 (warpgroup::warpid() == 0 || warpgroup::warpid() == 1)) {
+        } else if (ctarank == 0 && (warpgroup::warpid() == 0 || warpgroup::warpid() == 1)) {
             // ══════════════════════════════════════════════════════════
             // MMA LAUNCHER WARPS
             //
@@ -393,51 +365,43 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
             for (int task_iter = 0; true; task_iter++) {
                 int cluster_x = clusterIdx().x;
                 int task_id = task_iter * (gridDim.x / 2) + cluster_x;
-                if (task_id >= sched->total_tasks) break;
+                if (task_id >= sched->total_tasks)
+                    break;
 
                 // Wait for tensor memory to be freed by consumer (ping-pong)
-                tma::cluster::wait(outputs_finished[warpgroup::warpid()],
-                                   (task_iter + 1) % 2);
+                tma::cluster::wait(outputs_finished[warpgroup::warpid()], (task_iter + 1) % 2);
 
                 // Wait for first TMA load to arrive in shared memory
-                tma::cluster::wait(inputs_arrived[input_ring],
-                                   moe_get_phasebit<0>(bitfield, input_ring));
+                tma::cluster::wait(inputs_arrived[input_ring], moe_get_phasebit<0>(bitfield, input_ring));
                 moe_update_phasebit<0>(bitfield, input_ring);
 
                 // First K-iteration: D = A × B^T (reset accumulator)
                 // Internally emits: fence.proxy.async, tcgen05.mma (acc=0), tcgen05.commit
-                mm2_ABt(d_tt,
-                        a_smem[input_ring][warpgroup::warpid()],
-                        b_smem[input_ring],
-                        inputs_finished[input_ring]);
+                mm2_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
                 input_ring = moe_ring_advance<MOE_PIPE_DEPTH>(input_ring);
 
                 // Remaining K-iterations: D += A × B^T (accumulate)
                 for (int idx = 1; idx < iters_per_task; idx++) {
-                    tma::cluster::wait(inputs_arrived[input_ring],
-                                       moe_get_phasebit<0>(bitfield, input_ring));
+                    tma::cluster::wait(inputs_arrived[input_ring], moe_get_phasebit<0>(bitfield, input_ring));
                     moe_update_phasebit<0>(bitfield, input_ring);
 
                     // Internally emits: fence.proxy.async, tcgen05.mma (acc=1), tcgen05.commit
-                    mma2_ABt(d_tt,
-                             a_smem[input_ring][warpgroup::warpid()],
-                             b_smem[input_ring],
+                    mma2_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring],
                              inputs_finished[input_ring]);
                     input_ring = moe_ring_advance<MOE_PIPE_DEPTH>(input_ring);
                 }
             }
         }
-    }
-    // ═══════════════════════════════════════════════════════════════════
-    // CONSUMER WARPGROUPS (warpgroupid == 0 or 1)
-    //
-    // Each consumer warpgroup:
-    //   1. Waits for MMA results in tensor memory (outputs_arrived)
-    //   2. Issues tcgen05.ld to load FP32 accumulator → BF16 registers
-    //   3. Signals tensor memory is free (outputs_finished)
-    //   4. Stores BF16 result to global memory via TMA
-    // ═══════════════════════════════════════════════════════════════════
-    else {
+        // ═══════════════════════════════════════════════════════════════════
+        // CONSUMER WARPGROUPS (warpgroupid == 0 or 1)
+        //
+        // Each consumer warpgroup:
+        //   1. Waits for MMA results in tensor memory (outputs_arrived)
+        //   2. Issues tcgen05.ld to load FP32 accumulator → BF16 registers
+        //   3. Signals tensor memory is free (outputs_finished)
+        //   4. Stores BF16 result to global memory via TMA
+        // ═══════════════════════════════════════════════════════════════════
+    } else {
         warpgroup::increase_registers<224>();
 
         d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(warpgroupid * MOE_Nb);
@@ -445,13 +409,14 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
         for (int task_iter = 0; true; task_iter++) {
             int cluster_x = clusterIdx().x;
             int task_id = task_iter * (gridDim.x / 2) + cluster_x;
-            if (task_id >= sched->total_tasks) break;
+            if (task_id >= sched->total_tasks)
+                break;
 
             // Decode task for output position
             int3 task = sched->get_task(task_id);
-            int expert       = task.x;
-            int m_tile       = task.y;
-            int n_tile       = task.z;
+            int expert = task.x;
+            int m_tile = task.y;
+            int n_tile = task.z;
 
             // Output tile coordinates (matching reference B200 matmul pattern):
             //   rowcol_x = a_tile_base + ctarank*2 + warpgroupid
@@ -479,12 +444,12 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
             // ═══════════════════════════════════════════════════════
             rt_bf<MOE_Mb / 4, d_tile::cols> d_reg[4];
 
-            if (warpgroupid == 1) group<8>::sync(15);
+            if (warpgroupid == 1)
+                group<8>::sync(15);
 
-            #pragma unroll
+#pragma unroll
             for (int i = 0; i < MOE_Nb / d_tile::cols; i++) {
-                warpgroup::load_async(d_reg[i],
-                    d_tt.subtile<tt<float, 128, 64>>(0, 64 * i));
+                warpgroup::load_async(d_reg[i], d_tt.subtile<tt<float, 128, 64>>(0, 64 * i));
             }
 
             // ─── tcgen05.wait::ld — Wait for tensor loads to complete ───
@@ -495,8 +460,10 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
             if (warpgroup::laneid() == 0)
                 tma::cluster::arrive(outputs_finished[warpgroupid], 0);
 
-            if (warpgroupid == 0) group<8>::sync(15);
-            if (warpgroupid == 1) group<8>::sync(14);
+            if (warpgroupid == 0)
+                group<8>::sync(15);
+            if (warpgroupid == 1)
+                group<8>::sync(14);
 
             // ── Store BF16 result to global memory via TMA ──
             warpgroup::store(d_smem, d_reg[0]);
@@ -504,7 +471,7 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
             if (warpgroup::warpid() == 0)
                 tma::store_async(g.d, d_smem, {rowcol_x, 4 * rowcol_y + 0});
 
-            #pragma unroll
+#pragma unroll
             for (int i = 1; i < MOE_Nb / d_tile::cols; i++) {
                 tma::store_async_read_wait();
                 warpgroup::sync(warpgroupid);
@@ -515,7 +482,8 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
             }
             tma::store_async_read_wait();
 
-            if (warpgroupid == 0) group<8>::sync(14);
+            if (warpgroupid == 0)
+                group<8>::sync(14);
             group<8>::sync(15);
         }
     }
@@ -524,41 +492,35 @@ void moe_gemm_kernel(const __grid_constant__ moe_gemm_globals g) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// __global__ wrapper for standalone kernel launch
+// (Thin shim — the megakernel calls the __device__ function directly)
+// ═══════════════════════════════════════════════════════════════════════════
+
+__global__ __cluster_dims__(2)
+    __launch_bounds__(MOE_NUM_THREADS, 1) void moe_gemm_kernel_launch(const __grid_constant__ moe_gemm_globals g) {
+    moe_gemm_kernel(g);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Host-Side Launch Helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-inline void launch_moe_gemm(
-    __nv_bfloat16*       output,          // [padded_total, N_dim]
-    const __nv_bfloat16* sorted_hidden,   // [padded_total, K_dim]
-    const __nv_bfloat16* weights,         // [num_local_experts, N_dim, K_dim]
-    const MoETaskScheduler* d_scheduler,
-    int padded_total_tokens,
-    int num_local_experts,
-    int k_dim,
-    int n_dim,
-    cudaStream_t stream
-) {
+inline void launch_moe_gemm(__nv_bfloat16* output,              // [padded_total, N_dim]
+                            const __nv_bfloat16* sorted_hidden, // [padded_total, K_dim]
+                            const __nv_bfloat16* weights,       // [num_local_experts, N_dim, K_dim]
+                            const MoETaskScheduler* d_scheduler, int padded_total_tokens, int num_local_experts,
+                            int k_dim, int n_dim, cudaStream_t stream) {
     using globals = moe_gemm_globals;
 
-    typename globals::a_gl Ag{
-        const_cast<bf16*>(reinterpret_cast<const bf16*>(sorted_hidden)),
-        nullptr, nullptr,
-        padded_total_tokens, k_dim
-    };
+    typename globals::a_gl Ag{const_cast<bf16*>(reinterpret_cast<const bf16*>(sorted_hidden)), nullptr, nullptr,
+                              padded_total_tokens, k_dim};
 
     // 2D b_gl: flatten [num_experts, N_dim, K_dim] → [num_experts * N_dim, K_dim]
     // Memory layout is identical (row-major contiguous)
-    typename globals::b_gl Bg{
-        const_cast<bf16*>(reinterpret_cast<const bf16*>(weights)),
-        nullptr, nullptr,
-        (size_t)(num_local_experts * n_dim), (size_t)k_dim
-    };
+    typename globals::b_gl Bg{const_cast<bf16*>(reinterpret_cast<const bf16*>(weights)), nullptr, nullptr,
+                              static_cast<size_t>(num_local_experts * n_dim), static_cast<size_t>(k_dim)};
 
-    typename globals::d_gl Dg{
-        reinterpret_cast<bf16*>(output),
-        nullptr, nullptr,
-        padded_total_tokens, n_dim
-    };
+    typename globals::d_gl Dg{reinterpret_cast<bf16*>(output), nullptr, nullptr, padded_total_tokens, n_dim};
 
     // b_n_tile_stride = tiles per expert in N dimension
     // b_tile rows = MOE_Nb / 2 = 128, so stride = n_dim / 128
@@ -572,29 +534,24 @@ inline void launch_moe_gemm(
     unsigned long smem_size = MAX_SHARED_MEMORY - 1024;
 
     // Required on B200: enable non-portable cluster sizes (cluster_dims > 1)
-    auto cluster_err = cudaFuncSetAttribute(moe_gemm_kernel,
-                            cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    auto cluster_err = cudaFuncSetAttribute(moe_gemm_kernel_launch, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
     if (cluster_err != cudaSuccess) {
-        printf("MOE GEMM: NonPortableClusterSize failed: %s\n",
-               cudaGetErrorString(cluster_err));
+        printf("MOE GEMM: NonPortableClusterSize failed: %s\n", cudaGetErrorString(cluster_err));
         return;
     }
 
-    auto attr_err = cudaFuncSetAttribute(moe_gemm_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         smem_size);
+    auto attr_err =
+        cudaFuncSetAttribute(moe_gemm_kernel_launch, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     if (attr_err != cudaSuccess) {
-        printf("MOE GEMM: cudaFuncSetAttribute failed: %s (smem_size=%lu)\n",
-               cudaGetErrorString(attr_err), smem_size);
+        printf("MOE GEMM: cudaFuncSetAttribute failed: %s (smem_size=%lu)\n", cudaGetErrorString(attr_err), smem_size);
         return;
     }
 
-    moe_gemm_kernel<<<grid, block, smem_size, stream>>>(G);
+    moe_gemm_kernel_launch<<<grid, block, smem_size, stream>>>(G);
 
     // Check for launch errors (does NOT sync, just checks immediate errors)
     auto launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {
-        printf("MOE GEMM: kernel launch failed: %s\n",
-               cudaGetErrorString(launch_err));
+        printf("MOE GEMM: kernel launch failed: %s\n", cudaGetErrorString(launch_err));
     }
 }
