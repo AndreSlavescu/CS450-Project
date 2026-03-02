@@ -6,12 +6,12 @@
 #include "fmha_attention.cuh"
 #include "qwen3.cuh"
 
-#ifndef FA4_PROFILE_DEFAULT
-#define FA4_PROFILE_DEFAULT 0
+#ifndef FMHA_PROFILE_DEFAULT
+#define FMHA_PROFILE_DEFAULT 0
 #endif
 
 namespace {
-void fa4_check_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V) {
+void fmha_check_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torch::Tensor& V) {
     TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q, K, V must be CUDA tensors");
     TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bfloat16");
     TORCH_CHECK(K.dtype() == torch::kBFloat16, "K must be bfloat16");
@@ -23,9 +23,9 @@ void fa4_check_inputs(const torch::Tensor& Q, const torch::Tensor& K, const torc
 
 std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale,
                                                   bool causal, bool return_lse, int64_t q_offset, int64_t kv_offset,
-                                                  bool profile = static_cast<bool>(FA4_PROFILE_DEFAULT),
+                                                  bool profile = static_cast<bool>(FMHA_PROFILE_DEFAULT),
                                                   const std::string& trace_path = "trace.json") {
-    fa4_check_inputs(Q, K, V);
+    fmha_check_inputs(Q, K, V);
 
     int num_q_heads = Q.size(0);
     int seq_q = Q.size(1);
@@ -33,7 +33,7 @@ std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor
     int num_kv_heads = K.size(0);
     int seq_kv = K.size(1);
 
-    TORCH_CHECK(head_dim == 128, "FA4 kernel requires head_dim=128 (Qwen3)");
+    TORCH_CHECK(head_dim == 128, "FMHA kernel requires head_dim=128 (Qwen3)");
     TORCH_CHECK(K.size(2) == head_dim && V.size(2) == head_dim, "K, V head_dim must match Q");
     TORCH_CHECK(V.size(0) == num_kv_heads && V.size(1) == seq_kv, "V shape must match K");
     TORCH_CHECK(num_q_heads % num_kv_heads == 0, "num_q_heads must be divisible by num_kv_heads (GQA)");
@@ -50,13 +50,13 @@ std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
 
     if (profile) {
-        const int num_blocks = fa4_profile_block_count(num_q_heads, seq_q, seq_kv);
-        TORCH_CHECK(num_blocks > 0, "FA4 profiler launch computed zero blocks");
+        const int num_blocks = fmha_profile_block_count(num_q_heads, seq_q, seq_kv);
+        TORCH_CHECK(num_blocks > 0, "FMHA profiler launch computed zero blocks");
 
         profiler::host_buffer profile_buf;
         profile_buf.allocate(num_blocks);
 
-        fa4_forward_profile(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
+        fmha_forward_profile(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
                             reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()),
                             reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
                             reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()), num_q_heads, num_kv_heads, seq_q,
@@ -67,11 +67,11 @@ std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor
         TORCH_CHECK(sync_err == cudaSuccess, "cudaStreamSynchronize failed: ", cudaGetErrorString(sync_err));
 
         profiler::event_names names;
-        fa4_register_profile_event_names(names);
+        fmha_register_profile_event_names(names);
         profile_buf.export_perfetto_json(trace_path.c_str(), &names, true);
         profile_buf.free();
     } else {
-        fa4_forward(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
+        fmha_forward(reinterpret_cast<__nv_bfloat16*>(O.data_ptr()), lse_ptr,
                     reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()),
                     reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
                     reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()), num_q_heads, num_kv_heads, seq_q, seq_kv,
@@ -85,10 +85,10 @@ std::vector<torch::Tensor> fmha_attention_forward(torch::Tensor Q, torch::Tensor
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FA4 Forward Attention for Qwen3";
+    m.doc() = "CUTLASS SM100 FMHA Forward Attention for Qwen3";
 
-    m.def("forward", &fmha_attention_forward, "FMHA forward attention (GQA, causal, optional LSE)", py::arg("Q"),
+    m.def("forward", &fmha_attention_forward, "CUTLASS SM100 FMHA forward (GQA, causal, optional LSE)", py::arg("Q"),
           py::arg("K"), py::arg("V"), py::arg("scale"), py::arg("causal") = true, py::arg("return_lse") = false,
           py::arg("q_offset") = 0, py::arg("kv_offset") = 0,
-          py::arg("profile") = static_cast<bool>(FA4_PROFILE_DEFAULT), py::arg("trace_path") = "trace.json");
+          py::arg("profile") = static_cast<bool>(FMHA_PROFILE_DEFAULT), py::arg("trace_path") = "trace.json");
 }

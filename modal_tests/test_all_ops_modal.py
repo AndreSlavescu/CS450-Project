@@ -68,7 +68,7 @@ def _build_image(gpu: str) -> modal.Image:
         )
     )
     if gpu == "b200":
-        # Clone CUTLASS for Blackwell SM100 FMHA kernel headers (FA4 attention)
+        # Clone CUTLASS for Blackwell SM100 FMHA kernel headers
         img = img.run_commands("git clone --depth 1 https://github.com/NVIDIA/cutlass.git /workspace/cutlass")
     return img.add_local_dir(str(PROJECT_ROOT / "src" / "csrc"), "/workspace/src/csrc")
 
@@ -121,8 +121,8 @@ def _jit_compile(name, source_file, arch):
     return mod
 
 
-def _jit_compile_fa4(arch):
-    """Compile FA4 attention kernel with CUTLASS SM100 FMHA headers (B200 only)."""
+def _jit_compile_fmha(arch):
+    """Compile CUTLASS SM100 FMHA attention kernel (B200 only)."""
     from torch.utils.cpp_extension import load
 
     print("\n  Compiling fmha_attention (CUTLASS FMHA)...")
@@ -281,34 +281,34 @@ def _run_all_ops(arch: str) -> dict:
     )
 
     # ============================
-    # FA4 Attention (B200 / CUTLASS SM100 FMHA only)
+    # CUTLASS SM100 FMHA Attention (B200 only)
     # ============================
     if arch == "sm_100a":
-        fa4 = _jit_compile_fa4(arch)
+        fmha = _jit_compile_fmha(arch)
 
-        FA4_SEQ = 1024
-        FA4_NQ = 16
-        FA4_NKV = 8
-        FA4_HD = 128
-        FA4_SCALE = 1.0 / math.sqrt(FA4_HD)
+        FMHA_SEQ = 1024
+        FMHA_NQ = 16
+        FMHA_NKV = 8
+        FMHA_HD = 128
+        FMHA_SCALE = 1.0 / math.sqrt(FMHA_HD)
         torch.manual_seed(42)
-        Q_fa4 = torch.randn(FA4_NQ, FA4_SEQ, FA4_HD, device="cuda", dtype=torch.bfloat16)
-        K_fa4 = torch.randn(FA4_NKV, FA4_SEQ, FA4_HD, device="cuda", dtype=torch.bfloat16)
-        V_fa4 = torch.randn(FA4_NKV, FA4_SEQ, FA4_HD, device="cuda", dtype=torch.bfloat16)
+        Q_fmha = torch.randn(FMHA_NQ, FMHA_SEQ, FMHA_HD, device="cuda", dtype=torch.bfloat16)
+        K_fmha = torch.randn(FMHA_NKV, FMHA_SEQ, FMHA_HD, device="cuda", dtype=torch.bfloat16)
+        V_fmha = torch.randn(FMHA_NKV, FMHA_SEQ, FMHA_HD, device="cuda", dtype=torch.bfloat16)
 
         # Reference: PyTorch scaled_dot_product_attention (GQA, causal)
         # sdpa expects [batch, heads, seq, head_dim] — use batch=1
-        Q_sdpa = Q_fa4.unsqueeze(0)  # [1, NQ, SEQ, HD]
-        K_sdpa = K_fa4.unsqueeze(0)  # [1, NKV, SEQ, HD]
-        V_sdpa = V_fa4.unsqueeze(0)  # [1, NKV, SEQ, HD]
+        Q_sdpa = Q_fmha.unsqueeze(0)  # [1, NQ, SEQ, HD]
+        K_sdpa = K_fmha.unsqueeze(0)  # [1, NKV, SEQ, HD]
+        V_sdpa = V_fmha.unsqueeze(0)  # [1, NKV, SEQ, HD]
         ref_out = torch.nn.functional.scaled_dot_product_attention(Q_sdpa, K_sdpa, V_sdpa, is_causal=True).squeeze(
             0
         )  # [NQ, SEQ, HD]
 
-        fa4_out = fa4.forward(Q_fa4, K_fa4, V_fa4, FA4_SCALE, True, False)[0]
-        fa4_diff = (fa4_out.float() - ref_out.float()).abs().max().item()
-        results["fmha_attention"] = {"max_diff": fa4_diff, "pass": fa4_diff < 0.01}
-        print(f"[FA4] CUTLASS FMHA: max_diff={fa4_diff:.8f} {'PASS' if fa4_diff < 0.01 else 'FAIL'}")
+        fmha_out = fmha.forward(Q_fmha, K_fmha, V_fmha, FMHA_SCALE, True, False)[0]
+        fmha_diff = (fmha_out.float() - ref_out.float()).abs().max().item()
+        results["fmha_attention"] = {"max_diff": fmha_diff, "pass": fmha_diff < 0.01}
+        print(f"[FMHA] CUTLASS SM100 FMHA: max_diff={fmha_diff:.8f} {'PASS' if fmha_diff < 0.01 else 'FAIL'}")
 
     # ============================
     # Summary

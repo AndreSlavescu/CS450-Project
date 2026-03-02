@@ -6,23 +6,23 @@
 
 #include "../profiler/gpu_profiler.cuh"
 
-enum Fa4ProfileEvent : int {
-    FA4_EV_SETUP_BEGIN = 0,
-    FA4_EV_SETUP_END = 1,
-    FA4_EV_COMPUTE_BEGIN = 6,
-    FA4_EV_COMPUTE_END = 7,
-    FA4_EV_EPILOGUE_BEGIN = 8,
-    FA4_EV_EPILOGUE_END = 9,
+enum FmhaProfileEvent : int {
+    FMHA_EV_SETUP_BEGIN = 0,
+    FMHA_EV_SETUP_END = 1,
+    FMHA_EV_COMPUTE_BEGIN = 6,
+    FMHA_EV_COMPUTE_END = 7,
+    FMHA_EV_EPILOGUE_BEGIN = 8,
+    FMHA_EV_EPILOGUE_END = 9,
 };
 
-inline void fa4_register_profile_event_names(profiler::event_names& names) {
-    names.set(FA4_EV_SETUP_BEGIN, "setup");
-    names.set(FA4_EV_COMPUTE_BEGIN, "compute");
-    names.set(FA4_EV_EPILOGUE_BEGIN, "epilogue");
+inline void fmha_register_profile_event_names(profiler::event_names& names) {
+    names.set(FMHA_EV_SETUP_BEGIN, "setup");
+    names.set(FMHA_EV_COMPUTE_BEGIN, "compute");
+    names.set(FMHA_EV_EPILOGUE_BEGIN, "epilogue");
 }
 
 #if __has_include("device/fmha.hpp")
-#define FA4_HAS_CUTLASS_FMHA 1
+#define HAS_CUTLASS_FMHA 1
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -36,7 +36,7 @@ inline void fa4_register_profile_event_names(profiler::event_names& names) {
 #include "kernel/fmha_tile_scheduler.hpp"
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
 
-namespace fa4_cutlass {
+namespace fmha_cutlass {
 
 using namespace cute;
 
@@ -86,7 +86,7 @@ struct DeviceBufferCache {
             if (lse_buf)
                 cudaFree(lse_buf);
             auto err = cudaMalloc(&lse_buf, needed);
-            TORCH_CHECK(err == cudaSuccess, "FA4: failed to allocate LSE buffer");
+            TORCH_CHECK(err == cudaSuccess, "FMHA: failed to allocate LSE buffer");
             lse_bytes = needed;
         }
         return lse_buf;
@@ -98,7 +98,7 @@ struct DeviceBufferCache {
                 cudaFree(workspace);
             if (needed > 0) {
                 auto err = cudaMalloc(&workspace, needed);
-                TORCH_CHECK(err == cudaSuccess, "FA4: failed to allocate workspace");
+                TORCH_CHECK(err == cudaSuccess, "FMHA: failed to allocate workspace");
             } else {
                 workspace = nullptr;
             }
@@ -183,26 +183,26 @@ inline void run_fmha(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, const
     }
 }
 
-} // namespace fa4_cutlass
+} // namespace fmha_cutlass
 
 #else
-#define FA4_HAS_CUTLASS_FMHA 0
+#define HAS_CUTLASS_FMHA 0
 #endif
 
-inline int fa4_profile_block_count(int num_q_heads, int seq_q, int) {
+inline int fmha_profile_block_count(int num_q_heads, int seq_q, int) {
     return num_q_heads * ((seq_q + 255) / 256);
 }
 
-inline void fa4_forward(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, const __nv_bfloat16* K,
-                        const __nv_bfloat16* V, int num_q_heads, int num_kv_heads, int seq_q, int seq_kv, float scale,
-                        bool causal, int q_offset, int kv_offset, cudaStream_t stream) {
-#if FA4_HAS_CUTLASS_FMHA
+inline void fmha_forward(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, const __nv_bfloat16* K,
+                         const __nv_bfloat16* V, int num_q_heads, int num_kv_heads, int seq_q, int seq_kv, float scale,
+                         bool causal, int q_offset, int kv_offset, cudaStream_t stream) {
+#if HAS_CUTLASS_FMHA
     TORCH_CHECK(num_q_heads % num_kv_heads == 0, "num_q_heads must be divisible by num_kv_heads (GQA)");
 
     (void)scale;
     (void)q_offset;
     (void)kv_offset;
-    fa4_cutlass::run_fmha(O, lse, Q, K, V, num_q_heads, num_kv_heads, seq_q, seq_kv, causal, stream);
+    fmha_cutlass::run_fmha(O, lse, Q, K, V, num_q_heads, num_kv_heads, seq_q, seq_kv, causal, stream);
 #else
     (void)O;
     (void)lse;
@@ -218,15 +218,15 @@ inline void fa4_forward(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, co
     (void)q_offset;
     (void)kv_offset;
     (void)stream;
-    TORCH_CHECK(false, "FA4 requires CUTLASS FMHA headers (build with CUTLASS include paths)");
+    TORCH_CHECK(false, "FMHA requires CUTLASS FMHA headers (build with CUTLASS include paths)");
 #endif
 }
 
-inline void fa4_forward_profile(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, const __nv_bfloat16* K,
-                                const __nv_bfloat16* V, int num_q_heads, int num_kv_heads, int seq_q, int seq_kv,
-                                float scale, bool causal, int q_offset, int kv_offset, cudaStream_t stream,
-                                profiler::event_record* profile_events, int* profile_counts) {
+inline void fmha_forward_profile(__nv_bfloat16* O, float* lse, const __nv_bfloat16* Q, const __nv_bfloat16* K,
+                                 const __nv_bfloat16* V, int num_q_heads, int num_kv_heads, int seq_q, int seq_kv,
+                                 float scale, bool causal, int q_offset, int kv_offset, cudaStream_t stream,
+                                 profiler::event_record* profile_events, int* profile_counts) {
     (void)profile_events;
     (void)profile_counts;
-    fa4_forward(O, lse, Q, K, V, num_q_heads, num_kv_heads, seq_q, seq_kv, scale, causal, q_offset, kv_offset, stream);
+    fmha_forward(O, lse, Q, K, V, num_q_heads, num_kv_heads, seq_q, seq_kv, scale, causal, q_offset, kv_offset, stream);
 }
