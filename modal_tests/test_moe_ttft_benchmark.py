@@ -3,11 +3,9 @@
 Compares time-to-first-token across three inference backends for the
 Qwen3-Coder-480B-A35B-Instruct MoE model on 8 NVIDIA B200 GPUs.
 
-Each backend loads the model, then measures TTFT across multiple prompt
-lengths. Model loading time is excluded from TTFT measurements.
-
-The backends run sequentially so results are directly comparable on
-the same hardware allocation.
+Each backend loads the model ONCE via @modal.enter() and keeps it in GPU
+memory. The benchmark method can be called repeatedly without reloading.
+With keep_warm=1, containers stay alive between `modal run` invocations.
 
 Usage:
     # Step 1: Pre-download weights to the volume (cheap CPU, one-time)
@@ -44,47 +42,51 @@ _PROMPT_BASE = "The quick brown fox jumps over the lazy dog. "
 
 # ── Docker images ──
 # Our engine uses Dockerfile.b200 (torch nightly cu130 + CUTLASS/ThunderKittens).
-# vLLM and SGLang use their official Docker images which include CUDA toolkit
-# (nvcc required for torch.compile/CUDAGraph), correct torch, and B200 support.
-# IMPORTANT: We must clear the ENTRYPOINT from these images because their default
-# entrypoints (e.g. "vllm serve") conflict with Modal's container entrypoint.
+# vLLM and SGLang use thin Dockerfiles (Dockerfile.vllm, Dockerfile.sglang) that
+# pull the official images but clear ENTRYPOINT/CMD so Modal can bootstrap.
 
 ours_image = (
     modal.Image.from_dockerfile(PROJECT_ROOT / "Dockerfile.b200", force_build=force_rebuild)
-    .pip_install("transformers>=4.51.0,<5.0", "accelerate", "sentencepiece", "huggingface_hub")
+    .pip_install(
+        "transformers>=4.51.0,<5.0",
+        "accelerate",
+        "sentencepiece",
+        "huggingface_hub",
+    )
     .add_local_dir(str(PROJECT_ROOT / "src"), "/workspace/src")
 )
 
 vllm_image = (
-    modal.Image.from_registry(
-        "vllm/vllm-openai:latest",
-        setup_dockerfile_commands=[
-            "RUN ln -sf $(which python3) /usr/bin/python",
-            "ENTRYPOINT []",
-            "CMD []",
-        ],
+    modal.Image.from_dockerfile(
+        PROJECT_ROOT / "modal_tests" / "Dockerfile.vllm",
+        force_build=force_rebuild,
     )
-    .pip_install("huggingface_hub", "sentencepiece", "transformers>=4.51.0,<5.0")
-    .run_commands("pip install 'typing_extensions>=4.13.0'")  # Modal downgrades this; vLLM needs Sentinel
+    .pip_install(
+        "huggingface_hub",
+        "sentencepiece",
+        "transformers>=4.51.0,<5.0",
+    )
+    .run_commands("pip install 'typing_extensions>=4.13.0'")
 )
 
 sglang_image = (
-    modal.Image.from_registry(
-        "lmsysorg/sglang:latest",
-        setup_dockerfile_commands=[
-            "RUN ln -sf $(which python3) /usr/bin/python",
-            "ENTRYPOINT []",
-            "CMD []",
-        ],
+    modal.Image.from_dockerfile(
+        PROJECT_ROOT / "modal_tests" / "Dockerfile.sglang",
+        force_build=force_rebuild,
     )
-    .pip_install("huggingface_hub", "sentencepiece", "transformers>=4.51.0,<5.0")
-    .run_commands("pip install 'typing_extensions>=4.13.0'")  # Modal downgrades this; SGLang needs Sentinel
+    .pip_install(
+        "huggingface_hub",
+        "sentencepiece",
+        "transformers>=4.51.0,<5.0",
+    )
+    .run_commands("pip install 'typing_extensions>=4.13.0'")
 )
-
 
 # Lightweight image for downloading weights (no GPU needed)
 download_image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "huggingface_hub[hf_transfer]", "transformers>=4.51.0,<5.0", "sentencepiece"
+    "huggingface_hub[hf_transfer]",
+    "transformers>=4.51.0,<5.0",
+    "sentencepiece",
 )
 
 
@@ -95,7 +97,7 @@ download_image = modal.Image.debian_slim(python_version="3.12").pip_install(
 
 @app.function(
     image=download_image,
-    timeout=7200,  # 2 hours for ~960GB
+    timeout=7200,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={HF_CACHE_PATH: hf_cache},
     memory=8192,
@@ -109,11 +111,16 @@ def download_model():
     print(f"Downloading {MODEL_NAME} to volume...", flush=True)
     path = huggingface_hub.snapshot_download(
         MODEL_NAME,
-        allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model", "*.tiktoken"],
+        allow_patterns=[
+            "*.safetensors",
+            "*.json",
+            "*.txt",
+            "*.model",
+            "*.tiktoken",
+        ],
     )
     print(f"Download complete: {path}", flush=True)
 
-    # Commit volume so weights persist
     hf_cache.commit()
     print("Volume committed.", flush=True)
 
@@ -131,10 +138,12 @@ def _make_prompt(tokenizer, n_tokens: int) -> str:
 
 # ══════════════════════════════════════════════════════════════════
 # Backend 1: Our custom engine (TP=8 + EP=8)
+# Model loaded once via persistent workers, kept in GPU memory.
 # ══════════════════════════════════════════════════════════════════
 
 
-def _ours_worker(rank: int, world_size: int, results_dict: dict, prompt_lens: list):
+def _ours_persistent_worker(rank, world_size, barrier, exit_flag, prompt_lens_ref, results_dict):
+    """Persistent worker: loads model once, benchmarks on demand via barrier."""
     import time
 
     import torch
@@ -185,7 +194,7 @@ def _ours_worker(rank: int, world_size: int, results_dict: dict, prompt_lens: li
             ],
             text=True,
         ).strip()
-        extra_flags = f"{torch_incs} {torch_libs} -ltorch -ltorch_cpu -lc10 -ltorch_python"
+        extra_flags = f"{torch_incs} {torch_libs}" " -ltorch -ltorch_cpu -lc10 -ltorch_python"
 
         print("[Ours] Building MoE kernel...", flush=True)
         result = subprocess.run(
@@ -239,308 +248,415 @@ def _ours_worker(rank: int, world_size: int, results_dict: dict, prompt_lens: li
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # ── TTFT measurement (model loading excluded) ──
-    ttft_results = {}
-    decode_results = {}
+    # ── Signal ready to main process ──
+    barrier.wait()
 
-    for n_tok in prompt_lens:
-        prompt_text = _make_prompt(tokenizer, n_tok)
-        ids = tokenizer.encode(prompt_text, add_special_tokens=True)[:n_tok]
-        input_ids = torch.tensor([ids], dtype=torch.long, device=f"cuda:{rank}")
-        pos = torch.arange(len(ids), device=f"cuda:{rank}").unsqueeze(0)
+    # ── Task loop: wait for benchmark requests ──
+    while True:
+        barrier.wait()  # Wait for task from main
+        if exit_flag.value:
+            break
 
-        # Warmup
-        for _ in range(WARMUP):
-            model.stacked_kv_cache[0].zero_()
-            model.stacked_kv_cache[1].zero_()
-            model(input_ids, pos, len(ids))
-        torch.cuda.synchronize()
-        dist.barrier()
+        prompt_lens = list(prompt_lens_ref)
+        ttft_results = {}
+        decode_results = {}
 
-        # Measure TTFT (prefill only)
-        ttft_times = []
-        for _ in range(RUNS):
-            model.stacked_kv_cache[0].zero_()
-            model.stacked_kv_cache[1].zero_()
+        for n_tok in prompt_lens:
+            prompt_text = _make_prompt(tokenizer, n_tok)
+            ids = tokenizer.encode(prompt_text, add_special_tokens=True)[:n_tok]
+            input_ids = torch.tensor([ids], dtype=torch.long, device=f"cuda:{rank}")
+            pos = torch.arange(len(ids), device=f"cuda:{rank}").unsqueeze(0)
+
+            # Warmup
+            for _ in range(WARMUP):
+                model.stacked_kv_cache[0].zero_()
+                model.stacked_kv_cache[1].zero_()
+                model(input_ids, pos, len(ids))
+            torch.cuda.synchronize()
             dist.barrier()
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
+
+            # Measure TTFT (prefill only)
+            ttft_times = []
+            for _ in range(RUNS):
+                model.stacked_kv_cache[0].zero_()
+                model.stacked_kv_cache[1].zero_()
+                dist.barrier()
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                model(input_ids, pos, len(ids))
+                torch.cuda.synchronize()
+                ttft_times.append((time.perf_counter() - t0) * 1000.0)
+
+            ttft_times.sort()
+            median_ttft = ttft_times[len(ttft_times) // 2]
+            ttft_results[n_tok] = median_ttft
+
+            if rank == 0:
+                tps = len(ids) / (median_ttft / 1000.0)
+                print(
+                    f"  [Ours] n={n_tok:>5} → " f"TTFT {median_ttft:8.1f} ms  " f"({tps:.0f} tok/s prefill)",
+                    flush=True,
+                )
+
+            # Measure decode throughput
+            model.stacked_kv_cache[0].zero_()
+            model.stacked_kv_cache[1].zero_()
             logits = model(input_ids, pos, len(ids))
-            torch.cuda.synchronize()
-            ttft_times.append((time.perf_counter() - t0) * 1000.0)
+            first_tok = logits[0, -1].argmax().item()
 
-        ttft_times.sort()
-        median_ttft = ttft_times[len(ttft_times) // 2]
-        ttft_results[n_tok] = median_ttft
+            for _ in range(WARMUP):
+                kv_k_saved = model.stacked_kv_cache[0].clone()
+                kv_v_saved = model.stacked_kv_cache[1].clone()
+                tok = first_tok
+                seq = len(ids) + 1
+                for _ in range(GEN_TOKENS):
+                    tok_t = torch.tensor([[tok]], dtype=torch.long, device=f"cuda:{rank}")
+                    pos_t = torch.tensor([[seq - 1]], dtype=torch.long, device=f"cuda:{rank}")
+                    out = model(tok_t, pos_t, seq)
+                    tok = out[0, -1].argmax().item()
+                    seq += 1
+                model.stacked_kv_cache[0].copy_(kv_k_saved)
+                model.stacked_kv_cache[1].copy_(kv_v_saved)
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            decode_times = []
+            for _ in range(RUNS):
+                kv_k_saved = model.stacked_kv_cache[0].clone()
+                kv_v_saved = model.stacked_kv_cache[1].clone()
+                tok = first_tok
+                seq = len(ids) + 1
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                for _ in range(GEN_TOKENS):
+                    tok_t = torch.tensor([[tok]], dtype=torch.long, device=f"cuda:{rank}")
+                    pos_t = torch.tensor([[seq - 1]], dtype=torch.long, device=f"cuda:{rank}")
+                    out = model(tok_t, pos_t, seq)
+                    tok = out[0, -1].argmax().item()
+                    seq += 1
+                torch.cuda.synchronize()
+                decode_times.append((time.perf_counter() - t0) * 1000.0)
+                model.stacked_kv_cache[0].copy_(kv_k_saved)
+                model.stacked_kv_cache[1].copy_(kv_v_saved)
+
+            decode_times.sort()
+            median_decode = decode_times[len(decode_times) // 2]
+            ms_per_tok = median_decode / GEN_TOKENS
+            decode_results[n_tok] = ms_per_tok
+
+            if rank == 0:
+                print(
+                    f"  [Ours] n={n_tok:>5} → " f"Decode {ms_per_tok:.2f} ms/tok",
+                    flush=True,
+                )
 
         if rank == 0:
-            tps = len(ids) / (median_ttft / 1000.0)
-            print(f"  [Ours] n={n_tok:>5} → TTFT {median_ttft:8.1f} ms  ({tps:.0f} tok/s prefill)", flush=True)
+            results_dict["ttft"] = dict(ttft_results)
+            results_dict["decode_ms_per_tok"] = dict(decode_results)
 
-        # Measure decode throughput
-        model.stacked_kv_cache[0].zero_()
-        model.stacked_kv_cache[1].zero_()
-        logits = model(input_ids, pos, len(ids))
-        first_tok = logits[0, -1].argmax().item()
-
-        for _ in range(WARMUP):
-            kv_k_saved = model.stacked_kv_cache[0].clone()
-            kv_v_saved = model.stacked_kv_cache[1].clone()
-            tok = first_tok
-            seq = len(ids) + 1
-            for _ in range(GEN_TOKENS):
-                tok_t = torch.tensor([[tok]], dtype=torch.long, device=f"cuda:{rank}")
-                pos_t = torch.tensor([[seq - 1]], dtype=torch.long, device=f"cuda:{rank}")
-                out = model(tok_t, pos_t, seq)
-                tok = out[0, -1].argmax().item()
-                seq += 1
-            model.stacked_kv_cache[0].copy_(kv_k_saved)
-            model.stacked_kv_cache[1].copy_(kv_v_saved)
-        torch.cuda.synchronize()
         dist.barrier()
-
-        decode_times = []
-        for _ in range(RUNS):
-            kv_k_saved = model.stacked_kv_cache[0].clone()
-            kv_v_saved = model.stacked_kv_cache[1].clone()
-            tok = first_tok
-            seq = len(ids) + 1
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(GEN_TOKENS):
-                tok_t = torch.tensor([[tok]], dtype=torch.long, device=f"cuda:{rank}")
-                pos_t = torch.tensor([[seq - 1]], dtype=torch.long, device=f"cuda:{rank}")
-                out = model(tok_t, pos_t, seq)
-                tok = out[0, -1].argmax().item()
-                seq += 1
-            torch.cuda.synchronize()
-            decode_times.append((time.perf_counter() - t0) * 1000.0)
-            model.stacked_kv_cache[0].copy_(kv_k_saved)
-            model.stacked_kv_cache[1].copy_(kv_v_saved)
-
-        decode_times.sort()
-        median_decode = decode_times[len(decode_times) // 2]
-        ms_per_tok = median_decode / GEN_TOKENS
-        decode_results[n_tok] = ms_per_tok
-
-        if rank == 0:
-            print(f"  [Ours] n={n_tok:>5} → Decode {ms_per_tok:.2f} ms/tok", flush=True)
-
-    if rank == 0:
-        results_dict["ttft"] = dict(ttft_results)
-        results_dict["decode_ms_per_tok"] = dict(decode_results)
+        barrier.wait()  # Signal done to main
 
     dist.barrier()
     dist.destroy_process_group()
 
 
-@app.function(
+@app.cls(
     image=ours_image,
     gpu="B200:8",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={HF_CACHE_PATH: hf_cache},
+    keep_warm=1,
+    allow_concurrent_inputs=1,
 )
-def run_ours(prompt_lens: list[int]) -> dict:
-    import torch.multiprocessing as mp
+class OursEngine:
+    """Our engine with persistent 8-GPU worker pool. Model loads once."""
 
-    manager = mp.Manager()
-    results = manager.dict()
-    mp.spawn(_ours_worker, args=(8, results, prompt_lens), nprocs=8, join=True)
-    return dict(results)
+    @modal.enter()
+    def setup(self):
+        import multiprocessing as mp
+
+        self._manager = mp.Manager()
+        self._barrier = mp.Barrier(9)  # 8 workers + 1 main
+        self._exit_flag = mp.Value("i", 0)
+        self._prompt_lens = self._manager.list()
+        self._results = self._manager.dict()
+
+        self._workers = []
+        for rank in range(8):
+            p = mp.Process(
+                target=_ours_persistent_worker,
+                args=(
+                    rank,
+                    8,
+                    self._barrier,
+                    self._exit_flag,
+                    self._prompt_lens,
+                    self._results,
+                ),
+            )
+            p.start()
+            self._workers.append(p)
+
+        print("[Ours] Waiting for workers to load model...", flush=True)
+        self._barrier.wait()  # Wait for all workers to finish loading
+        print("[Ours] All 8 workers ready, model in GPU memory", flush=True)
+
+    @modal.method()
+    def benchmark(self, prompt_lens: list[int]) -> dict:
+        self._prompt_lens[:] = prompt_lens
+        self._barrier.wait()  # Signal workers to start benchmark
+        self._barrier.wait()  # Wait for workers to finish
+        return dict(self._results)
+
+    @modal.exit()
+    def teardown(self):
+        self._exit_flag.value = 1
+        self._barrier.wait()  # Release workers to check exit flag
+        for w in self._workers:
+            w.join(timeout=30)
 
 
 # ══════════════════════════════════════════════════════════════════
-# Backend 2: vLLM (TP=8)
+# Backend 2: vLLM (TP=8) — model loaded once in @modal.enter()
 # ══════════════════════════════════════════════════════════════════
 
 
-@app.function(
+@app.cls(
     image=vllm_image,
     gpu="B200:8",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={HF_CACHE_PATH: hf_cache},
+    keep_warm=1,
+    allow_concurrent_inputs=1,
 )
-def run_vllm(prompt_lens: list[int]) -> dict:
-    import subprocess
-    import time as _time
+class VllmEngine:
+    """vLLM engine. Model loads once and stays in GPU memory."""
 
-    # Modal's runtime downgrades typing_extensions; pydantic_core needs Sentinel (>=4.13)
-    subprocess.check_call(
-        ["pip", "install", "-q", "typing_extensions>=4.13.0"]
-    )
+    @modal.enter()
+    def load(self):
+        import subprocess
 
-    import torch
-    from transformers import AutoTokenizer
+        # Modal runtime may downgrade typing_extensions; pydantic needs Sentinel
+        subprocess.check_call(["pip", "install", "-q", "typing_extensions>=4.13.0"])
 
-    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
-    print(f"[vLLM] Device: {device_name} x {torch.cuda.device_count()}", flush=True)
+        import torch
+        from transformers import AutoTokenizer
+        from vllm import LLM
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    ttft_results = {}
-    decode_results = {}
+        device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+        print(
+            f"[vLLM] Device: {device} x {torch.cuda.device_count()}",
+            flush=True,
+        )
 
-    try:
-        from vllm import LLM, SamplingParams
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
         print("[vLLM] Loading model...", flush=True)
-        llm = LLM(
+        self.llm = LLM(
             model=MODEL_NAME,
             tensor_parallel_size=8,
             dtype="bfloat16",
-            max_model_len=max(prompt_lens) + GEN_TOKENS + 64,
+            max_model_len=MAX_SEQ_LEN + GEN_TOKENS + 64,
             trust_remote_code=True,
             enable_expert_parallel=True,
         )
-        print("[vLLM] Model loaded, starting TTFT measurements", flush=True)
+        print("[vLLM] Model loaded, ready for benchmarks", flush=True)
+
+    @modal.method()
+    def benchmark(self, prompt_lens: list[int]) -> dict:
+        import time as _time
+
+        from vllm import SamplingParams
 
         params = SamplingParams(temperature=0.0, max_tokens=GEN_TOKENS)
         params_1tok = SamplingParams(temperature=0.0, max_tokens=1)
+        ttft_results = {}
+        decode_results = {}
 
-        for n_tok in prompt_lens:
-            prompt_text = _make_prompt(tokenizer, n_tok)
+        try:
+            for n_tok in prompt_lens:
+                prompt_text = _make_prompt(self.tokenizer, n_tok)
 
-            # Warmup
-            for _ in range(WARMUP):
-                llm.generate([prompt_text], params)
+                # Warmup
+                for _ in range(WARMUP):
+                    self.llm.generate([prompt_text], params)
 
-            # TTFT: try vLLM metrics first, fall back to wall-clock
-            ttft_times = []
-            decode_ms_per_tok_list = []
-            for _ in range(RUNS):
-                outputs = llm.generate([prompt_text], params)
-                output = outputs[0]
-                m = output.metrics
-
-                if hasattr(m, "first_token_time") and m.first_token_time is not None:
-                    ttft_times.append((m.first_token_time - m.arrival_time) * 1000.0)
-
-                n_gen = len(output.outputs[0].token_ids)
-                if (
-                    n_gen > 1
-                    and hasattr(m, "last_token_time")
-                    and m.last_token_time
-                    and hasattr(m, "first_token_time")
-                    and m.first_token_time
-                ):
-                    decode_total = (m.last_token_time - m.first_token_time) * 1000.0
-                    decode_ms_per_tok_list.append(decode_total / (n_gen - 1))
-
-            if not ttft_times:
-                # Wall-clock fallback
+                # TTFT: try vLLM metrics, fall back to wall-clock
+                ttft_times = []
+                decode_ms_list = []
                 for _ in range(RUNS):
-                    t0 = _time.perf_counter()
-                    llm.generate([prompt_text], params_1tok)
-                    ttft_times.append((_time.perf_counter() - t0) * 1000.0)
+                    outputs = self.llm.generate([prompt_text], params)
+                    output = outputs[0]
+                    m = output.metrics
 
-            ttft_times.sort()
-            median_ttft = ttft_times[len(ttft_times) // 2]
-            ttft_results[n_tok] = median_ttft
-            print(f"  [vLLM] n={n_tok:>5} → TTFT {median_ttft:8.1f} ms", flush=True)
+                    if hasattr(m, "first_token_time") and m.first_token_time is not None:
+                        ttft_times.append((m.first_token_time - m.arrival_time) * 1000.0)
 
-            if decode_ms_per_tok_list:
-                decode_ms_per_tok_list.sort()
-                decode_results[n_tok] = decode_ms_per_tok_list[len(decode_ms_per_tok_list) // 2]
-                print(f"  [vLLM] n={n_tok:>5} → Decode {decode_results[n_tok]:.2f} ms/tok", flush=True)
+                    n_gen = len(output.outputs[0].token_ids)
+                    if (
+                        n_gen > 1
+                        and hasattr(m, "last_token_time")
+                        and m.last_token_time
+                        and hasattr(m, "first_token_time")
+                        and m.first_token_time
+                    ):
+                        dt = (m.last_token_time - m.first_token_time) * 1000.0
+                        decode_ms_list.append(dt / (n_gen - 1))
 
-        del llm
+                if not ttft_times:
+                    # Wall-clock fallback (generate 1 token only)
+                    for _ in range(RUNS):
+                        t0 = _time.perf_counter()
+                        self.llm.generate([prompt_text], params_1tok)
+                        ttft_times.append((_time.perf_counter() - t0) * 1000.0)
 
-    except Exception as e:
-        import traceback
+                ttft_times.sort()
+                median_ttft = ttft_times[len(ttft_times) // 2]
+                ttft_results[n_tok] = median_ttft
+                print(
+                    f"  [vLLM] n={n_tok:>5} → TTFT {median_ttft:8.1f} ms",
+                    flush=True,
+                )
 
-        print(f"[vLLM] FAILED: {e}", flush=True)
-        traceback.print_exc()
-        return {"error": str(e), "ttft": {}, "decode_ms_per_tok": {}}
+                if decode_ms_list:
+                    decode_ms_list.sort()
+                    decode_results[n_tok] = decode_ms_list[len(decode_ms_list) // 2]
+                    print(
+                        f"  [vLLM] n={n_tok:>5} → " f"Decode {decode_results[n_tok]:.2f} ms/tok",
+                        flush=True,
+                    )
 
-    return {"ttft": ttft_results, "decode_ms_per_tok": decode_results}
+        except Exception as e:
+            import traceback
+
+            print(f"[vLLM] FAILED: {e}", flush=True)
+            traceback.print_exc()
+            return {"error": str(e), "ttft": {}, "decode_ms_per_tok": {}}
+
+        return {"ttft": ttft_results, "decode_ms_per_tok": decode_results}
+
+    @modal.exit()
+    def unload(self):
+        if hasattr(self, "llm"):
+            del self.llm
 
 
 # ══════════════════════════════════════════════════════════════════
-# Backend 3: SGLang (TP=8)
+# Backend 3: SGLang (TP=8) — model loaded once in @modal.enter()
 # ══════════════════════════════════════════════════════════════════
 
 
-@app.function(
+@app.cls(
     image=sglang_image,
     gpu="B200:8",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={HF_CACHE_PATH: hf_cache},
+    keep_warm=1,
+    allow_concurrent_inputs=1,
 )
-def run_sglang(prompt_lens: list[int]) -> dict:
-    import subprocess
-    import time as _time
+class SglangEngine:
+    """SGLang engine. Model loads once and stays in GPU memory."""
 
-    # Modal's runtime downgrades typing_extensions; pydantic_core needs Sentinel (>=4.13)
-    subprocess.check_call(
-        ["pip", "install", "-q", "typing_extensions>=4.13.0"]
-    )
+    @modal.enter()
+    def load(self):
+        import subprocess
 
-    import torch
-    from transformers import AutoTokenizer
+        subprocess.check_call(["pip", "install", "-q", "typing_extensions>=4.13.0"])
 
-    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
-    print(f"[SGLang] Device: {device_name} x {torch.cuda.device_count()}", flush=True)
+        import torch
+        from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    ttft_results = {}
-    decode_results = {}
+        device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+        print(
+            f"[SGLang] Device: {device} x {torch.cuda.device_count()}",
+            flush=True,
+        )
 
-    try:
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
         import sglang as sgl
 
         print("[SGLang] Loading model...", flush=True)
-        engine = sgl.Engine(
+        self.engine = sgl.Engine(
             model_path=MODEL_NAME,
             tp_size=8,
             dtype="bfloat16",
         )
-        print("[SGLang] Model loaded, starting TTFT measurements", flush=True)
+        print("[SGLang] Model loaded, ready for benchmarks", flush=True)
 
-        for n_tok in prompt_lens:
-            prompt_text = _make_prompt(tokenizer, n_tok)
+    @modal.method()
+    def benchmark(self, prompt_lens: list[int]) -> dict:
+        import time as _time
 
-            # Warmup
-            for _ in range(WARMUP):
-                engine.generate(prompt_text, {"max_new_tokens": GEN_TOKENS, "temperature": 0.0})
+        ttft_results = {}
+        decode_results = {}
 
-            # TTFT (generate 1 token = prefill only)
-            ttft_times = []
-            for _ in range(RUNS):
-                t0 = _time.perf_counter()
-                engine.generate(prompt_text, {"max_new_tokens": 1, "temperature": 0.0})
-                ttft_times.append((_time.perf_counter() - t0) * 1000.0)
+        try:
+            for n_tok in prompt_lens:
+                prompt_text = _make_prompt(self.tokenizer, n_tok)
 
-            ttft_times.sort()
-            median_ttft = ttft_times[len(ttft_times) // 2]
-            ttft_results[n_tok] = median_ttft
-            print(f"  [SGLang] n={n_tok:>5} → TTFT {median_ttft:8.1f} ms", flush=True)
+                # Warmup
+                for _ in range(WARMUP):
+                    self.engine.generate(
+                        prompt_text,
+                        {"max_new_tokens": GEN_TOKENS, "temperature": 0.0},
+                    )
 
-            # Decode
-            total_times = []
-            for _ in range(RUNS):
-                t0 = _time.perf_counter()
-                engine.generate(prompt_text, {"max_new_tokens": GEN_TOKENS, "temperature": 0.0})
-                total_times.append((_time.perf_counter() - t0) * 1000.0)
+                # TTFT (generate 1 token = prefill only)
+                ttft_times = []
+                for _ in range(RUNS):
+                    t0 = _time.perf_counter()
+                    self.engine.generate(
+                        prompt_text,
+                        {"max_new_tokens": 1, "temperature": 0.0},
+                    )
+                    ttft_times.append((_time.perf_counter() - t0) * 1000.0)
 
-            total_times.sort()
-            median_total = total_times[len(total_times) // 2]
-            decode_total = max(median_total - median_ttft, 0.1)
-            ms_per_tok = decode_total / (GEN_TOKENS - 1) if GEN_TOKENS > 1 else decode_total
-            decode_results[n_tok] = ms_per_tok
-            print(f"  [SGLang] n={n_tok:>5} → Decode {ms_per_tok:.2f} ms/tok", flush=True)
+                ttft_times.sort()
+                median_ttft = ttft_times[len(ttft_times) // 2]
+                ttft_results[n_tok] = median_ttft
+                print(
+                    f"  [SGLang] n={n_tok:>5} → " f"TTFT {median_ttft:8.1f} ms",
+                    flush=True,
+                )
 
-        engine.shutdown()
+                # Decode
+                total_times = []
+                for _ in range(RUNS):
+                    t0 = _time.perf_counter()
+                    self.engine.generate(
+                        prompt_text,
+                        {"max_new_tokens": GEN_TOKENS, "temperature": 0.0},
+                    )
+                    total_times.append((_time.perf_counter() - t0) * 1000.0)
 
-    except Exception as e:
-        import traceback
+                total_times.sort()
+                median_total = total_times[len(total_times) // 2]
+                decode_total = max(median_total - median_ttft, 0.1)
+                ms_per_tok = decode_total / (GEN_TOKENS - 1) if GEN_TOKENS > 1 else decode_total
+                decode_results[n_tok] = ms_per_tok
+                print(
+                    f"  [SGLang] n={n_tok:>5} → " f"Decode {ms_per_tok:.2f} ms/tok",
+                    flush=True,
+                )
 
-        print(f"[SGLang] FAILED: {e}", flush=True)
-        traceback.print_exc()
-        return {"error": str(e), "ttft": {}, "decode_ms_per_tok": {}}
+        except Exception as e:
+            import traceback
 
-    return {"ttft": ttft_results, "decode_ms_per_tok": decode_results}
+            print(f"[SGLang] FAILED: {e}", flush=True)
+            traceback.print_exc()
+            return {"error": str(e), "ttft": {}, "decode_ms_per_tok": {}}
+
+        return {"ttft": ttft_results, "decode_ms_per_tok": decode_results}
+
+    @modal.exit()
+    def shutdown(self):
+        if hasattr(self, "engine"):
+            self.engine.shutdown()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -548,7 +664,13 @@ def run_sglang(prompt_lens: list[int]) -> dict:
 # ══════════════════════════════════════════════════════════════════
 
 
-def _print_table(title: str, all_results: dict[str, dict], prompt_lens: list[int], key: str, fmt: str = ".1f"):
+def _print_table(
+    title: str,
+    all_results: dict[str, dict],
+    prompt_lens: list[int],
+    key: str,
+    fmt: str = ".1f",
+):
     """Print a comparison table for one metric across backends."""
     backends = list(all_results.keys())
 
@@ -559,7 +681,6 @@ def _print_table(title: str, all_results: dict[str, dict], prompt_lens: list[int
     header = f"{'prompt_len':>10}"
     for b in backends:
         header += f"  {b:>12}"
-    # Speedup ratios vs Ours
     for b in backends:
         if b != "Ours":
             header += f"  {'Ours/' + b:>12}"
@@ -577,7 +698,7 @@ def _print_table(title: str, all_results: dict[str, dict], prompt_lens: list[int
             if b != "Ours":
                 ours_v = vals.get("Ours")
                 other_v = vals.get(b)
-                if ours_v is not None and other_v is not None and other_v > 0:
+                if ours_v and other_v and other_v > 0:
                     row += f"  {ours_v / other_v:>11.2f}x"
                 else:
                     row += f"  {'N/A':>12}"
@@ -586,16 +707,11 @@ def _print_table(title: str, all_results: dict[str, dict], prompt_lens: list[int
 
 @app.function(
     image=download_image,
-    timeout=10800,  # 3 hours total (sum of all backends)
+    timeout=10800,
     memory=2048,
 )
 def orchestrate(prompt_lens: list[int]) -> dict:
-    """Run all backends sequentially on Modal servers.
-
-    This runs as a remote function so that the .remote() calls to each
-    backend happen server-to-server, avoiding local heartbeat timeouts
-    that killed previous runs.
-    """
+    """Run all backends sequentially. Models stay loaded via keep_warm."""
     all_results = {}
 
     print(f"\n{'='*70}")
@@ -603,39 +719,42 @@ def orchestrate(prompt_lens: list[int]) -> dict:
     print("Hardware: 8x B200 per backend")
     print(f"Prompt lengths: {prompt_lens}")
     print(f"Decode tokens: {GEN_TOKENS}")
-    print("Note: Model loading time is NOT included in TTFT measurements")
     print(f"{'='*70}")
 
-    # Run backends sequentially
-    print("\n--- Running: Our custom engine (TP=8, EP=8) ---", flush=True)
+    print("\n--- Running: Our engine (TP=8, EP=8) ---", flush=True)
     try:
-        all_results["Ours"] = run_ours.remote(prompt_lens)
+        ours = OursEngine()
+        all_results["Ours"] = ours.benchmark.remote(prompt_lens)
     except Exception as e:
         print(f"[WARN] Our engine failed: {e}")
         all_results["Ours"] = {"ttft": {}, "decode_ms_per_tok": {}}
 
     print("\n--- Running: vLLM (TP=8, EP=8) ---", flush=True)
     try:
-        all_results["vLLM"] = run_vllm.remote(prompt_lens)
+        vllm_engine = VllmEngine()
+        all_results["vLLM"] = vllm_engine.benchmark.remote(prompt_lens)
     except Exception as e:
         print(f"[WARN] vLLM failed: {e}")
         all_results["vLLM"] = {"ttft": {}, "decode_ms_per_tok": {}}
 
     print("\n--- Running: SGLang (TP=8) ---", flush=True)
     try:
-        all_results["SGLang"] = run_sglang.remote(prompt_lens)
+        sglang_engine = SglangEngine()
+        all_results["SGLang"] = sglang_engine.benchmark.remote(prompt_lens)
     except Exception as e:
         print(f"[WARN] SGLang failed: {e}")
         all_results["SGLang"] = {"ttft": {}, "decode_ms_per_tok": {}}
 
     # Print comparison tables
+    _print_table("TTFT (median ms)", all_results, prompt_lens, "ttft", fmt=".1f")
     _print_table(
-        "TTFT (median ms, lower is better — model loading excluded)", all_results, prompt_lens, "ttft", fmt=".1f"
+        "DECODE (ms/tok)",
+        all_results,
+        prompt_lens,
+        "decode_ms_per_tok",
+        fmt=".2f",
     )
 
-    _print_table("DECODE (ms/tok, lower is better)", all_results, prompt_lens, "decode_ms_per_tok", fmt=".2f")
-
-    # Errors
     for name, res in all_results.items():
         if "error" in res:
             print(f"\n[{name}] Error: {res['error']}")
@@ -655,13 +774,23 @@ def main(download_only: bool = False):
         print("Done. Weights are cached in the 'hf-model-cache' volume.")
         return
 
-    # Dispatch to remote orchestrator — avoids local heartbeat timeouts
     print("Dispatching benchmark to remote orchestrator...")
     results = orchestrate.remote(PROMPT_LENS)
 
-    # Reprint the comparison tables locally for convenience
-    _print_table("TTFT (median ms, lower is better — model loading excluded)", results, PROMPT_LENS, "ttft", fmt=".1f")
-    _print_table("DECODE (ms/tok, lower is better)", results, PROMPT_LENS, "decode_ms_per_tok", fmt=".2f")
+    _print_table(
+        "TTFT (median ms, lower is better — model loading excluded)",
+        results,
+        PROMPT_LENS,
+        "ttft",
+        fmt=".1f",
+    )
+    _print_table(
+        "DECODE (ms/tok, lower is better)",
+        results,
+        PROMPT_LENS,
+        "decode_ms_per_tok",
+        fmt=".2f",
+    )
 
     for name, res in results.items():
         if "error" in res:
