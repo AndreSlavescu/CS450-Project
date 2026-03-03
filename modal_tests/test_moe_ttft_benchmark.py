@@ -363,7 +363,13 @@ def run_ours(prompt_lens: list[int]) -> dict:
     volumes={HF_CACHE_PATH: hf_cache},
 )
 def run_vllm(prompt_lens: list[int]) -> dict:
+    import subprocess
     import time as _time
+
+    # Modal's runtime downgrades typing_extensions; pydantic_core needs Sentinel (>=4.13)
+    subprocess.check_call(
+        ["pip", "install", "-q", "typing_extensions>=4.13.0"]
+    )
 
     import torch
     from transformers import AutoTokenizer
@@ -463,7 +469,13 @@ def run_vllm(prompt_lens: list[int]) -> dict:
     volumes={HF_CACHE_PATH: hf_cache},
 )
 def run_sglang(prompt_lens: list[int]) -> dict:
+    import subprocess
     import time as _time
+
+    # Modal's runtime downgrades typing_extensions; pydantic_core needs Sentinel (>=4.13)
+    subprocess.check_call(
+        ["pip", "install", "-q", "typing_extensions>=4.13.0"]
+    )
 
     import torch
     from transformers import AutoTokenizer
