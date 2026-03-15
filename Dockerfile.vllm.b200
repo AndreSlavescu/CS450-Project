@@ -1,0 +1,27 @@
+FROM nvcr.io/nvidia/vllm:25.10-py3
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    curl \
+    libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install numpy ninja pytest uv "setuptools>=64.0.0" pandas tabulate psutil "pydra-config>=0.0.13" openai tqdm accelerate einops pyright art pybind11
+
+WORKDIR /workspace
+
+COPY Megakernels /workspace/Megakernels
+
+ENV THUNDERKITTENS_ROOT=/workspace/Megakernels/ThunderKittens
+ENV MEGAKERNELS_ROOT=/workspace/Megakernels
+ENV PYTHON_VERSION=3.12
+ENV GPU=B200
+
+RUN cd /workspace/Megakernels && pip install --no-build-isolation -e .
+
+RUN cd /workspace/Megakernels/demos/low-latency-llama && make
