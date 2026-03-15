@@ -16,17 +16,24 @@ def _base_image():
 # Shared deps for megakernel (and bench_engines.py when used with vllm/sglang)
 image = _base_image().pip_install("pandas", "tabulate")
 
-# vLLM and SGLang use incompatible triton/torch stacks → separate images
-image_vllm = _base_image().pip_install(
-    "vllm==0.15.1",
-    "pandas",
-    "tabulate",
-)
-image_sglang = _base_image().pip_install(
-    "sglang[all]",
-    "pandas",
-    "tabulate",
-)
+def _vllm_image():
+    # vLLM image
+    return modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.vllm.b200").run_commands(
+        "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
+    )
+
+def _sglang_image():
+    # SGLang image
+    return modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.sglang.b200").run_commands(
+        "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
+    )
+
+# Shared deps for megakernel (and bench_engines.py when used with vllm/sglang)
+image = _base_image().pip_install("pandas", "tabulate")
+
+# Engine-specific images
+image_vllm = _vllm_image()
+image_sglang = _sglang_image()
 
 PROJECT_ROOT = "/workspace/Megakernels"
 
