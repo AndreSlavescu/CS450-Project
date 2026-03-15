@@ -36,7 +36,9 @@ def run_benchmark(gpu, engine):
     return throughput
 
 def main():
-    gpus = ["H100", "B200"]
+    # gpus = ["H100", "B200"]
+    # gpus = ["H100"]
+    gpus = ["B200"]
     engines = ["megakernel", "vllm", "sglang"]
     num_runs = 3
     
