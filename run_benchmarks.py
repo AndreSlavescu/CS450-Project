@@ -1,7 +1,5 @@
 import re
 import subprocess
-import sys
-from collections import defaultdict
 
 
 def run_benchmark(gpu, engine):
@@ -73,7 +71,7 @@ def main():
         for engine in engines:
             for run_idx in range(num_runs):
                 print(
-                    f"--- {gpu} | {engine} | Run {run_idx+1}/{num_runs} ---",
+                    f"--- {gpu} | {engine} | Run {run_idx + 1}/{num_runs} ---",
                     flush=True,
                 )
                 throughput = run_benchmark(gpu, engine)
@@ -82,7 +80,7 @@ def main():
                     results[gpu][name_map[engine]].append(throughput)
                 else:
                     print(
-                        f"Parsed Throughput: FAILED",
+                        "Parsed Throughput: FAILED",
                         flush=True,
                     )
 

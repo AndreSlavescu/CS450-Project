@@ -256,9 +256,7 @@ def generate_profiler_trace():
 
     trace_filename = "llama_profile.json"
 
-    cmd = (
-        f"python {PROJECT_ROOT}/megakernels/scripts/make_torch_profile.py " f"outfile={trace_filename} " "compile=True"
-    )
+    cmd = f"python {PROJECT_ROOT}/megakernels/scripts/make_torch_profile.py outfile={trace_filename} compile=True"
 
     subprocess.run(cmd, shell=True, cwd=PROJECT_ROOT, check=True)
 

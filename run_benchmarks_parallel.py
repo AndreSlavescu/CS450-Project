@@ -2,7 +2,6 @@ import concurrent.futures
 import pprint
 import re
 import subprocess
-import sys
 import threading
 
 # Lock for thread-safe printing
@@ -18,7 +17,7 @@ def run_benchmark(gpu, engine, run_idx, num_runs):
     script = f"reproduce_baseline_{gpu.lower()}.py"
     cmd = ["modal", "run", script, "--action", engine]
 
-    prefix = f"[{gpu}|{engine}|{run_idx+1}/{num_runs}]"
+    prefix = f"[{gpu}|{engine}|{run_idx + 1}/{num_runs}]"
     safe_print(f"{prefix} Starting: {' '.join(cmd)}", flush=True)
 
     process = subprocess.Popen(
