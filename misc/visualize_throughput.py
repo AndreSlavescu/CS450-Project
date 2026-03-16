@@ -22,12 +22,55 @@ import numpy as np
 #     },
 # }
 
-data = {'B200': {'Megakernel': [1537.92, 1546.2, 1552.29, 1554.59, 1545.86, 1555.46],
-          'SgLang': [683.493563817775, 770.3817483675491, 675.6730015113567, 778.8660370544206, 796.911027043055, 784.7740489592632],
-          'vLLM': [459.2982869413357, 443.6472150982267, 433.8468577951744, 436.5768706546318]},
-          'H100': {'Megakernel': [1019.47, 1004.42, 1003.43],
-          'SgLang': [639.0071405915832, 646.5226525900517, 640.2277661920616],
-          'vLLM': [619.2003165534729, 698.3169756290176, 622.462678936665]}}
+data = {
+    "H100": {
+        "Megakernel": [
+            1019.47,
+            1004.42,
+            1003.43,
+        ],
+        "SgLang": [
+            639.0071405915832,
+            646.5226525900517,
+            640.2277661920616,
+            651.1255211708208,
+            560.3324315235179,
+            652.2206265290728,
+        ],
+        "vLLM": [
+            619.2003165534729,
+            698.3169756290176,
+            622.462678936665,
+            584.8890062061128,
+            560.6378016560118,
+            696.0680788918768,
+        ],
+    },
+    "B200": {
+        "Megakernel": [
+            1537.92,
+            1546.2,
+            1552.29,
+            1554.59,
+            1545.86,
+            1555.46,
+        ],
+        "SgLang": [
+            683.493563817775,
+            770.3817483675491,
+            675.6730015113567,
+            778.8660370544206,
+            796.911027043055,
+            784.7740489592632,
+        ],
+        "vLLM": [
+            459.2982869413357,
+            443.6472150982267,
+            433.8468577951744,
+            436.5768706546318,
+        ],
+    },
+}
 
 gpus = list(data.keys())
 methods = ["vLLM", "SgLang", "Megakernel"]
@@ -60,7 +103,11 @@ for i, method in enumerate(methods):
 
 ax.set_ylabel("Tokens/s", fontsize=14, fontweight="bold")
 ax.set_xlabel("GPU", fontsize=16, fontweight="bold")
-ax.set_title("Llama-1B (BF16) Batch-Size 1, Decoding Throughput", fontsize=18, fontweight="bold")
+ax.set_title(
+    "Llama-1B (BF16) Batch-Size 1, Decoding Throughput",
+    fontsize=18,
+    fontweight="bold",
+)
 ax.set_xticks(x)
 ax.set_xticklabels(gpus, fontsize=14)
 ax.yaxis.grid(True, linestyle="--", alpha=0.5)
@@ -85,6 +132,10 @@ for bars in bars_by_method:
         )
 
 plt.tight_layout()
-plt.savefig("throughput_comparison.png", dpi=150, bbox_inches="tight")
+plt.savefig(
+    "throughput_comparison.png",
+    dpi=150,
+    bbox_inches="tight",
+)
 print("Saved throughput_comparison.png")
 plt.close()

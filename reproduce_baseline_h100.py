@@ -41,7 +41,17 @@ def benchmark_megakernel_h100():
     """
     Reproduces the Megakernel bar graph as per Figure 1.
     """
+    import torch
+
     print("=== Benchmarking Megakernel (H100) ===")
+
+    # Diagnostic info
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"Device name: {torch.cuda.get_device_name(0)}")
+        print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
 
     # Using the same parameters as the paper (approx 32 token prompt, 128 gen)
     cmd = (
@@ -53,7 +63,12 @@ def benchmark_megakernel_h100():
     )
 
     # We change dir to ensure relative paths in the script work
-    subprocess.run(cmd, shell=True, cwd=PROJECT_ROOT, check=True)
+    subprocess.run(
+        cmd,
+        shell=True,
+        cwd=PROJECT_ROOT,
+        check=True,
+    )
 
 
 @app.function(
@@ -68,8 +83,17 @@ def benchmark_vllm_baseline():
     """
 
     import requests
+    import torch
 
     print("=== Benchmarking vLLM Baseline (H100) ===")
+
+    # Diagnostic info
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"Device name: {torch.cuda.get_device_name(0)}")
+        print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
 
     # 1. Start the vLLM server in the background
     server_cmd = [
@@ -146,8 +170,17 @@ def benchmark_sglang_baseline():
     Reproduces the SGLang baseline bar graph as per Figure 1.
     """
     import requests
+    import torch
 
     print("=== Benchmarking SGLang Baseline (H100) ===")
+
+    # Diagnostic info
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"Device name: {torch.cuda.get_device_name(0)}")
+        print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
 
     # 1. Start the SGLang server in the background
     server_cmd = [

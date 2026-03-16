@@ -16,17 +16,20 @@ def _base_image():
 # Shared deps for megakernel (and bench_engines.py when used with vllm/sglang)
 image = _base_image().pip_install("pandas", "tabulate")
 
+
 def _vllm_image():
     # vLLM image
     return modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.vllm.b200").run_commands(
         "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
     )
 
+
 def _sglang_image():
     # SGLang image
     return modal.Image.from_dockerfile(Path(__file__).parent / "Dockerfile.sglang.b200").run_commands(
         "apt-get update && apt-get install -y --no-install-recommends libnuma1 && rm -rf /var/lib/apt/lists/*"
     )
+
 
 # Shared deps for megakernel (and bench_engines.py when used with vllm/sglang)
 image = _base_image().pip_install("pandas", "tabulate")
@@ -126,7 +129,12 @@ def benchmark_vllm_baseline():
 
     print(f"Launching server: {' '.join(server_cmd)}")
     # We capture stdout/stderr to debug crashes if they occur
-    server_process = subprocess.Popen(server_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    server_process = subprocess.Popen(
+        server_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
     try:
         # 2. Wait for the server to actually start (Health Check)
@@ -167,7 +175,12 @@ def benchmark_vllm_baseline():
         )
 
         # We allow stdout to print to the console so you can see the results
-        subprocess.run(bench_cmd, shell=True, cwd=PROJECT_ROOT, check=True)
+        subprocess.run(
+            bench_cmd,
+            shell=True,
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
 
     finally:
         print("\nTerminating vLLM server...")
@@ -219,7 +232,12 @@ def benchmark_sglang_baseline():
     ]
 
     print(f"Launching server: {' '.join(server_cmd)}")
-    server_process = subprocess.Popen(server_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    server_process = subprocess.Popen(
+        server_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
     try:
         # 2. Wait for the server to start (health check)
