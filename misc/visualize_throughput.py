@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Grouped bar graph comparing vLLM, SgLang, and Megakernels throughput (tokens/s) across GPUs."""
+"""Grouped bar graph comparing vLLM, SgLang, and Megakernels throughput (fwd/s) across GPUs."""
 
 import matplotlib
 
@@ -7,44 +7,12 @@ matplotlib.use("Agg")  # headless; no display required
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Throughput data (tokens/s)
-# ORIGINAL DATA:
-# data = {
-#     "H100": {
-#         "vLLM": [528.3286219400202, 543.9213663676006, 595.994130425175],
-#         "SgLang": [652.4172194758338, 651.894325088411, 617.707075474433],
-#         "Megakernel": [1016.25, 1004.35, 1004.60],
-#     },
-#     "B200": {
-#         "vLLM": [763.1435042131611, 765.1417427353231, 630.0018816914028],
-#         "SgLang": [777.8798011215572, 582.5545180470235, 708.0349989612283],
-#         "Megakernel": [1581.22, 1576.93, 1578.34],
-#     },
-# }
 
 data = {
     "H100": {
-        "Megakernel": [
-            1019.47,
-            1004.42,
-            1003.43,
-        ],
-        "SgLang": [
-            639.0071405915832,
-            646.5226525900517,
-            640.2277661920616,
-            651.1255211708208,
-            560.3324315235179,
-            652.2206265290728,
-        ],
-        "vLLM": [
-            619.2003165534729,
-            698.3169756290176,
-            622.462678936665,
-            584.8890062061128,
-            560.6378016560118,
-            696.0680788918768,
-        ],
+        "vLLM": [528.3286219400202, 543.9213663676006, 595.994130425175],
+        "SgLang": [652.4172194758338, 651.894325088411, 617.707075474433],
+        "Megakernel": [1016.25, 1004.35, 1004.60],
     },
     "B200": {
         "Megakernel": [
@@ -101,7 +69,7 @@ for i, method in enumerate(methods):
     )
     bars_by_method.append(bars)
 
-ax.set_ylabel("Tokens/s", fontsize=14, fontweight="bold")
+ax.set_ylabel("Fwd/s", fontsize=14, fontweight="bold")
 ax.set_xlabel("GPU", fontsize=16, fontweight="bold")
 ax.set_title(
     "Llama-1B (BF16) Batch-Size 1, Decoding Throughput",
