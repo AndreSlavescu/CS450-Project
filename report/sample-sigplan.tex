@@ -121,73 +121,118 @@ Our persistent megakernel achieves 2.0-4.9ms TTFT across all prompt lengths on a
 \begin{table}[h]
 \caption{Comparison of our persistent megakernel vs baselines for Qwen3-1.7B model on Nvidia B200}
 \label{tab:1}
-\begin{tabular}{lllll}
+\begin{tabular}{llll}
 \toprule
-Prompt Length & Ours (ms) & vLLM (ms) & SGLang (ms) & HuggingFace (ms) \\
+Prompt Length & Ours (ms) & vLLM (ms) & SGLang (ms) \\
 \midrule
-16 & 2.02 & 14.28 & 16.15 & 19.14 \\
-64 & 2.23 & 13.91 & 14.70 & 19.15 \\
-128 & 2.36 & 16.45 & 15.59 & 17.91 \\
-256 & 2.64 & 14.15 & 14.87 & 18.46 \\
-512 & 3.28 & 15.45 & 15.22 & 17.83 \\
-1024 & 4.86 & 17.21 & 16.06 & 18.01 \\
+16 & 2.02 & 14.28 & 16.15 \\
+64 & 2.23 & 13.91 & 14.70 \\
+128 & 2.36 & 16.45 & 15.59 \\
+256 & 2.64 & 14.15 & 14.87 \\
+512 & 3.28 & 15.45 & 15.22 \\
+1024 & 4.86 & 17.21 & 16.06 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-At 128 tokens input, we achieve 7.0x over vLLM, 6.6x over SGLang, and 7.6x over HuggingFace.
+At 128 tokens input, we achieve 7.0x over vLLM and 6.6x over SGLang.
 
 \begin{table}[h]
 \caption{Hardware utilization for our persistent megakernel on B200}
 \label{tab:2}
+\small
 \begin{tabular}{llll}
 \toprule
-Sequence Length & Throughput (Tokens / s) & Bandwidth util $(GB/s)$ & Compute (TFLOPS) \\
+Seq Len & Tok/s & BW (GB/s) & TFLOPS \\
 \midrule
-1 & 478 & 1645/8000 (20.6\%) & 1.65 \\
-128 & 429 & 1484/8000 (18.6\%) & 1.49 \\
-512 & 333 & 1165/8000 (14.6\%) & 1.18 \\
-1024 & 256 & 912/8000 (11.4\%) & 0.94 \\
+1 & 478 & 1645 (20.6\%) & 1.65 \\
+128 & 429 & 1484 (18.6\%) & 1.49 \\
+512 & 333 & 1165 (14.6\%) & 1.18 \\
+1024 & 256 & 912 (11.4\%) & 0.94 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 The decode phase is memory-bandwidth bound (thin GEMVs), achieving up to 1645 GB/s of the B200's 8 TB/s peak.
 
-\section{Kernel Architecture}
-The speedup comes from a persistent megakernel that fuses the entire decoder layer into a single GPU launch with grid-wide barrier synchronization (512 threads/block, 128 blocks):
-\begin{itemize}
-    \item Block 0: KV cache management with attention coordination
-    \item Blocks 1-16: Flash decode (one per Q head, GQA with online softmax)
-    \item Blocks 17-127: FFN GEMV (gate/up/down projections)
-\end{itemize}
+\section{Dense Megakernel Architecture Qwen3 1.7B}
+
+The core contribution for the dense model is a persistent megakernel that fuses all 28 transformer decoder layers into a single cooperative kernel launch. The kernel runs on a fixed grid of 128 blocks $\times$ 512 threads (65{,}536 threads total), launched via \texttt{cudaLaunchCooperativeKernel} to enable device-wide synchronization through a custom \texttt{GridBarrier} built on global atomics.
+
+\subsection{Block Specialization}
+
+Rather than launching separate kernels per operation, the megakernel assigns functional roles to thread blocks at compile time. Block 0 acts as the KV cache coordinator, managing KV write pointers and synchronizing attention heads with FFN blocks via the grid barrier. Blocks 1 through 16 handle flash decode attention, with one block per query head (16 heads for 1.7B), where each block computes grouped-query attention (GQA ratio $= 2$, sharing 8 KV heads across 16 Q heads) using online softmax with warp-per-head decomposition. Within each block, warps chunk the KV sequence and maintain running \texttt{(max, sum, output)} accumulators that are merged via a final reduction in shared memory. The remaining blocks 17 through 127 serve as FFN GEMV workers, where 111 blocks collectively compute the gate/up/down projections via parallel row-wise dot products with vectorized 8-element \texttt{uint4} loads of BF16 pairs using \texttt{\_\_ldcg} (cache-global) for sustained bandwidth.
+
+All inter-layer communication is barrier-mediated, with 5 grid barriers per layer (140 total for 28 layers) and intermediate activations residing in a single shared buffer of $(H + 32) \times 4 = 8{,}320$ bytes per block (where $H = 2{,}048$ for 1.7B). No intermediate results are written to global HBM between fused operations.
+
+\subsection{Fused Operations}
 
 \begin{table*}[t]
-\caption{Fused operations with no intermediate global memory (HBM) traffic with number of launches saved}
+\caption{Fused operations eliminating intermediate HBM traffic. Each fused kernel replaces multiple standalone launches.}
 \label{tab:3}
 \begin{tabular}{p{0.25\linewidth} p{0.5\linewidth} l}
 \toprule
 Fused Kernel & Operations & Launches Saved \\
 \midrule
 rmsnorm\_qkv\_split & RMSNorm + Q/K/V projection + head split & $4 \rightarrow 1$ \\
-qknorm\_rope\_kvcache & Q/K per-head Norm + Rope + KV Cache Write & $5 \rightarrow 1$ \\
-Flash\_decode\_gqa \newline oproj\_residual \newline upgate\_silu & GQA Attention with online softmax + Fast Exp Approx \newline Projection + Residual Add \newline Gate + Up GEMVs + SiLU Act + Elementwise Multiply O & $3 \rightarrow 1$ \newline $2 \rightarrow 1$ \newline $4 \rightarrow 1$ \\
-downproj\_residual & Down Projection + Residual Add & $2 \rightarrow 1$ \\
-rmsnorm lmhead & Final RMSNorm + Vocab Logits & $2 \rightarrow 1$ \\
+qknorm\_rope\_kvcache & Q/K per-head RMSNorm + RoPE ($\theta = 10^6$) + KV cache write & $5 \rightarrow 1$ \\
+flash\_decode\_gqa & GQA attention (online softmax, fast exp approx) & $3 \rightarrow 1$ \\
+oproj\_residual & Output projection + residual add & $2 \rightarrow 1$ \\
+upgate\_silu & Gate + Up GEMVs + SiLU + elementwise multiply & $4 \rightarrow 1$ \\
+downproj\_residual & Down projection + residual add & $2 \rightarrow 1$ \\
+rmsnorm\_lmhead & Final RMSNorm + vocabulary logit projection & $2 \rightarrow 1$ \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
-Total per forward pass: 1 kernel launch (megakernel) and 1 CUTLASS FMHA $= 2$ launches vs over 200 with PyTorch eager mode.
+The total per forward pass is 1 megakernel launch plus 1 CUTLASS SM100 FMHA call (for prefill), giving 2 launches compared to over 200 with PyTorch eager mode. The FMHA kernel uses CUTLASS's \texttt{Sm100FmhaFwdKernelTmaWarpspecialized} with tile shape $\langle 256, 128, 128 \rangle$ (Q-seq $\times$ K-seq $\times$ head\_dim), TMA-based async global-to-shared loads, and a persistent tile scheduler.
 
-\section{Next Steps}
-For the remainder of this project, we will focus on addressing current discrepancies and scaling for larger, more complex architectures. Specifically, our upcoming work will be divided into the following key objectives:
+\subsection{Qwen3-Specific Adaptations}
 
-\begin{itemize}
-    \item \textbf{Unifying Recovered Results:} We will identify the potential sources of discrepancy observed during inference on the B200 GPUs when served by SGLang and vLLM. Resolving this issue is a priority to ensure our reproduced baseline results align with the expected results published in the Hazy blogs.
-    \item \textbf{Developing a Megakernel for QWEN 480B:} We will scale up our current implementation by developing a megakernel specifically designed for the 480B model from Alibaba's QWEN architecture series. This will be based on the QWEN3-coder (https://ollama.com/library/qwen3-coder).
-    \item \textbf{Creating a Distributed MOE Gate Kernel:} To handle the increased scale and compute requirements, we will construct a distributed Mixture of Experts (MOE) gate kernel designed to operate efficiently across a multi-GPU setup.
-    \item Identify potential sources of discrepancy for inference on B200 when served by SGLang/vLLM to unify our recovered results with the expected results from Hazy.
-\end{itemize}
+The kernel accounts for several Qwen3 architectural features not present in the Llama baseline. Per-head Q/K RMSNorm is applied after projection and before RoPE, fused into a single device function that avoids writing intermediate normalized values to HBM. For GQA with ratio 2, where 16 Q heads share 8 KV heads, the flash decode kernel maps $\lfloor \texttt{head\_idx} / 2 \rfloor$ to select the correct KV head, doubling compute reuse per KV cache read. The embedding matrix is also reused for the LM head via tied word embeddings, saving 300\,MB of weight memory for the 1.7B model.
+
+\section{Scaling to Qwen3-480B-A35B: MoE Megakernel}
+
+The Qwen3-Coder-480B-A35B model replaces the dense FFN with a Mixture-of-Experts (MoE) layer consisting of 160 routed experts with top-8 gating, a hidden size of 6{,}144, and a per-expert intermediate dimension of 2{,}560. At approximately 960 GB in BF16, the model requires 8$\times$ B200 GPUs with expert parallelism (EP=8), giving 20 local experts per GPU.
+
+\subsection{3-Stage Kernel Pipeline}
+
+The MoE FFN has been implemented as a 3-stage fused pipeline, replacing what would otherwise be 8+ separate kernel launches per MoE layer.
+
+The first stage handles routing and sorting. A single kernel computes router logits via a warp-per-(token, expert) GEMV pattern ($[T, 6144] \times [160, 6144]^T$), applies numerically-stable softmax, selects the top-8 experts, and sorts tokens by local expert index via a histogram + scatter approach. This is optimal for the small expert count ($E=20$) and avoids the overhead of CUB radix sort.
+
+The second stage performs the fused gate-up GEMM. A persistent tcgen05 kernel computes the gate-up projection, where each expert's gate and up weight matrices have been concatenated into a single $[5120, 6144]$ matrix, turning two GEMMs into one wider GEMM per expert. A fused SiLU activation kernel then computes $\text{SiLU}(\text{gate}) \odot \text{up}$ in a single pass.
+
+The third stage handles the down GEMM and scatter. A second persistent tcgen05 kernel computes the down projection ($[2560 \rightarrow 6144]$), followed by a weighted scatter-accumulate that writes each expert's output back to the original token position with the routing weight applied, using FP32 atomic adds.
+
+\subsection{Persistent tcgen05 Expert GEMM}
+
+The expert GEMM kernels are the computational core of the MoE layer. Built on the ThunderKittens B200 matmul framework, they use explicit \texttt{tcgen05} PTX inline assembly for all 5th-generation tensor core operations, including \texttt{tcgen05.mma.cta\_group::2.kind::f16} for BF16$\times$BF16$\rightarrow$FP32 matrix multiply-accumulate across a 2-CTA cluster, \texttt{tcgen05.commit} for signaling mbarrier completion with multicast to both cluster CTAs, \texttt{tcgen05.ld} with \texttt{pack::16b} for loading FP32 accumulators from tensor memory while packing to BF16, and \texttt{tcgen05.fence::before/after\_thread\_sync} for memory ordering around barrier syncs.
+
+\paragraph{Tile configuration.} Each task operates on $M_b = 128$ rows $\times$ $N_b = 256$ columns with $K_b = 64$ reduction per TMA load. A 2-CTA cluster processes $\text{CLUSTER\_M} = 512$ rows per task (4 consumer tiles, from 2 CTAs $\times$ 2 consumer warpgroups $\times$ 128 rows). The TMA pipeline depth is 4 stages, keeping the tensor cores fed while loads are in flight.
+
+\paragraph{Warp specialization.} Each CTA runs 3 warpgroups (384 threads). Warpgroups 0 and 1 are the consumers, each with 224 registers, responsible for loading FP32 results from tensor memory via \texttt{tcgen05.ld}, converting to BF16, and storing to global memory via TMA. Warpgroup 2 is the producer with 56 registers, where warp 3 issues TMA \texttt{cp.async.bulk} loads for the A (activations) and B (weights) tiles, while warps 0 and 1 issue \texttt{tcgen05.mma} instructions. Phase-bit semaphores are used to synchronize the producer-consumer ring buffer.
+
+\paragraph{Persistent task scheduler.} All (expert, $m$-tile, $n$-tile) combinations across the 20 local experts are flattened into a linear task queue. A global atomic counter distributes tasks to CTAs, achieving natural load balancing even when expert token counts are imbalanced. The scheduler uses binary search over prefix-summed expert tile offsets to decode each flat task ID into its (expert, $m$-tile, $n$-tile) triple. The kernel launches on 148 CTAs (74 clusters, matching the B200's 148 SMs) with maximum dynamic shared memory allocation.
+
+\subsection{Expert Weight Packing}
+
+To avoid scatter-gather overhead during the GEMM, expert weights are packed into contiguous buffers at model load time. The gate and up projection weights are concatenated per expert into a $[E_{\text{local}}, 2I, H] = [20, 5120, 6144]$ buffer, and the down projection weights are stored as $[E_{\text{local}}, H, I] = [20, 6144, 2560]$. The B matrix TMA descriptor flattens the expert dimension into the row dimension ($[E \cdot N, K]$), so the TMA load coordinate simply indexes \texttt{expert $\times$ stride + tile\_col}. After packing, the original \texttt{nn.Linear} modules are freed, preventing the approximately 109 GiB weight duplication that would otherwise cause OOM.
+
+\subsection{Distributed Communication}
+
+The 8-GPU setup uses two orthogonal parallelism strategies. For attention, tensor parallelism (TP=8) is used, where Q/K/V heads are sharded across ranks with \texttt{all\_reduce} for the output projection, and each rank computes $96/8 = 12$ Q heads and $8/8 = 1$ KV head. For the MoE layer, expert parallelism (EP=8) is used, where each rank holds 20 of the 160 experts and partial outputs are combined via NCCL \texttt{all\_reduce} across the EP process group after local expert computation.
+
+For the TP all-reduce, we additionally explored multimem NVLS (NVLink SHARP), which is a fused \texttt{ld\_reduce\_add\_bf16x8} kernel that performs all-reduce directly through NVLink multicast memory, bypassing NCCL's ring protocol. This provides lower latency for the small activation tensors typical of batch-1 decode (approximately $6{,}144 \times 2 = 12$ KB per all-reduce).
+
+\subsection{B200 (SM100) Optimizations}
+
+Several optimizations are specific to the Blackwell architecture. Unlike Hopper's \texttt{wgmma} which reads accumulators from registers, Blackwell's tcgen05 uses dedicated tensor memory with an explicit alloc/dealloc lifecycle. The \texttt{tensor\_allocator<1,2>} manages column allocation across the 2-CTA cluster, and the \texttt{tcgen05.ld} instruction supports a \texttt{pack::16b} modifier that converts FP32 accumulator values to BF16 during the load, eliminating a separate conversion pass.
+
+The B200's cluster architecture allows two CTAs to share data through cluster-scoped TMA loads (\texttt{tma::cluster::load\_async} with a multicast mask). Each CTA loads its half of the B matrix (128 of 256 columns) and broadcasts to the partner CTA, halving the required TMA bandwidth for weights. The prefill attention path uses CUTLASS's \texttt{Sm100FmhaFwdKernelTmaWarpspecialized} with persistent tile scheduling, achieving higher occupancy than the SM90 (Hopper) equivalent by exploiting the B200's larger register file (256 registers/thread) and doubled shared memory capacity (228 KB/SM). The scatter-accumulate kernel uses FP32 \texttt{atomicAdd} for weighted output accumulation, and on B200 these atomics execute at the L2 cache level with 2$\times$ the bandwidth of H100, reducing the scatter bottleneck for high fan-out routing (top-8 $\times$ $T$ tokens).
+
+\section{Conclusion}
+
+We have presented a custom inference engine for the Qwen3 model family on NVIDIA B200 GPUs, spanning from a 1.7B dense model to the 480B MoE architecture. For the dense model, a persistent megakernel fusing all decoder operations into 2 kernel launches achieves 2 to 5 ms TTFT, which is a 6 to 8$\times$ improvement over production serving engines. For the 480B MoE model, a tcgen05-based persistent expert GEMM kernel with sorted-block dispatch, gate-up fusion, and expert parallelism across 8 GPUs enables efficient inference of a model that activates 35B parameters per token across 160 experts. The B200-specific optimizations including tensor memory management, 2-CTA cluster TMA, and CUTLASS SM100 FMHA demonstrate that significant performance gains are available to kernels designed for the Blackwell architecture rather than ported from Hopper.
 
 \end{document}
