@@ -1,0 +1,193 @@
+%% The first command in your LaTeX source must be the \documentclass command.
+\documentclass[sigplan,screen]{acmart}
+
+%% \BibTeX command to typeset BibTeX logo in the docs
+\AtBeginDocument{%
+  \providecommand\BibTeX{{%
+    Bib\TeX}}}
+
+%% Rights management information.
+\setcopyright{none}
+\copyrightyear{2026}
+\acmYear{2026}
+\acmDOI{}
+
+%% These commands are for a PROCEEDINGS abstract or paper.
+\acmConference[CS 450]{}{March 5, 2026}{}
+\acmISBN{}
+
+%%
+%% end of the preamble, start of the body of the document source.
+\begin{document}
+
+%%
+%% The "title" command has an optional parameter,
+%% allowing the author to define a "short title" to be used in page headers.
+\title{Checkpoint Report CS 450}
+
+%%
+%% The "author" command and its associated commands are used to define
+%% the authors and their affiliations.
+\author{Andy Cheng}
+\authornote{21232618}
+\affiliation{%
+  \institution{University of Waterloo}
+  \country{Canada}
+}
+
+\author{Mischa Lamoureux}
+\authornote{20938543}
+\affiliation{%
+  \institution{University of Waterloo}
+  \country{Canada}
+}
+
+\author{Jatin Mehta}
+\authornote{20940224}
+\affiliation{%
+  \institution{University of Waterloo}
+  \country{Canada}
+}
+
+\author{Bilal Nasar}
+\authornote{20944062}
+\affiliation{%
+  \institution{University of Waterloo}
+  \country{Canada}
+}
+
+\author{Rishabh Sharma}
+\authornote{20941002}
+\affiliation{%
+  \institution{University of Waterloo}
+  \country{Canada}
+}
+
+\author{Andre Slavescu}
+\authornote{20942887}
+\affiliation{%
+  \institution{University of Waterloo}
+  \country{Canada}
+}
+
+%%
+%% By default, the full list of authors will be used in the page
+%% headers. Often, this list is too long, and will overlap
+%% other information printed in the page headers. This command allows
+%% the author to define a more concise list
+%% of authors' names for this purpose.
+\renewcommand{\shortauthors}{Cheng et al.}
+
+%%
+%% This command processes the author and affiliation and title
+%% information and builds the first part of the formatted document.
+\maketitle
+
+\noindent \textbf{Date:} March 5, 2026
+
+\section{Current Progress}
+The project infrastructure has been fully established, including compute access via Modal for both NVIDIA H100 (sm\_90a) and B200 (sm\_100a) GPUs, GPU-specific Docker images, and a JIT compilation pipeline. The Hazy Research megakernel baseline for Llama-1B has been successfully reproduced on both H100 and B200, providing a reference point for performance comparison.
+
+All eight fused CUDA operations comprising a complete Qwen3-1.7B forward pass have been implemented and verified for numerical correctness against HuggingFace reference outputs on B200, with all operations passing below 7e-6 maximum difference. These operations span the full transformed decode path: RMSNorm, QKV projection with per-head Q/K RMSNorm and ROPE, flash attention with group query attention, attention reduction output projection with residual, up/gate projection with SiLU, down projection with residual, and a final RMSNorm fused with the LM head.
+
+The kernels account for Qwen3-specific architectural features not present in Llama, including per-head Q/K RMSNorm, a 2:1 GQA ratio, and tied word embeddings. A persistent megakernel decoder fuses all eight operations into a signal-kernel inference engine with token-level correctness validated against HuggingFace model.generate(). A benchmarking harness measures TTFT and decode throughput against Hugging Face Transformers, vLLM, and SGLang. A custom GPU profiler with Perfetto trace export enables fine-grained kernel analysis. A Qwen3 model loader has been integrated into the HazyResearch megakernel framework with tensor-parallel-aware weight mapping. Preliminary MoE megakernel work has begun, with CUDA kernels for expert routing and computation implemented targeting the Qwen3-480B-A35B architecture, along with test and benchmarking infrastructure.
+
+\section{Key Results}
+
+\subsection{Baseline Reproduction}
+
+
+Reproduction of performance improvements of the Hazy megakernel, as presented in their blogs have been mostly successful. Reproduction was conducted using the H100s and B200s provided through the Modal cloud computing platform and invoking the benchmarking scripts as provided by the original authors, with minimal changes for code execution and environment compatibility. Figures describing our recovered results can be seen above, where similar results have been reproduced for the H100, while we note significant differences for B200s for when the inference is served using SGLang/vLLLM, which remains to be figured out. A final note is that Token/s in our figure are synonymous with Forward Passes (Fwd)/s with that of Hazy's.
+
+\begin{figure}[h]
+  \centering
+  % Replace 'figure1.png' with your actual uploaded file name
+  \includegraphics[width=\linewidth]{figure1.jpg}
+  \caption{Reproduced baseline and mega-kernel results on both H100 and B200. Each bar graph is mean token/s over 3 iterations.}
+  \label{fig:1}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  % Replace 'figure2.png' with your actual uploaded file name
+  \includegraphics[width=\linewidth]{figure2.jpg}
+  \caption{Baseline results from the blog}
+  \label{fig:2}
+\end{figure}
+
+\subsection{Qwen3-1.7B}
+Our persistent megakernel achieves 2.0-4.9ms TTFT across all prompt lengths on a single B200, compared to 14-19ms for production serving engines.
+
+\begin{table}[h]
+\caption{Comparison of our persistent megakernel vs baselines for Qwen3-1.7B model on Nvidia B200}
+\label{tab:1}
+\begin{tabular}{lllll}
+\toprule
+Prompt Length & Ours (ms) & vLLM (ms) & SGLang (ms) & HuggingFace (ms) \\
+\midrule
+16 & 2.02 & 14.28 & 16.15 & 19.14 \\
+64 & 2.23 & 13.91 & 14.70 & 19.15 \\
+128 & 2.36 & 16.45 & 15.59 & 17.91 \\
+256 & 2.64 & 14.15 & 14.87 & 18.46 \\
+512 & 3.28 & 15.45 & 15.22 & 17.83 \\
+1024 & 4.86 & 17.21 & 16.06 & 18.01 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At 128 tokens input, we achieve 7.0x over vLLM, 6.6x over SGLang, and 7.6x over HuggingFace.
+
+\begin{table}[h]
+\caption{Hardware utilization for our persistent megakernel on B200}
+\label{tab:2}
+\begin{tabular}{llll}
+\toprule
+Sequence Length & Throughput (Tokens / s) & Bandwidth util $(GB/s)$ & Compute (TFLOPS) \\
+\midrule
+1 & 478 & 1645/8000 (20.6\%) & 1.65 \\
+128 & 429 & 1484/8000 (18.6\%) & 1.49 \\
+512 & 333 & 1165/8000 (14.6\%) & 1.18 \\
+1024 & 256 & 912/8000 (11.4\%) & 0.94 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The decode phase is memory-bandwidth bound (thin GEMVs), achieving up to 1645 GB/s of the B200's 8 TB/s peak.
+
+\section{Kernel Architecture}
+The speedup comes from a persistent megakernel that fuses the entire decoder layer into a single GPU launch with grid-wide barrier synchronization (512 threads/block, 128 blocks):
+\begin{itemize}
+    \item Block 0: KV cache management with attention coordination
+    \item Blocks 1-16: Flash decode (one per Q head, GQA with online softmax)
+    \item Blocks 17-127: FFN GEMV (gate/up/down projections)
+\end{itemize}
+
+\begin{table*}[t]
+\caption{Fused operations with no intermediate global memory (HBM) traffic with number of launches saved}
+\label{tab:3}
+\begin{tabular}{p{0.25\linewidth} p{0.5\linewidth} l}
+\toprule
+Fused Kernel & Operations & Launches Saved \\
+\midrule
+rmsnorm\_qkv\_split & RMSNorm + Q/K/V projection + head split & $4 \rightarrow 1$ \\
+qknorm\_rope\_kvcache & Q/K per-head Norm + Rope + KV Cache Write & $5 \rightarrow 1$ \\
+Flash\_decode\_gqa \newline oproj\_residual \newline upgate\_silu & GQA Attention with online softmax + Fast Exp Approx \newline Projection + Residual Add \newline Gate + Up GEMVs + SiLU Act + Elementwise Multiply O & $3 \rightarrow 1$ \newline $2 \rightarrow 1$ \newline $4 \rightarrow 1$ \\
+downproj\_residual & Down Projection + Residual Add & $2 \rightarrow 1$ \\
+rmsnorm lmhead & Final RMSNorm + Vocab Logits & $2 \rightarrow 1$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Total per forward pass: 1 kernel launch (megakernel) and 1 CUTLASS FMHA $= 2$ launches vs over 200 with PyTorch eager mode.
+
+\section{Next Steps}
+For the remainder of this project, we will focus on addressing current discrepancies and scaling for larger, more complex architectures. Specifically, our upcoming work will be divided into the following key objectives:
+
+\begin{itemize}
+    \item \textbf{Unifying Recovered Results:} We will identify the potential sources of discrepancy observed during inference on the B200 GPUs when served by SGLang and vLLM. Resolving this issue is a priority to ensure our reproduced baseline results align with the expected results published in the Hazy blogs.
+    \item \textbf{Developing a Megakernel for QWEN 480B:} We will scale up our current implementation by developing a megakernel specifically designed for the 480B model from Alibaba's QWEN architecture series. This will be based on the QWEN3-coder (https://ollama.com/library/qwen3-coder).
+    \item \textbf{Creating a Distributed MOE Gate Kernel:} To handle the increased scale and compute requirements, we will construct a distributed Mixture of Experts (MOE) gate kernel designed to operate efficiently across a multi-GPU setup.
+    \item Identify potential sources of discrepancy for inference on B200 when served by SGLang/vLLM to unify our recovered results with the expected results from Hazy.
+\end{itemize}
+
+\end{document}
