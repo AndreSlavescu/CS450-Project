@@ -78,12 +78,21 @@
 %% of authors' names for this purpose.
 \renewcommand{\shortauthors}{Cheng et al.}
 
+\begin{abstract}
+Running large language models (LLMs) in single-sequence settings can be difficult because modern inference engines break the forward pass of a transformer into hundreds of small GPU kernels. Each kernel introduces overhead, which includes launch latency, synchronization, and unnecessary round-trips to global memory, all of which stall the GPU and waste memory bandwidth. Hazy Research recently showed that fusing an entire Llama-1B forward pass into a single \textit{megakernel} eliminates these pipeline bubbles and outperforms popular serving engines like vLLM and SGLang by over 1.5x on an Nvidia H100 GPU. We build on this idea in two ways: extending it to the Qwen3 model family to explore the generalizability of the megakernel approach, and optimizing specifically for Nvidia's newer Blackwell B200 GPU.
+
+For the Qwen3-1.7B model, we fuse all 28 decoder layers into a single kernel launch, handling Qwen3-specific features like per-head query/key normalization, grouped-query attention (GQA), and tied word embeddings. On a B200, this achieves 2.0-4.9 ms time-to-first-token (TTFT) across prompt lengths of 16-1024 tokens, which is a 6x improvement over vLLM and SGLang. We also scale the approach to Qwen3-480B-A35B, a 160-expert Mixture-of-Experts (MoE) model, with a fused 3-stage pipeline across 8 B200s using Blackwell-native tensor core and memory instructions. Our results show that the megakernel paradigm generalizes well beyond Llama-style architectures, and that designing kernels specifically for Blackwell, rather than porting from the older Hopper (H100) architecture, is key to squeezing out the most performance from modern hardware.
+\end{abstract}
+
+
 %%
 %% This command processes the author and affiliation and title
 %% information and builds the first part of the formatted document.
 \maketitle
 
 \noindent \textbf{Date:} March 5, 2026
+
+
 
 \section{Current Progress}
 The project infrastructure has been fully established, including compute access via Modal for both NVIDIA H100 (sm\_90a) and B200 (sm\_100a) GPUs, GPU-specific Docker images, and a JIT compilation pipeline. The Hazy Research megakernel baseline for Llama-1B has been successfully reproduced on both H100 and B200, providing a reference point for performance comparison.
