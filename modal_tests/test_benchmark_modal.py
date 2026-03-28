@@ -88,7 +88,6 @@ else:
 
 @dataclass(frozen=True)
 class ModelConfig:
-
     name: str
     hf_id: str
     hidden_size: int
@@ -135,7 +134,7 @@ BENCH_ITERS = 20
 BENCH_SEQ_LENS = [1, 32, 128, 512, 1024]
 BENCH_PROMPT = "The quick brown fox jumps over the lazy dog"
 KERNEL_BENCH_SEQ_LENS = [1024, 2048, 4096, 8192, 16384, 32768]
-KERNEL_DEFAULTS = ("fa4", "fa4_lse", "sdpa", "sdpa_math", "zigzag_local")
+KERNEL_DEFAULTS = ("fmha", "fmha_lse", "sdpa", "sdpa_math", "zigzag_local")
 TTFT_PROMPT_LENS = [16, 64, 128, 256, 512, 1024]
 _TTFT_BASE = "The quick brown fox jumps over the lazy dog. "
 
@@ -370,10 +369,10 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
     from torch.utils.cpp_extension import load
 
     kernels_dir = "/workspace/src/csrc/kernels"
-    need_fa4 = any(k in kernels for k in ("fa4", "fa4_lse", "fa4_profile", "fa4_nocausal"))
+    need_fmha = any(k in kernels for k in ("fmha", "fmha_lse", "fmha_profile", "fmha_nocausal"))
     need_zigzag = "zigzag_local" in kernels
 
-    if not (need_fa4 or need_zigzag):
+    if not (need_fmha or need_zigzag):
         return None, None
 
     arch_flags = ["-arch=sm_90a"] if gpu.lower() == "h100" else ["-gencode=arch=compute_100a,code=sm_100a"]
@@ -402,9 +401,9 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
     fmha_attention = None
     zigzag_attention = None
 
-    if need_fa4:
-        fa4_build_dir = "/tmp/torch_ext_fmha_attention_bench"
-        os.makedirs(fa4_build_dir, exist_ok=True)
+    if need_fmha:
+        fmha_build_dir = "/tmp/torch_ext_fmha_attention_bench"
+        os.makedirs(fmha_build_dir, exist_ok=True)
         fmha_attention = load(
             name=f"fmha_attention_bench_{gpu.lower()}",
             sources=[os.path.join(kernels_dir, "fmha_attention.cu")],
@@ -414,7 +413,7 @@ def _build_attention_kernel_modules(gpu: str, kernels: list[str]):
             extra_ldflags=["-lcuda"],
             verbose=True,
             with_cuda=True,
-            build_directory=fa4_build_dir,
+            build_directory=fmha_build_dir,
         )
 
     if need_zigzag:
@@ -460,8 +459,8 @@ def _run_attention_kernels_benchmark(
     gpu: str,
     warmup_iters: int,
     bench_iters: int,
-    fa4_block_q: int = 0,
-    fa4_dual_cta: bool = False,
+    fmha_block_q: int = 0,
+    fmha_dual_cta: bool = False,
 ) -> dict:
     import json
     import os
@@ -478,15 +477,15 @@ def _run_attention_kernels_benchmark(
     torch.manual_seed(0)
     scale = 1.0 / (cfg.head_dim**0.5)
 
-    valid_kernels = set(KERNEL_DEFAULTS) | {"fa4_profile", "fa4_nocausal"}
+    valid_kernels = set(KERNEL_DEFAULTS) | {"fmha_profile", "fmha_nocausal"}
     invalid = [k for k in kernels if k not in valid_kernels]
     if invalid:
         raise ValueError(f"Unknown kernels requested: {invalid}. Valid: {sorted(valid_kernels)}")
-    if any(k in kernels for k in ("fa4", "fa4_lse", "fa4_profile", "fa4_nocausal")):
-        if fa4_block_q not in (0, 64, 128):
-            raise ValueError(f"fa4_block_q must be 0 (auto), 64, or 128, got {fa4_block_q}")
-        os.environ["FA4_BLOCK_Q"] = str(fa4_block_q)
-        os.environ["FA4_DUAL_CTA"] = "1" if fa4_dual_cta else "0"
+    if any(k in kernels for k in ("fmha", "fmha_lse", "fmha_profile", "fmha_nocausal")):
+        if fmha_block_q not in (0, 64, 128):
+            raise ValueError(f"fmha_block_q must be 0 (auto), 64, or 128, got {fmha_block_q}")
+        os.environ["FMHA_BLOCK_Q"] = str(fmha_block_q)
+        os.environ["FMHA_DUAL_CTA"] = "1" if fmha_dual_cta else "0"
 
     fmha_attention, zigzag_attention = _build_attention_kernel_modules(gpu, kernels)
 
@@ -529,27 +528,27 @@ def _run_attention_kernels_benchmark(
             trace_path = None
             local_warmup_iters = warmup_iters
             local_bench_iters = bench_iters
-            if kernel_name == "fa4_profile":
-                trace_path = f"/tmp/fa4_profile_{gpu.lower()}_seq{seq_len}.json"
+            if kernel_name == "fmha_profile":
+                trace_path = f"/tmp/fmha_profile_{gpu.lower()}_seq{seq_len}.json"
                 local_warmup_iters = 0
                 local_bench_iters = 1
 
             def _run_once():
-                if kernel_name == "fa4":
+                if kernel_name == "fmha":
                     if fmha_attention is None:
-                        raise RuntimeError("fa4 module not built")
+                        raise RuntimeError("fmha module not built")
                     return fmha_attention.forward(Q, K, V, scale, True, False, 0, 0, False, "")[0]
-                if kernel_name == "fa4_lse":
+                if kernel_name == "fmha_lse":
                     if fmha_attention is None:
-                        raise RuntimeError("fa4 module not built")
+                        raise RuntimeError("fmha module not built")
                     return fmha_attention.forward(Q, K, V, scale, True, True, 0, 0, False, "")[0]
-                if kernel_name == "fa4_nocausal":
+                if kernel_name == "fmha_nocausal":
                     if fmha_attention is None:
-                        raise RuntimeError("fa4 module not built")
+                        raise RuntimeError("fmha module not built")
                     return fmha_attention.forward(Q, K, V, scale, False, False, 0, 0, False, "")[0]
-                if kernel_name == "fa4_profile":
+                if kernel_name == "fmha_profile":
                     if fmha_attention is None:
-                        raise RuntimeError("fa4 module not built")
+                        raise RuntimeError("fmha module not built")
                     return fmha_attention.forward(Q, K, V, scale, True, True, 0, 0, True, trace_path)[0]
                 if kernel_name == "sdpa":
                     return F.scaled_dot_product_attention(Q_b, K_b, V_b, is_causal=True, enable_gqa=True).squeeze(0)
@@ -584,7 +583,7 @@ def _run_attention_kernels_benchmark(
             median_ms = times_ms_sorted[len(times_ms_sorted) // 2]
             min_ms = times_ms_sorted[0]
 
-            is_causal_kernel = kernel_name not in ("fa4_nocausal",)
+            is_causal_kernel = kernel_name not in ("fmha_nocausal",)
             theory = _attention_theoretical_metrics(cfg, seq_len, causal=is_causal_kernel)
             achieved_tflops = theory["flops"] / (mean_ms / 1000.0) / 1e12
             achieved_bw_gb_s = theory["bytes"] / (mean_ms / 1000.0) / 1e9
@@ -592,14 +591,14 @@ def _run_attention_kernels_benchmark(
 
             max_abs = None
             mean_abs = None
-            if kernel_name not in ("sdpa", "fa4_nocausal") and out is not None:
+            if kernel_name not in ("sdpa", "fmha_nocausal") and out is not None:
                 diff = (out.float() - ref_out.float()).abs()
                 max_abs = diff.max().item()
                 mean_abs = diff.mean().item()
 
             trace_json = None
             trace_event_count = None
-            if kernel_name == "fa4_profile" and trace_path and os.path.exists(trace_path):
+            if kernel_name == "fmha_profile" and trace_path and os.path.exists(trace_path):
                 with open(trace_path) as f:
                     trace_json = json.load(f)
                 trace_event_count = len(trace_json.get("traceEvents", []))
@@ -1274,11 +1273,11 @@ def run_attention_kernels_benchmark(
     gpu: str,
     warmup_iters: int = WARMUP_ITERS,
     bench_iters: int = BENCH_ITERS,
-    fa4_block_q: int = 0,
-    fa4_dual_cta: bool = False,
+    fmha_block_q: int = 0,
+    fmha_dual_cta: bool = False,
 ) -> dict:
     return _run_attention_kernels_benchmark(
-        model_cfg, seq_lens, kernels, gpu, warmup_iters, bench_iters, fa4_block_q, fa4_dual_cta
+        model_cfg, seq_lens, kernels, gpu, warmup_iters, bench_iters, fmha_block_q, fmha_dual_cta
     )
 
 
@@ -1375,9 +1374,9 @@ def _print_kernel_table(
     data = kernel_results.get("results", {})
     kernels = kernel_results.get("kernels", list(KERNEL_DEFAULTS))
 
-    print(f"\n{'='*90}")
+    print(f"\n{'=' * 90}")
     print(f"KERNEL MICROBENCH RESULTS ({model_cfg.name} on {gpu_name})")
-    print(f"{'='*90}")
+    print(f"{'=' * 90}")
     print(f"Kernels: {kernels}")
     for seq_len in seq_lens:
         rows = data.get(seq_len) or data.get(str(seq_len))
@@ -1572,8 +1571,8 @@ def main(
     warmup_iters: int = WARMUP_ITERS,
     bench_iters: int = BENCH_ITERS,
     kernel_seq_lens: str = "",
-    fa4_block_q: int = 0,
-    fa4_dual_cta: bool = False,
+    fmha_block_q: int = 0,
+    fmha_dual_cta: bool = False,
 ):
     import json
     import time
@@ -1619,10 +1618,10 @@ def main(
     if mode == "kernels":
         print(f"  Kernels: {requested_kernels}")
         print(f"  Sequence lengths: {selected_kernel_seq_lens}")
-        if any(k in requested_kernels for k in ("fa4", "fa4_lse", "fa4_profile")):
-            block_q_label = "auto" if fa4_block_q == 0 else str(fa4_block_q)
-            print(f"  FA4 block_q: {block_q_label}")
-            print(f"  FA4 dual_cta: {fa4_dual_cta}")
+        if any(k in requested_kernels for k in ("fmha", "fmha_lse", "fmha_profile")):
+            block_q_label = "auto" if fmha_block_q == 0 else str(fmha_block_q)
+            print(f"  FMHA block_q: {block_q_label}")
+            print(f"  FMHA dual_cta: {fmha_dual_cta}")
     else:
         print(f"  Sequence lengths: {BENCH_SEQ_LENS}")
     print(f"  Warmup: {warmup_iters}, Bench: {bench_iters} iterations")
@@ -1633,9 +1632,9 @@ def main(
     model_slug = model.replace("-", "_").replace(".", "_")
 
     if mode == "kernels":
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("Running Attention Kernel Microbenchmarks...")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         kernel_results = run_attention_kernels_benchmark.remote(
             asdict(model_cfg),
             selected_kernel_seq_lens,
@@ -1643,8 +1642,8 @@ def main(
             gpu,
             warmup_iters,
             bench_iters,
-            fa4_block_q,
-            fa4_dual_cta,
+            fmha_block_q,
+            fmha_dual_cta,
         )
         _print_kernel_table(model_cfg, gpu_name, gpu_config, kernel_results, selected_kernel_seq_lens)
 
@@ -1678,30 +1677,30 @@ def main(
         trace_dir = PROJECT_ROOT / "src" / "csrc" / "profiler" / "traces"
         trace_dir.mkdir(parents=True, exist_ok=True)
         for seq_len, seq_rows in kernel_results.get("results", {}).items():
-            row = seq_rows.get("fa4_profile")
+            row = seq_rows.get("fmha_profile")
             if not row:
                 continue
             trace_json = row.get("trace_json")
             if not trace_json:
                 continue
-            trace_path = trace_dir / f"trace_fa4_{gpu}_seq{seq_len}.json"
+            trace_path = trace_dir / f"trace_fmha_{gpu}_seq{seq_len}.json"
             with open(trace_path, "w") as f:
                 json.dump(trace_json, f, indent=2)
             n_events = len(trace_json.get("traceEvents", []))
-            print(f"Saved FA4 pipeline trace ({n_events} events) to {trace_path}")
+            print(f"Saved FMHA pipeline trace ({n_events} events) to {trace_path}")
 
         return
 
     model_cfg_dict = asdict(model_cfg)
 
     if mode == "megakernel":
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("Running Megakernel Benchmark (compile + decode only)...")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         mega_results = run_megakernel_benchmark.remote(model_cfg_dict, BENCH_SEQ_LENS, warmup_iters, bench_iters)
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("MEGAKERNEL RESULTS")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         mega_data = mega_results.get("results", {})
         print(f"{'seq_len':>8} {'mean_ms':>10} {'tok/s':>8} {'TFLOPS':>9} {'BW GB/s':>10}")
         print("-" * 55)
@@ -1716,10 +1715,10 @@ def main(
 
     if mode == "vm":
         vm_seq_lens = [1, 64, 256, 1024, 2048]
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f"VM Kernel A/B Benchmark: {model_cfg.name} on {gpu_name}")
         print(f"Seq lengths: {vm_seq_lens}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         vm_results = run_vm_benchmark.remote(model_cfg_dict, vm_seq_lens, warmup_iters, bench_iters)
 
         correct = vm_results.get("correctness_match", "N/A")
@@ -1728,7 +1727,7 @@ def main(
         vm_data = vm_results.get("results", {})
         peak_bw_gb_s = gpu_config["peak_bandwidth_tb_s"] * 1000
 
-        print(f"\n{'='*90}")
+        print(f"\n{'=' * 90}")
         print(
             f"{'seq_len':>8} {'baseline':>10} {'VM':>10} {'speedup':>8}"
             f" {'BL BW':>10} {'VM BW':>10} {'BL util':>8} {'VM util':>8}"
@@ -1749,7 +1748,7 @@ def main(
                 f"{sl:>8} {bl_ms:>9.3f}ms {vm_ms:>9.3f}ms {sp:>7.2f}x"
                 f" {bl_bw:>9.0f} {vm_bw:>9.0f} {bl_util:>7.1f}% {vm_util:>7.1f}%"
             )
-        print(f"{'='*90}")
+        print(f"{'=' * 90}")
 
         results_path = ref_dir / f"vm_benchmark_{model_slug}_{gpu}_{timestamp}.json"
         with open(results_path, "w") as f:
@@ -1758,10 +1757,10 @@ def main(
         return
 
     if mode == "ttft":
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f"TTFT Benchmark: {model_cfg.name} on {gpu_name}")
         print(f"Prompt lengths: {TTFT_PROMPT_LENS}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         ttft_handle = run_ttft_benchmark.spawn(model_cfg_dict, TTFT_PROMPT_LENS, warmup_iters, bench_iters)
         vllm_handle = None
@@ -1795,9 +1794,9 @@ def main(
                 backends_data[backend] = timings
         active_backends = [b for b in backends_data if backends_data[b]]
 
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("TTFT RESULTS (mean ms, lower is better)")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         print(f"{'prompt_len':>10}", end="")
         for b in active_backends:
@@ -1825,7 +1824,7 @@ def main(
                         print(f"  {'N/A':>12}", end="")
             print()
 
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         results_path = ref_dir / f"ttft_{model_slug}_{gpu}_{timestamp}.json"
         with open(results_path, "w") as f:
@@ -1833,9 +1832,9 @@ def main(
         print(f"\nTTFT results saved to {results_path}")
         return
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"Theoretical Analysis: {model_cfg.name} (per decode step, batch=1, bf16)")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     print(f"{'seq_len':>8} {'GFLOP':>10} {'GB traffic':>12} {'AI (F/B)':>10} {'Regime':>15}")
     print("-" * 70)
     ridge_point = gpu_config["peak_tflops_bf16"] * 1e12 / (gpu_config["peak_bandwidth_tb_s"] * 1e12)
@@ -1849,19 +1848,19 @@ def main(
         )
     print(f"  Ridge point (FLOP/byte): {ridge_point:.1f}")
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("Running HF Baseline Benchmark...")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     hf_results = run_hf_benchmark.remote(model_cfg_dict, BENCH_SEQ_LENS, WARMUP_ITERS, BENCH_ITERS)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("Running Megakernel Benchmark...")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     mega_results = run_megakernel_benchmark.remote(model_cfg_dict, BENCH_SEQ_LENS, WARMUP_ITERS, BENCH_ITERS)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("BENCHMARK RESULTS")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
     actual_seq_lens = []
     hf_data = hf_results.get("results", {})

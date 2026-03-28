@@ -111,9 +111,9 @@ def _worker(rank: int, world_size: int, results_dict: dict):
     )
 
     if rank == 0:
-        print(f"\n{'='*60}", flush=True)
+        print(f"\n{'=' * 60}", flush=True)
         print(f"Distributed Qwen3-1.7B  TP={world_size}  batch=1  greedy", flush=True)
-        print(f"{'='*60}", flush=True)
+        print(f"{'=' * 60}", flush=True)
 
     # ── correctness check ──
     if rank == 0:
@@ -191,9 +191,9 @@ def _worker(rank: int, world_size: int, results_dict: dict):
 
     # ── TTFT benchmark: batched prefill, measuring time to first token ──
     if rank == 0:
-        print(f"\n{'─'*60}")
+        print(f"\n{'─' * 60}")
         print(f"{'Prompt len':>12} {'TTFT (ms)':>12} {'Prefill tok/s':>14}")
-        print(f"{'─'*60}")
+        print(f"{'─' * 60}")
 
     base_text = "The quick brown fox jumps over the lazy dog. "
     ttft_results = {}
@@ -237,8 +237,8 @@ def _worker(rank: int, world_size: int, results_dict: dict):
 
     # ── decode throughput: tokens/sec after prefill ──
     if rank == 0:
-        print(f"\n{'─'*60}")
-        print(f"Decode throughput ({GEN_TOKENS} tokens, prefill={len(ids)-1})")
+        print(f"\n{'─' * 60}")
+        print(f"Decode throughput ({GEN_TOKENS} tokens, prefill={len(ids) - 1})")
 
     dec.reset()
     if len(ids) > 1:
@@ -293,16 +293,16 @@ def _worker(rank: int, world_size: int, results_dict: dict):
     # ── single-GPU megakernel baseline (rank 0 only) ──
     mk_results = {}
     if rank == 0:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Single-GPU megakernel baseline (rank 0)")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         from src.python.Qwen3.decoder import Decoder as SingleDecoder
 
         single_dec = SingleDecoder(verbose=False)
 
         print(f"\n{'Prompt len':>12} {'TTFT (ms)':>12} {'Prefill tok/s':>14}")
-        print(f"{'─'*60}")
+        print(f"{'─' * 60}")
 
         for plen in TTFT_PROMPT_LENS:
             prompt_text = (base_text * ((plen // 10) + 1))[: plen * 5]
@@ -382,11 +382,11 @@ def _worker(rank: int, world_size: int, results_dict: dict):
         torch.cuda.empty_cache()
 
         # ── summary ──
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Summary: TP={world_size} distributed vs single-GPU megakernel")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"{'Prompt':>8} {'1-GPU (ms)':>12} {'TP{} (ms)'.format(world_size):>12} {'Speedup':>10}")
-        print(f"{'─'*60}")
+        print(f"{'─' * 60}")
         for plen in TTFT_PROMPT_LENS:
             if plen in mk_results and plen in ttft_results:
                 sg = mk_results[plen]["mean_ms"]

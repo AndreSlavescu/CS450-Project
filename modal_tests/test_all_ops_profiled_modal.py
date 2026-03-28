@@ -192,6 +192,5 @@ def main(gpu: str = "b200"):
     print("\nResults:")
     for label, r in results.items():
         print(
-            f"  {label:15s}: {r['time_custom_ms']:.4f}ms "
-            f"({r['speedup']:.2f}x speedup, {r['bandwidth_gb_s']:.1f} GB/s)"
+            f"  {label:15s}: {r['time_custom_ms']:.4f}ms ({r['speedup']:.2f}x speedup, {r['bandwidth_gb_s']:.1f} GB/s)"
         )

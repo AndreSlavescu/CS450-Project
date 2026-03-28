@@ -1,0 +1,18 @@
+The final report will be at least 4 pages, with the following format:
+
+Letter page: 8.5 ✕ 11 inches.
+The main body in font size 10.
+Single-spaced.
+2-column.
+Page margins 1 inch.
+The recommended ACM template is available on Overleaf (in LaTeX). The same template is also available in Word. Relevant references should be included in the report. The final report will look like a conference paper, with the following sections:
+
+Abstract: a one- or two-paragraph summary of the whole project.
+Introduction: a longer summary of the project that covers the background, prior research works, high-level ideas of this project, and the key results.
+Background and Motivation: Describe any background knowledge the audience needs to know before going to your project. Highlight why the research problem is important, and why existing work your project is based on is insufficient, i.e., its weaknesses.
+High-level Ideas: Describe the high-level ideas and designs of the project.
+Implementation/mechanism: expand the ideas and describe the implementation details.
+Evaluation: Describe the evaluation methodology (simulated/real system of the evaluation, software environment, etc.) and the results.
+Conclusion: Conclude the project by reiterating the research problem and contributions of this project.
+References: References should be included at the end of the documents (at least 5 references).
+Tips: The research paper your project is based on is usually a good example of a research report. Usually, a research paper is much longer than this project report but the structures are largely the same.

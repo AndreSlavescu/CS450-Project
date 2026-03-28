@@ -38,6 +38,20 @@ ALL_NVCCFLAGS = $(BASE_NVCCFLAGS) $(NVCCFLAGS)
 EXT_SUFFIX = $(shell python3-config --extension-suffix)
 TARGETS = tp_sp$(EXT_SUFFIX) fmha_attention$(EXT_SUFFIX) zigzag_attention$(EXT_SUFFIX)
 
+# ThunderKittens include paths (for tcgen05 MoE kernel)
+ifdef THUNDERKITTENS_ROOT
+TK_INCLUDES = -I$(THUNDERKITTENS_ROOT)/include -I$(MEGAKERNELS_ROOT)/include
+else ifdef MEGAKERNELS_ROOT
+TK_INCLUDES = -I$(MEGAKERNELS_ROOT)/ThunderKittens/include -I$(MEGAKERNELS_ROOT)/include
+else
+TK_INCLUDES =
+endif
+
+# MoE kernel only built for B200 (requires tcgen05)
+ifeq ($(GPU),B200)
+TARGETS += moe_expert$(EXT_SUFFIX)
+endif
+
 all: $(TARGETS)
 
 tp_sp$(EXT_SUFFIX): tp_sp.cu tp_sp.cuh multimem.cuh distributed.cuh qwen3.cuh
@@ -48,6 +62,9 @@ fmha_attention$(EXT_SUFFIX): fmha_attention.cu fmha_attention.cuh qwen3.cuh
 
 zigzag_attention$(EXT_SUFFIX): zigzag_attention.cu zigzag_attention.cuh qwen3.cuh
 	$(NVCC) zigzag_attention.cu $(ALL_NVCCFLAGS) -lnccl -o $@
+
+moe_expert$(EXT_SUFFIX): moe_expert.cu moe_expert.cuh moe_router.cuh moe_expert_types.cuh qwen3.cuh
+	$(NVCC) moe_expert.cu $(ALL_NVCCFLAGS) $(TK_INCLUDES) -DTORCH_EXTENSION_NAME=moe_expert -o $@
 
 clean:
 	rm -f $(TARGETS)

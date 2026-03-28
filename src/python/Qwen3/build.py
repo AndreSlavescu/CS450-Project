@@ -23,7 +23,7 @@ def _detect_arch() -> str:
         return "sm_80"  # Ampere   (A100)
     else:
         raise RuntimeError(
-            f"Unsupported GPU compute capability {major}.{minor}. " "Add the arch flag for your GPU in build.py."
+            f"Unsupported GPU compute capability {major}.{minor}. Add the arch flag for your GPU in build.py."
         )
 
 
