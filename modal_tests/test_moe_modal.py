@@ -54,6 +54,8 @@ def _worker(rank: int, world_size: int, results_dict: dict):
     os.environ.setdefault("NCCL_P2P_LEVEL", "NVL")
     os.environ.setdefault("NCCL_SHM_DISABLE", "0")
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
+    # Use cuBLAS GEMM path (tcgen05 persistent kernel has driver compat issues)
+    os.environ.setdefault("MOE_FORCE_CUBLAS", "1")
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
