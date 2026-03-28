@@ -469,6 +469,7 @@ class VllmEngine:
 
     @modal.method()
     def benchmark(self, prompt_lens: list[int]) -> dict:
+        import concurrent.futures
         import time as _time
 
         from vllm import SamplingParams
@@ -478,19 +479,31 @@ class VllmEngine:
         ttft_results = {}
         decode_results = {}
 
+        # Timeout wrapper — vLLM generate() can hang on B200 EP mode
+        _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        PER_CALL_TIMEOUT = 180  # seconds
+
+        def _gen(prompt, sp):
+            fut = _executor.submit(self.llm.generate, [prompt], sp)
+            return fut.result(timeout=PER_CALL_TIMEOUT)
+
         try:
             for n_tok in prompt_lens:
                 prompt_text = _make_prompt(self.tokenizer, n_tok)
+                print(f"  [vLLM] n={n_tok:>5} starting warmup...", flush=True)
 
                 # Warmup
-                for _ in range(WARMUP):
-                    self.llm.generate([prompt_text], params)
+                for wi in range(WARMUP):
+                    print(f"  [vLLM]   warmup {wi+1}/{WARMUP}...", flush=True)
+                    _gen(prompt_text, params)
+
+                print(f"  [vLLM] n={n_tok:>5} measuring...", flush=True)
 
                 # TTFT: try vLLM metrics, fall back to wall-clock
                 ttft_times = []
                 decode_ms_list = []
-                for _ in range(RUNS):
-                    outputs = self.llm.generate([prompt_text], params)
+                for ri in range(RUNS):
+                    outputs = _gen(prompt_text, params)
                     output = outputs[0]
                     m = output.metrics
 
@@ -512,7 +525,7 @@ class VllmEngine:
                     # Wall-clock fallback (generate 1 token only)
                     for _ in range(RUNS):
                         t0 = _time.perf_counter()
-                        self.llm.generate([prompt_text], params_1tok)
+                        _gen(prompt_text, params_1tok)
                         ttft_times.append((_time.perf_counter() - t0) * 1000.0)
 
                 ttft_times.sort()
@@ -531,12 +544,17 @@ class VllmEngine:
                         flush=True,
                     )
 
+        except concurrent.futures.TimeoutError:
+            print("[vLLM] TIMEOUT: generate() hung for > 180s, skipping remaining", flush=True)
+            return {"error": "timeout", "ttft": ttft_results, "decode_ms_per_tok": decode_results}
         except Exception as e:
             import traceback
 
             print(f"[vLLM] FAILED: {e}", flush=True)
             traceback.print_exc()
-            return {"error": str(e), "ttft": {}, "decode_ms_per_tok": {}}
+            return {"error": str(e), "ttft": ttft_results, "decode_ms_per_tok": decode_results}
+        finally:
+            _executor.shutdown(wait=False)
 
         return {"ttft": ttft_results, "decode_ms_per_tok": decode_results}
 

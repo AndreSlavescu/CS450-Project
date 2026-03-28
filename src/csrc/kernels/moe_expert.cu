@@ -173,6 +173,19 @@ static torch::Tensor moe_gemm_tcgen05(
 #endif // KITTENS_BLACKWELL
 
 // ---------------------------------------------------------------------------
+// cuBLAS handle (shared by router matmul and expert GEMMs)
+// ---------------------------------------------------------------------------
+
+static cublasHandle_t get_cublas_handle() {
+    static cublasHandle_t handle = nullptr;
+    if (!handle) {
+        cublasCreate(&handle);
+        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+    }
+    return handle;
+}
+
+// ---------------------------------------------------------------------------
 // Router + Top-K + Sort
 // ---------------------------------------------------------------------------
 
@@ -189,17 +202,28 @@ std::vector<torch::Tensor> moe_router_topk_op(torch::Tensor hidden_states, // [T
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
     // 1. Router matmul → logits [T, num_experts] in FP32
+    //    C[T, N] = A[T, K] × B[N, K]^T   where N=num_experts, K=hidden_size
+    //    Uses cuBLAS tensor cores instead of custom warp-per-row kernel (~3x faster)
     auto router_logits = torch::empty({T, num_experts}, torch::dtype(torch::kFloat32).device(hidden_states.device()));
 
     {
-        int threads = 256;
-        int warps_needed = T * num_experts;
-        int blocks = (warps_needed * 32 + threads - 1) / threads;
-        blocks = std::min(blocks, 1024);
-
-        moe_router_matmul_kernel_launch<<<blocks, threads, 0, stream>>>(
-            router_logits.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(hidden_states.data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(router_weight.data_ptr()), T, hidden_size, num_experts);
+        auto handle = get_cublas_handle();
+        cublasSetStream(handle, stream);
+        float alpha = 1.0f, beta = 0.0f;
+        // Row-major: C[T,N] = A[T,K] × B[N,K]^T
+        // cuBLAS col-major: C_col[N,T] = B_col^T × A_col
+        cublasGemmEx(handle,
+                     CUBLAS_OP_T, CUBLAS_OP_N,
+                     num_experts, T, hidden_size,           // m=N, n=T, k=K
+                     &alpha,
+                     reinterpret_cast<const __nv_bfloat16*>(router_weight.data_ptr()),
+                     CUDA_R_16BF, hidden_size,              // B[N,K] row-major → col[K,N], ld=K
+                     reinterpret_cast<const __nv_bfloat16*>(hidden_states.data_ptr()),
+                     CUDA_R_16BF, hidden_size,              // A[T,K] row-major → col[K,T], ld=K
+                     &beta,
+                     router_logits.data_ptr<float>(),
+                     CUDA_R_32F, num_experts,               // C[T,N] row-major → col[N,T], ld=N
+                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     }
 
     // 2. Softmax + Top-K → selected_experts [T, top_k], routing_weights [T, top_k]
@@ -382,15 +406,6 @@ static bool use_tcgen05_gemm() {
     return val != 0;
 }
 #endif
-
-static cublasHandle_t get_cublas_handle() {
-    static cublasHandle_t handle = nullptr;
-    if (!handle) {
-        cublasCreate(&handle);
-        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
-    }
-    return handle;
-}
 
 // cuBLAS fallback: one GEMM per expert
 static torch::Tensor moe_gemm_cublas(
