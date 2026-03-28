@@ -326,7 +326,7 @@ __device__ void moe_scatter_accumulate_kernel(float* output, // [T, hidden_size]
 // Replaces CPU prefix scan + host sync in the router pipeline.
 // ---------------------------------------------------------------------------
 
-__device__ void moe_prefix_scan_kernel(int* expert_offsets, // [num_local_experts + 1] output
+__device__ void moe_prefix_scan_kernel(int* expert_offsets,      // [num_local_experts + 1] output
                                        const int* expert_counts, // [num_local_experts] input
                                        int num_local_experts) {
     if (threadIdx.x != 0)
@@ -369,10 +369,10 @@ __device__ __forceinline__ __nv_bfloat162 silu_mul_bf16x2(__nv_bfloat162 gate, _
     return __floats2bfloat162_rn(r0, r1);
 }
 
-__device__ void moe_silu_fusion_vec_kernel(__nv_bfloat16* intermediate,      // [total_assignments, intermediate_size]
-                                           const __nv_bfloat16* gate_up_out, // [total_assignments, 2 * intermediate_size]
-                                           int total_assignments,
-                                           int intermediate_size) {
+__device__ void
+moe_silu_fusion_vec_kernel(__nv_bfloat16* intermediate,      // [total_assignments, intermediate_size]
+                           const __nv_bfloat16* gate_up_out, // [total_assignments, 2 * intermediate_size]
+                           int total_assignments, int intermediate_size) {
     int row = blockIdx.x;
     if (row >= total_assignments)
         return;
@@ -406,10 +406,10 @@ __device__ void moe_silu_fusion_vec_kernel(__nv_bfloat16* intermediate,      // 
 // Uses float4 loads, scalar FP32 atomics (minimal contention with EP)
 // ---------------------------------------------------------------------------
 
-__device__ void moe_scatter_accumulate_vec_kernel(float* output,                  // [T, hidden_size] FP32
-                                                  const __nv_bfloat16* down_out,  // [total_assignments, hidden_size]
-                                                  const int* sorted_token_ids,    // [total_assignments]
-                                                  const float* sorted_weights,    // [total_assignments]
+__device__ void moe_scatter_accumulate_vec_kernel(float* output,                 // [T, hidden_size] FP32
+                                                  const __nv_bfloat16* down_out, // [total_assignments, hidden_size]
+                                                  const int* sorted_token_ids,   // [total_assignments]
+                                                  const float* sorted_weights,   // [total_assignments]
                                                   int total_assignments, int hidden_size) {
     int assignment = blockIdx.x;
     if (assignment >= total_assignments)
@@ -503,7 +503,8 @@ __global__ void moe_silu_fusion_kernel_launch(__nv_bfloat16* intermediate, const
 __global__ void moe_scatter_accumulate_kernel_launch(float* output, const __nv_bfloat16* down_out,
                                                      const int* sorted_token_ids, const float* sorted_weights,
                                                      int total_assignments, int hidden_size) {
-    moe_scatter_accumulate_vec_kernel(output, down_out, sorted_token_ids, sorted_weights, total_assignments, hidden_size);
+    moe_scatter_accumulate_vec_kernel(output, down_out, sorted_token_ids, sorted_weights, total_assignments,
+                                      hidden_size);
 }
 
 __global__ void moe_zero_kernel_launch(float* buf, int n) {
