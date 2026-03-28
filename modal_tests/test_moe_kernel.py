@@ -122,9 +122,9 @@ def run_moe_kernel_test():
 
     print(f"  has_tcgen05() = {moe.has_tcgen05()}")
 
-    # Test both GEMM paths: first cuBLAS (reliable), then tcgen05 (experimental)
-    # Set MOE_FORCE_CUBLAS=0 to skip cuBLAS and go straight to tcgen05
-    os.environ["MOE_FORCE_CUBLAS"] = os.environ.get("MOE_FORCE_CUBLAS", "0")
+    # Use cuBLAS GEMM by default (tcgen05 has driver compat issues on Modal B200)
+    # Set MOE_FORCE_CUBLAS=0 to try tcgen05 path
+    os.environ["MOE_FORCE_CUBLAS"] = os.environ.get("MOE_FORCE_CUBLAS", "1")
     print(f"  MOE_FORCE_CUBLAS = {os.environ.get('MOE_FORCE_CUBLAS', '0')}")
 
     # ══════════════════════════════════════════════════════════════════
