@@ -127,6 +127,13 @@ static torch::Tensor moe_gemm_tcgen05(
     if (sched.total_tasks == 0 || padded_total == 0)
         return torch::zeros({total_sorted, n_dim}, torch::dtype(torch::kBFloat16).device(dev));
 
+    // Debug: print scheduler parameters
+    printf("[tcgen05] total_sorted=%d padded=%d n_tiles=%d total_tasks=%d k=%d n=%d experts=%d\n",
+           total_sorted, padded_total, sched.n_tiles, sched.total_tasks, k_dim, n_dim, num_local_experts);
+    for (int e = 0; e <= num_local_experts && e <= 3; e++)
+        printf("  expert_offsets[%d]=%d padded[%d]=%d tile_offsets[%d]=%d\n",
+               e, h_offsets[e], e, h_padded[e], e, sched.expert_tile_offsets[e]);
+
     // Allocate padded buffers (zero-init for padding rows)
     auto padded_input = torch::zeros({padded_total, k_dim}, torch::dtype(torch::kBFloat16).device(dev));
     auto padded_output = torch::zeros({padded_total, n_dim}, torch::dtype(torch::kBFloat16).device(dev));
