@@ -527,31 +527,27 @@ inline void launch_moe_gemm(__nv_bfloat16* output,              // [padded_total
     int b_n_tile_stride = n_dim / (MOE_Nb / 2);
     globals G{Ag, Bg, Dg, b_n_tile_stride, d_scheduler};
 
-    // 148 SMs on B200, 2 CTAs per cluster = 74 clusters
+    // Match ThunderKittens reference B200 matmul launch pattern exactly:
+    // 148 SMs on B200 → 148 CTAs → 74 clusters of 2
     dim3 grid(148, 1);
     dim3 block(MOE_NUM_THREADS);
 
     unsigned long smem_size = MAX_SHARED_MEMORY - 1024;
 
-    // Required on B200: enable non-portable cluster sizes (cluster_dims > 1)
-    auto cluster_err = cudaFuncSetAttribute(moe_gemm_kernel_launch, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    if (cluster_err != cudaSuccess) {
-        printf("MOE GEMM: NonPortableClusterSize failed: %s\n", cudaGetErrorString(cluster_err));
-        return;
-    }
-
-    auto attr_err =
-        cudaFuncSetAttribute(moe_gemm_kernel_launch, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    if (attr_err != cudaSuccess) {
-        printf("MOE GEMM: cudaFuncSetAttribute failed: %s (smem_size=%lu)\n", cudaGetErrorString(attr_err), smem_size);
-        return;
-    }
+    // Set max dynamic shared memory (required for >48KB)
+    // Note: reference TK matmul launches without this but B200 default may be high enough.
+    // We set it explicitly for safety.
+    cudaFuncSetAttribute(moe_gemm_kernel_launch, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
     moe_gemm_kernel_launch<<<grid, block, smem_size, stream>>>(G);
 
-    // Check for launch errors (does NOT sync, just checks immediate errors)
+    // Synchronize and check for kernel errors
     auto launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {
         printf("MOE GEMM: kernel launch failed: %s\n", cudaGetErrorString(launch_err));
+    }
+    auto sync_err = cudaStreamSynchronize(stream);
+    if (sync_err != cudaSuccess) {
+        printf("MOE GEMM: kernel execution failed: %s\n", cudaGetErrorString(sync_err));
     }
 }
