@@ -19,10 +19,158 @@
 #include "moe_expert_types.cuh"
 #include "moe_router.cuh"
 
-// tcgen05 kernel (SM100) — currently disabled due to TK/driver compatibility
+// tcgen05 persistent GEMM kernel (SM100 / Blackwell)
 #if defined(KITTENS_BLACKWELL)
 #include "moe_expert.cuh"
-#endif
+
+// -----------------------------------------------------------------------
+// tcgen05 Persistent GEMM Integration
+//
+// Wraps launch_moe_gemm() with padding logic:
+//   1. Pad expert boundaries to CLUSTER_M (512) alignment for TMA
+//   2. Copy compact input → padded positions (vectorized float4)
+//   3. Launch single persistent tcgen05 GEMM kernel across all experts
+//   4. Extract compact output from padded positions
+//
+// Replaces 20 sequential cuBLAS calls with ONE persistent kernel launch.
+// -----------------------------------------------------------------------
+
+static constexpr int TCGEN05_CLUSTER_M = 4 * MOE_TILE_M; // 512
+
+// Scatter rows from compact [total_sorted, W] to padded [padded_total, W]
+__global__ void moe_compact_to_padded_kernel(
+    __nv_bfloat16* __restrict__ padded_out,
+    const __nv_bfloat16* __restrict__ compact_in,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ padded_offsets,
+    int total_sorted, int width, int num_local_experts)
+{
+    int row = blockIdx.x;
+    if (row >= total_sorted) return;
+
+    // Binary search for expert owning this row
+    int lo = 0, hi = num_local_experts;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (expert_offsets[mid + 1] <= row) lo = mid + 1;
+        else hi = mid;
+    }
+    int padded_row = padded_offsets[lo] + (row - expert_offsets[lo]);
+
+    const float4* src = reinterpret_cast<const float4*>(compact_in + (long)row * width);
+    float4* dst = reinterpret_cast<float4*>(padded_out + (long)padded_row * width);
+    int nvec = width >> 3; // 8 bf16 per float4
+    for (int i = threadIdx.x; i < nvec; i += blockDim.x)
+        dst[i] = src[i];
+}
+
+// Gather rows from padded [padded_total, W] back to compact [total_sorted, W]
+__global__ void moe_padded_to_compact_kernel(
+    __nv_bfloat16* __restrict__ compact_out,
+    const __nv_bfloat16* __restrict__ padded_in,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ padded_offsets,
+    int total_sorted, int width, int num_local_experts)
+{
+    int row = blockIdx.x;
+    if (row >= total_sorted) return;
+
+    int lo = 0, hi = num_local_experts;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (expert_offsets[mid + 1] <= row) lo = mid + 1;
+        else hi = mid;
+    }
+    int padded_row = padded_offsets[lo] + (row - expert_offsets[lo]);
+
+    const float4* src = reinterpret_cast<const float4*>(padded_in + (long)padded_row * width);
+    float4* dst = reinterpret_cast<float4*>(compact_out + (long)row * width);
+    int nvec = width >> 3;
+    for (int i = threadIdx.x; i < nvec; i += blockDim.x)
+        dst[i] = src[i];
+}
+
+// Main tcgen05 GEMM: pad → persistent kernel → extract
+static torch::Tensor moe_gemm_tcgen05(
+    torch::Tensor sorted_input,            // [total_sorted, k_dim] bf16
+    torch::Tensor weights,                 // [num_local_experts, n_dim, k_dim] bf16
+    const std::vector<int>& h_offsets,     // expert_offsets already on host
+    torch::Tensor expert_offsets_d,        // device copy
+    int k_dim, int n_dim, cudaStream_t stream)
+{
+    int total_sorted = sorted_input.size(0);
+    int num_local_experts = (int)expert_offsets_d.size(0) - 1;
+    auto dev = sorted_input.device();
+
+    // Build padded offsets + scheduler on host
+    std::vector<int> h_padded(num_local_experts + 1, 0);
+    MoETaskScheduler sched = {};
+    sched.num_local_experts = num_local_experts;
+    sched.n_tiles = n_dim / MOE_TILE_N;
+    sched.expert_offsets[0] = 0;
+    sched.expert_tile_offsets[0] = 0;
+
+    for (int e = 0; e < num_local_experts; e++) {
+        int count = h_offsets[e + 1] - h_offsets[e];
+        int padded = count > 0
+            ? ((count + TCGEN05_CLUSTER_M - 1) / TCGEN05_CLUSTER_M) * TCGEN05_CLUSTER_M
+            : 0;
+        h_padded[e + 1] = h_padded[e] + padded;
+        sched.expert_offsets[e + 1] = h_padded[e + 1];
+        int m_tiles = padded / TCGEN05_CLUSTER_M;
+        sched.expert_tile_offsets[e + 1] =
+            sched.expert_tile_offsets[e] + m_tiles * sched.n_tiles;
+    }
+    sched.total_tasks = sched.expert_tile_offsets[num_local_experts];
+    int padded_total = h_padded[num_local_experts];
+
+    if (sched.total_tasks == 0 || padded_total == 0)
+        return torch::zeros({total_sorted, n_dim}, torch::dtype(torch::kBFloat16).device(dev));
+
+    // Allocate padded buffers (zero-init for padding rows)
+    auto padded_input = torch::zeros({padded_total, k_dim}, torch::dtype(torch::kBFloat16).device(dev));
+    auto padded_output = torch::zeros({padded_total, n_dim}, torch::dtype(torch::kBFloat16).device(dev));
+
+    // Padded offsets → device
+    auto padded_offsets_d = torch::empty({num_local_experts + 1}, torch::dtype(torch::kInt32).device(dev));
+    cudaMemcpyAsync(padded_offsets_d.data_ptr<int>(), h_padded.data(),
+                    (num_local_experts + 1) * sizeof(int), cudaMemcpyHostToDevice, stream);
+
+    // Scheduler → device
+    MoETaskScheduler* d_sched;
+    cudaMallocAsync(&d_sched, sizeof(MoETaskScheduler), stream);
+    cudaMemcpyAsync(d_sched, &sched, sizeof(MoETaskScheduler), cudaMemcpyHostToDevice, stream);
+
+    // Step 1: Compact → Padded (vectorized, one block per row)
+    if (total_sorted > 0) {
+        moe_compact_to_padded_kernel<<<total_sorted, 256, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(padded_input.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(sorted_input.data_ptr()),
+            expert_offsets_d.data_ptr<int>(), padded_offsets_d.data_ptr<int>(),
+            total_sorted, k_dim, num_local_experts);
+    }
+
+    // Step 2: Persistent tcgen05 GEMM (single launch, all experts)
+    launch_moe_gemm(
+        reinterpret_cast<__nv_bfloat16*>(padded_output.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(padded_input.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(weights.data_ptr()),
+        d_sched, padded_total, num_local_experts, k_dim, n_dim, stream);
+
+    // Step 3: Padded → Compact (vectorized, one block per row)
+    auto output = torch::empty({total_sorted, n_dim}, torch::dtype(torch::kBFloat16).device(dev));
+    if (total_sorted > 0) {
+        moe_padded_to_compact_kernel<<<total_sorted, 256, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(padded_output.data_ptr()),
+            expert_offsets_d.data_ptr<int>(), padded_offsets_d.data_ptr<int>(),
+            total_sorted, n_dim, num_local_experts);
+    }
+
+    cudaFreeAsync(d_sched, stream);
+    return output;
+}
+#endif // KITTENS_BLACKWELL
 
 // ---------------------------------------------------------------------------
 // Router + Top-K + Sort
@@ -110,23 +258,12 @@ std::vector<torch::Tensor> moe_router_topk_op(torch::Tensor hidden_states, // [T
             expert_counts.data_ptr<int>(), assignment_expert_ids.data_ptr<int>(), h_num_assignments);
     }
 
-    // 5. Prefix sum → expert_offsets [num_local_experts + 1]
+    // 5. GPU prefix scan → expert_offsets [num_local_experts + 1]
+    //    Replaces CPU scan + host sync — single block kernel for 20 elements
     auto expert_offsets =
         torch::zeros({num_local_experts + 1}, torch::dtype(torch::kInt32).device(hidden_states.device()));
-    {
-        // Simple inclusive scan on CPU (num_local_experts=20 is tiny)
-        std::vector<int> h_counts(num_local_experts);
-        cudaMemcpyAsync(h_counts.data(), expert_counts.data_ptr<int>(), num_local_experts * sizeof(int),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-
-        std::vector<int> h_offsets(num_local_experts + 1, 0);
-        for (int i = 0; i < num_local_experts; i++)
-            h_offsets[i + 1] = h_offsets[i] + h_counts[i];
-
-        cudaMemcpyAsync(expert_offsets.data_ptr<int>(), h_offsets.data(), (num_local_experts + 1) * sizeof(int),
-                        cudaMemcpyHostToDevice, stream);
-    }
+    moe_prefix_scan_kernel_launch<<<1, 32, 0, stream>>>(
+        expert_offsets.data_ptr<int>(), expert_counts.data_ptr<int>(), num_local_experts);
 
     // 6. Scatter into sorted order
     auto sorted_token_ids =
@@ -164,12 +301,8 @@ torch::Tensor moe_gather_tokens_op(torch::Tensor hidden_states,    // [T, hidden
     auto sorted_hidden =
         torch::empty({total_assignments, hidden_size}, torch::dtype(torch::kBFloat16).device(hidden_states.device()));
 
-    int total = total_assignments * hidden_size;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    blocks = std::min(blocks, 65535);
-
-    moe_gather_tokens_kernel_launch<<<blocks, threads, 0, stream>>>(
+    // Vectorized: one block per row, float4 (8 bf16) per thread
+    moe_gather_tokens_kernel_launch<<<total_assignments, 256, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(sorted_hidden.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(hidden_states.data_ptr()), sorted_token_ids.data_ptr<int>(),
         total_assignments, hidden_size);
@@ -193,12 +326,8 @@ torch::Tensor moe_silu_fusion_op(torch::Tensor gate_up_out, // [total_assignment
     auto intermediate = torch::empty({total_assignments, intermediate_size},
                                      torch::dtype(torch::kBFloat16).device(gate_up_out.device()));
 
-    int total = total_assignments * intermediate_size;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    blocks = std::min(blocks, 65535);
-
-    moe_silu_fusion_kernel_launch<<<blocks, threads, 0, stream>>>(
+    // Vectorized: one block per row, float4 (8 bf16) SiLU+mul per thread
+    moe_silu_fusion_kernel_launch<<<total_assignments, 256, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(intermediate.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(gate_up_out.data_ptr()), total_assignments, intermediate_size);
 
@@ -221,12 +350,8 @@ torch::Tensor moe_scatter_accumulate_op(torch::Tensor down_out,         // [tota
 
     int total_assignments = sorted_token_ids.size(0);
     if (total_assignments > 0) {
-        int total = total_assignments * hidden_size;
-        int threads = 256;
-        int blocks = (total + threads - 1) / threads;
-        blocks = std::min(blocks, 65535);
-
-        moe_scatter_accumulate_kernel_launch<<<blocks, threads, 0, stream>>>(
+        // Vectorized: one block per assignment row, float4 loads + scalar FP32 atomics
+        moe_scatter_accumulate_kernel_launch<<<total_assignments, 256, 0, stream>>>(
             output_f32.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(down_out.data_ptr()),
             sorted_token_ids.data_ptr<int>(), sorted_weights.data_ptr<float>(), total_assignments, hidden_size);
     }
@@ -236,15 +361,14 @@ torch::Tensor moe_scatter_accumulate_op(torch::Tensor down_out,         // [tota
 }
 
 // ---------------------------------------------------------------------------
-// cuBLAS grouped GEMM for MoE expert projections
+// MoE Expert GEMM Dispatch
 //
-// Dispatches one cuBLAS GEMM per local expert. Each expert computes:
-//   C[T_e, N] = A[T_e, K] × B[N, K]^T
+// On B200 (KITTENS_BLACKWELL): uses the tcgen05 persistent GEMM kernel
+//   — single kernel launch processes all 20 local experts
+//   — 2-CTA cluster, persistent tile scheduler, TMA loads
 //
-// For gate+up:  K=6144, N=5120  (20 experts → 20 cuBLAS calls)
-// For down:     K=2560, N=6144  (20 experts → 20 cuBLAS calls)
-//
-// Total: 40 cuBLAS calls per MoE layer (vs 60+ in naive PyTorch loop)
+// Fallback (H100/A100): cuBLAS per-expert GEMM loop
+//   — 20 cuBLAS calls per projection
 // ---------------------------------------------------------------------------
 
 static cublasHandle_t get_cublas_handle() {
@@ -254,6 +378,46 @@ static cublasHandle_t get_cublas_handle() {
         cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
     }
     return handle;
+}
+
+// cuBLAS fallback: one GEMM per expert
+static torch::Tensor moe_gemm_cublas(
+    torch::Tensor sorted_input,    // [total_sorted, k_dim]
+    torch::Tensor weights,         // [num_local_experts, n_dim, k_dim]
+    const std::vector<int>& h_offsets,
+    int k_dim, int n_dim, cudaStream_t stream)
+{
+    int total_sorted = sorted_input.size(0);
+    int num_local_experts = (int)h_offsets.size() - 1;
+
+    auto output = torch::zeros({total_sorted, n_dim},
+                               torch::dtype(torch::kBFloat16).device(sorted_input.device()));
+
+    auto handle = get_cublas_handle();
+    cublasSetStream(handle, stream);
+
+    const auto* A_base = reinterpret_cast<const __nv_bfloat16*>(sorted_input.data_ptr());
+    const auto* B_base = reinterpret_cast<const __nv_bfloat16*>(weights.data_ptr());
+    auto* C_base = reinterpret_cast<__nv_bfloat16*>(output.data_ptr());
+
+    float alpha = 1.0f, beta = 0.0f;
+
+    for (int e = 0; e < num_local_experts; e++) {
+        int T_e = h_offsets[e + 1] - h_offsets[e];
+        if (T_e == 0) continue;
+
+        const auto* A_ptr = A_base + h_offsets[e] * (long)k_dim;
+        const auto* B_ptr = B_base + e * (long)n_dim * (long)k_dim;
+        auto* C_ptr = C_base + h_offsets[e] * (long)n_dim;
+
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     n_dim, T_e, k_dim, &alpha,
+                     B_ptr, CUDA_R_16BF, k_dim,
+                     A_ptr, CUDA_R_16BF, k_dim,
+                     &beta, C_ptr, CUDA_R_16BF, n_dim,
+                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    }
+    return output;
 }
 
 torch::Tensor moe_gate_up_gemm_op(torch::Tensor sorted_hidden,   // [total_sorted, hidden_size] bf16
@@ -266,51 +430,21 @@ torch::Tensor moe_gate_up_gemm_op(torch::Tensor sorted_hidden,   // [total_sorte
     int num_local_experts = expert_offsets.size(0) - 1;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
-    if (total_sorted == 0) {
+    if (total_sorted == 0)
         return torch::empty({0, gate_up_width}, torch::dtype(torch::kBFloat16).device(sorted_hidden.device()));
-    }
 
-    // Copy expert offsets to host
+    // Copy expert offsets to host (one sync, shared by both paths)
     std::vector<int> h_offsets(num_local_experts + 1);
-    cudaMemcpyAsync(h_offsets.data(), expert_offsets.data_ptr<int>(), (num_local_experts + 1) * sizeof(int),
-                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_offsets.data(), expert_offsets.data_ptr<int>(),
+                    (num_local_experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
-    auto output =
-        torch::zeros({total_sorted, gate_up_width}, torch::dtype(torch::kBFloat16).device(sorted_hidden.device()));
-
-    auto handle = get_cublas_handle();
-    cublasSetStream(handle, stream);
-
-    const auto* A_base = reinterpret_cast<const __nv_bfloat16*>(sorted_hidden.data_ptr());
-    const auto* B_base = reinterpret_cast<const __nv_bfloat16*>(gate_up_weights.data_ptr());
-    auto* C_base = reinterpret_cast<__nv_bfloat16*>(output.data_ptr());
-
-    float alpha = 1.0f, beta = 0.0f;
-    int K = hidden_size;
-    int N = gate_up_width;
-
-    for (int e = 0; e < num_local_experts; e++) {
-        int T_e = h_offsets[e + 1] - h_offsets[e];
-        if (T_e == 0)
-            continue;
-
-        const auto* A_ptr = A_base + h_offsets[e] * (long)K;
-        const auto* B_ptr = B_base + e * (long)N * (long)K;
-        auto* C_ptr = C_base + h_offsets[e] * (long)N;
-
-        // Row-major: C[T_e, N] = A[T_e, K] × B[N, K]^T
-        // cuBLAS col-major: C_col[N, T_e] = B_col^T × A_col
-        cublasGemmEx(handle,
-                     CUBLAS_OP_T,                              // transpose B (weight)
-                     CUBLAS_OP_N,                              // no transpose A (activation)
-                     N, T_e, K, &alpha, B_ptr, CUDA_R_16BF, K, // B[N,K] row-major → col[K,N], ld=K
-                     A_ptr, CUDA_R_16BF, K,                    // A[T_e,K] row-major → col[K,T_e], ld=K
-                     &beta, C_ptr, CUDA_R_16BF, N,             // C[T_e,N] row-major → col[N,T_e], ld=N
-                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    }
-
-    return output;
+#if defined(KITTENS_BLACKWELL)
+    return moe_gemm_tcgen05(sorted_hidden, gate_up_weights, h_offsets, expert_offsets,
+                            hidden_size, gate_up_width, stream);
+#else
+    return moe_gemm_cublas(sorted_hidden, gate_up_weights, h_offsets, hidden_size, gate_up_width, stream);
+#endif
 }
 
 torch::Tensor moe_down_gemm_op(torch::Tensor intermediate,   // [total_sorted, intermediate_size] bf16
@@ -323,43 +457,20 @@ torch::Tensor moe_down_gemm_op(torch::Tensor intermediate,   // [total_sorted, i
     int num_local_experts = expert_offsets.size(0) - 1;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
-    if (total_sorted == 0) {
+    if (total_sorted == 0)
         return torch::empty({0, hidden_size}, torch::dtype(torch::kBFloat16).device(intermediate.device()));
-    }
 
     std::vector<int> h_offsets(num_local_experts + 1);
-    cudaMemcpyAsync(h_offsets.data(), expert_offsets.data_ptr<int>(), (num_local_experts + 1) * sizeof(int),
-                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_offsets.data(), expert_offsets.data_ptr<int>(),
+                    (num_local_experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
-    auto output =
-        torch::zeros({total_sorted, hidden_size}, torch::dtype(torch::kBFloat16).device(intermediate.device()));
-
-    auto handle = get_cublas_handle();
-    cublasSetStream(handle, stream);
-
-    const auto* A_base = reinterpret_cast<const __nv_bfloat16*>(intermediate.data_ptr());
-    const auto* B_base = reinterpret_cast<const __nv_bfloat16*>(down_weights.data_ptr());
-    auto* C_base = reinterpret_cast<__nv_bfloat16*>(output.data_ptr());
-
-    float alpha = 1.0f, beta = 0.0f;
-    int K = intermediate_size;
-    int N = hidden_size;
-
-    for (int e = 0; e < num_local_experts; e++) {
-        int T_e = h_offsets[e + 1] - h_offsets[e];
-        if (T_e == 0)
-            continue;
-
-        const auto* A_ptr = A_base + h_offsets[e] * (long)K;
-        const auto* B_ptr = B_base + e * (long)N * (long)K;
-        auto* C_ptr = C_base + h_offsets[e] * (long)N;
-
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, T_e, K, &alpha, B_ptr, CUDA_R_16BF, K, A_ptr, CUDA_R_16BF, K,
-                     &beta, C_ptr, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    }
-
-    return output;
+#if defined(KITTENS_BLACKWELL)
+    return moe_gemm_tcgen05(intermediate, down_weights, h_offsets, expert_offsets,
+                            intermediate_size, hidden_size, stream);
+#else
+    return moe_gemm_cublas(intermediate, down_weights, h_offsets, intermediate_size, hidden_size, stream);
+#endif
 }
 
 // ---------------------------------------------------------------------------

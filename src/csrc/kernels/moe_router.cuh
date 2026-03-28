@@ -322,6 +322,128 @@ __device__ void moe_scatter_accumulate_kernel(float* output, // [T, hidden_size]
 }
 
 // ---------------------------------------------------------------------------
+// GPU-side prefix scan for small arrays (num_local_experts ≤ 32)
+// Replaces CPU prefix scan + host sync in the router pipeline.
+// ---------------------------------------------------------------------------
+
+__device__ void moe_prefix_scan_kernel(int* expert_offsets, // [num_local_experts + 1] output
+                                       const int* expert_counts, // [num_local_experts] input
+                                       int num_local_experts) {
+    if (threadIdx.x != 0)
+        return;
+    expert_offsets[0] = 0;
+    for (int i = 0; i < num_local_experts; i++)
+        expert_offsets[i + 1] = expert_offsets[i] + expert_counts[i];
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized gather: one block per assignment row, float4 (8 bf16) per thread
+// ---------------------------------------------------------------------------
+
+__device__ void moe_gather_tokens_vec_kernel(__nv_bfloat16* sorted_hidden,       // [total_assignments, hidden_size]
+                                             const __nv_bfloat16* hidden_states, // [T, hidden_size]
+                                             const int* sorted_token_ids,        // [total_assignments]
+                                             int total_assignments, int hidden_size) {
+    int assignment = blockIdx.x;
+    if (assignment >= total_assignments)
+        return;
+    int src_tok = sorted_token_ids[assignment];
+
+    const float4* src = reinterpret_cast<const float4*>(hidden_states + (long)src_tok * hidden_size);
+    float4* dst = reinterpret_cast<float4*>(sorted_hidden + (long)assignment * hidden_size);
+    int nvec = hidden_size >> 3; // 8 bf16 per float4
+    for (int i = threadIdx.x; i < nvec; i += blockDim.x)
+        dst[i] = src[i];
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized SiLU fusion: one block per row, float4 vectorized reads/writes
+//   intermediate[t, j] = SiLU(gate_up[t, j]) * gate_up[t, j + intermediate_size]
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ __nv_bfloat162 silu_mul_bf16x2(__nv_bfloat162 gate, __nv_bfloat162 up) {
+    float2 gf = __bfloat1622float2(gate);
+    float2 uf = __bfloat1622float2(up);
+    float r0 = (gf.x / (1.0f + expf(-gf.x))) * uf.x;
+    float r1 = (gf.y / (1.0f + expf(-gf.y))) * uf.y;
+    return __floats2bfloat162_rn(r0, r1);
+}
+
+__device__ void moe_silu_fusion_vec_kernel(__nv_bfloat16* intermediate,      // [total_assignments, intermediate_size]
+                                           const __nv_bfloat16* gate_up_out, // [total_assignments, 2 * intermediate_size]
+                                           int total_assignments,
+                                           int intermediate_size) {
+    int row = blockIdx.x;
+    if (row >= total_assignments)
+        return;
+
+    const __nv_bfloat16* gate_row = gate_up_out + (long)row * 2 * intermediate_size;
+    const __nv_bfloat16* up_row = gate_row + intermediate_size;
+    __nv_bfloat16* out_row = intermediate + (long)row * intermediate_size;
+
+    int nvec = intermediate_size >> 3; // 8 bf16 per float4
+    for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
+        float4 g_raw = reinterpret_cast<const float4*>(gate_row)[i];
+        float4 u_raw = reinterpret_cast<const float4*>(up_row)[i];
+
+        float4 result;
+        *reinterpret_cast<__nv_bfloat162*>(&result.x) =
+            silu_mul_bf16x2(*reinterpret_cast<__nv_bfloat162*>(&g_raw.x), *reinterpret_cast<__nv_bfloat162*>(&u_raw.x));
+        *reinterpret_cast<__nv_bfloat162*>(&result.y) =
+            silu_mul_bf16x2(*reinterpret_cast<__nv_bfloat162*>(&g_raw.y), *reinterpret_cast<__nv_bfloat162*>(&u_raw.y));
+        *reinterpret_cast<__nv_bfloat162*>(&result.z) =
+            silu_mul_bf16x2(*reinterpret_cast<__nv_bfloat162*>(&g_raw.z), *reinterpret_cast<__nv_bfloat162*>(&u_raw.z));
+        *reinterpret_cast<__nv_bfloat162*>(&result.w) =
+            silu_mul_bf16x2(*reinterpret_cast<__nv_bfloat162*>(&g_raw.w), *reinterpret_cast<__nv_bfloat162*>(&u_raw.w));
+
+        reinterpret_cast<float4*>(out_row)[i] = result;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized scatter-accumulate: one block per assignment row
+//   output[token, col] += weight * down_out[assignment, col]
+// Uses float4 loads, scalar FP32 atomics (minimal contention with EP)
+// ---------------------------------------------------------------------------
+
+__device__ void moe_scatter_accumulate_vec_kernel(float* output,                  // [T, hidden_size] FP32
+                                                  const __nv_bfloat16* down_out,  // [total_assignments, hidden_size]
+                                                  const int* sorted_token_ids,    // [total_assignments]
+                                                  const float* sorted_weights,    // [total_assignments]
+                                                  int total_assignments, int hidden_size) {
+    int assignment = blockIdx.x;
+    if (assignment >= total_assignments)
+        return;
+
+    int src_tok = sorted_token_ids[assignment];
+    float weight = sorted_weights[assignment];
+    float* dst = output + (long)src_tok * hidden_size;
+    const float4* src = reinterpret_cast<const float4*>(down_out + (long)assignment * hidden_size);
+
+    int nvec = hidden_size >> 3; // 8 bf16 per float4
+    for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
+        float4 raw = src[i];
+        __nv_bfloat162 v0 = *reinterpret_cast<__nv_bfloat162*>(&raw.x);
+        __nv_bfloat162 v1 = *reinterpret_cast<__nv_bfloat162*>(&raw.y);
+        __nv_bfloat162 v2 = *reinterpret_cast<__nv_bfloat162*>(&raw.z);
+        __nv_bfloat162 v3 = *reinterpret_cast<__nv_bfloat162*>(&raw.w);
+        float2 f0 = __bfloat1622float2(v0);
+        float2 f1 = __bfloat1622float2(v1);
+        float2 f2 = __bfloat1622float2(v2);
+        float2 f3 = __bfloat1622float2(v3);
+        int col = i * 8;
+        atomicAdd(&dst[col + 0], f0.x * weight);
+        atomicAdd(&dst[col + 1], f0.y * weight);
+        atomicAdd(&dst[col + 2], f1.x * weight);
+        atomicAdd(&dst[col + 3], f1.y * weight);
+        atomicAdd(&dst[col + 4], f2.x * weight);
+        atomicAdd(&dst[col + 5], f2.y * weight);
+        atomicAdd(&dst[col + 6], f3.x * weight);
+        atomicAdd(&dst[col + 7], f3.y * weight);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Zero-initialize a float buffer
 // ---------------------------------------------------------------------------
 
@@ -370,20 +492,24 @@ __global__ void moe_scatter_kernel_launch(int* sorted_token_ids, float* sorted_w
 
 __global__ void moe_gather_tokens_kernel_launch(__nv_bfloat16* sorted_hidden, const __nv_bfloat16* hidden_states,
                                                 const int* sorted_token_ids, int total_assignments, int hidden_size) {
-    moe_gather_tokens_kernel(sorted_hidden, hidden_states, sorted_token_ids, total_assignments, hidden_size);
+    moe_gather_tokens_vec_kernel(sorted_hidden, hidden_states, sorted_token_ids, total_assignments, hidden_size);
 }
 
 __global__ void moe_silu_fusion_kernel_launch(__nv_bfloat16* intermediate, const __nv_bfloat16* gate_up_out,
                                               int total_assignments, int intermediate_size) {
-    moe_silu_fusion_kernel(intermediate, gate_up_out, total_assignments, intermediate_size);
+    moe_silu_fusion_vec_kernel(intermediate, gate_up_out, total_assignments, intermediate_size);
 }
 
 __global__ void moe_scatter_accumulate_kernel_launch(float* output, const __nv_bfloat16* down_out,
                                                      const int* sorted_token_ids, const float* sorted_weights,
                                                      int total_assignments, int hidden_size) {
-    moe_scatter_accumulate_kernel(output, down_out, sorted_token_ids, sorted_weights, total_assignments, hidden_size);
+    moe_scatter_accumulate_vec_kernel(output, down_out, sorted_token_ids, sorted_weights, total_assignments, hidden_size);
 }
 
 __global__ void moe_zero_kernel_launch(float* buf, int n) {
     moe_zero_kernel(buf, n);
+}
+
+__global__ void moe_prefix_scan_kernel_launch(int* expert_offsets, const int* expert_counts, int num_local_experts) {
+    moe_prefix_scan_kernel(expert_offsets, expert_counts, num_local_experts);
 }
