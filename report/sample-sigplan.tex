@@ -92,6 +92,23 @@ For the Qwen3-1.7B model, we fuse all 28 decoder layers into a single kernel lau
 
 \noindent \textbf{Date:} March 5, 2026
 
+\section{Background and Motivation}
+
+
+Autoregressive decoding in decoder-only LLMs generates one token per forward pass, where each token depends on all preceding tokens. Each forward pass performs matrix multiplication (GEMVs) across all model layers (operations that are heavily memory-bandwidth bound rather than compute bound). The key performance metric is time-to-first-token (TTFT), which the user perceives as latency when interacting with these LLMs.
+
+
+A decode step in a transformer executes hundreds of fine-grained CUDA kernels: normalization, QKV projections, attention, output projections, etc. which are repeated across every layer. Each kernel launch incurs setup and teardown overhead, and forces intermediate activations to be written to and read from memory between operations. On an H100, launch overhead alone can consume hundreds of microseconds, which is a significant fraction of the total decode latency for small models and the GPU spends more time waiting than computing.
+
+
+Hazy Research introduced a megakernel architecture that fuses the entire transformer decode pass into a single persistent kernel launch~\cite{hazyresearch}. By keeping all intermediate activations in shared memory (vs ${\sim}$3.35\,TB/s for memory) and eliminating kernel boundaries, the megakernel removes the repeated global memory round-trips and launch overhead. Their implementation for Llama-1B on H100 demonstrated significant speedups over production serving engines like vLLM and SGLang. The kernel uses an instruction-driven execution model where a controller warp fetches and dispatches operations to specialized worker warps, with a shared memory page allocator managing on-chip tensor storage.
+
+
+Despite its strong results, the Hazy Research megakernel has three key limitations. First, their B200 implementation underexploits the Blackwell architecture; the authors themselves report that approximately 250$\mu$s (40\% of total runtime) is spent on activation store/load overhead, noting their B200 results are ``quite a ways off from the theoretical limit.'' Blackwell introduces dedicated tensor memory with explicit alloc/dealloc lifecycle, 2-CTA cluster execution, and new generation tensor core instructions (tcgen05). Second, the implementation is specialized exclusively for the Llama-1B architecture and does not generalize to other model families or to sparse Mixture-of-Experts (MoE) architectures, which are increasingly dominant in production LLMs. Third, synchronization overhead from their counter-based global memory barriers and standard CUDA barriers leaves measurable performance on the table.
+
+
+These limitations motivate our work to have a megakernel inference engine designed from the ground up for NVIDIA Blackwell B200 GPUs, extended to the Qwen3 model family spanning both dense (1.7B) and MoE (480B-A35B) architectures. By exploiting B200-specific features such as tcgen05 tensor core instructions, tensor memory, CTA cluster cooperation, and cluster-scoped TMA and by demonstrating generality across fundamentally different model architectures, we aim to push megakernel inference by leveraging newer generation hardware.
+
 
 
 \section{Current Progress}
