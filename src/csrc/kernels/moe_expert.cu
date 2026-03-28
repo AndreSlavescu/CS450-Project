@@ -366,10 +366,22 @@ torch::Tensor moe_scatter_accumulate_op(torch::Tensor down_out,         // [tota
 // On B200 (KITTENS_BLACKWELL): uses the tcgen05 persistent GEMM kernel
 //   — single kernel launch processes all 20 local experts
 //   — 2-CTA cluster, persistent tile scheduler, TMA loads
+//   — Set MOE_FORCE_CUBLAS=1 to force cuBLAS fallback for debugging
 //
 // Fallback (H100/A100): cuBLAS per-expert GEMM loop
 //   — 20 cuBLAS calls per projection
 // ---------------------------------------------------------------------------
+
+#if defined(KITTENS_BLACKWELL)
+static bool use_tcgen05_gemm() {
+    static int val = -1;
+    if (val < 0) {
+        const char* env = getenv("MOE_FORCE_CUBLAS");
+        val = (env && env[0] == '1') ? 0 : 1;
+    }
+    return val != 0;
+}
+#endif
 
 static cublasHandle_t get_cublas_handle() {
     static cublasHandle_t handle = nullptr;
@@ -440,11 +452,11 @@ torch::Tensor moe_gate_up_gemm_op(torch::Tensor sorted_hidden,   // [total_sorte
     cudaStreamSynchronize(stream);
 
 #if defined(KITTENS_BLACKWELL)
-    return moe_gemm_tcgen05(sorted_hidden, gate_up_weights, h_offsets, expert_offsets,
-                            hidden_size, gate_up_width, stream);
-#else
-    return moe_gemm_cublas(sorted_hidden, gate_up_weights, h_offsets, hidden_size, gate_up_width, stream);
+    if (use_tcgen05_gemm())
+        return moe_gemm_tcgen05(sorted_hidden, gate_up_weights, h_offsets, expert_offsets,
+                                hidden_size, gate_up_width, stream);
 #endif
+    return moe_gemm_cublas(sorted_hidden, gate_up_weights, h_offsets, hidden_size, gate_up_width, stream);
 }
 
 torch::Tensor moe_down_gemm_op(torch::Tensor intermediate,   // [total_sorted, intermediate_size] bf16
@@ -466,11 +478,11 @@ torch::Tensor moe_down_gemm_op(torch::Tensor intermediate,   // [total_sorted, i
     cudaStreamSynchronize(stream);
 
 #if defined(KITTENS_BLACKWELL)
-    return moe_gemm_tcgen05(intermediate, down_weights, h_offsets, expert_offsets,
-                            intermediate_size, hidden_size, stream);
-#else
-    return moe_gemm_cublas(intermediate, down_weights, h_offsets, intermediate_size, hidden_size, stream);
+    if (use_tcgen05_gemm())
+        return moe_gemm_tcgen05(intermediate, down_weights, h_offsets, expert_offsets,
+                                intermediate_size, hidden_size, stream);
 #endif
+    return moe_gemm_cublas(intermediate, down_weights, h_offsets, intermediate_size, hidden_size, stream);
 }
 
 // ---------------------------------------------------------------------------
