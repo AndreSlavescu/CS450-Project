@@ -79,9 +79,9 @@
 \renewcommand{\shortauthors}{Cheng et al.}
 
 \begin{abstract}
-Running large language models (LLMs) in single-sequence settings can be difficult because modern inference engines break the forward pass of a transformer into hundreds of small GPU kernels. Each kernel introduces overhead, which includes launch latency, synchronization, and unnecessary round-trips to global memory, all of which stall the GPU and waste memory bandwidth. Hazy Research recently showed that fusing an entire Llama-1B forward pass into a single \textit{megakernel} eliminates these pipeline bubbles and outperforms popular serving engines like vLLM and SGLang by over 1.5x on an Nvidia H100 GPU. We build on this idea in two ways: extending it to the Qwen3 model family to explore the generalizability of the megakernel approach, and optimizing specifically for Nvidia's newer Blackwell B200 GPU.
+  Running large language models (LLMs) in single-sequence settings can be difficult because modern inference engines break the forward pass of a transformer into hundreds of small GPU kernels. Each kernel introduces overhead, which includes launch latency, synchronization, and unnecessary round-trips to global memory, all of which stall the GPU and waste memory bandwidth. Hazy Research recently showed that fusing an entire Llama-1B forward pass into a single \textit{megakernel} eliminates these pipeline bubbles and outperforms popular serving engines like vLLM and SGLang by over 1.5x on an Nvidia H100 GPU. We build on this idea in two ways: extending it to the Qwen3 model family to explore the generalizability of the megakernel approach, and optimizing specifically for Nvidia's newer Blackwell B200 GPU.
 
-For the Qwen3-1.7B model, we fuse all 28 decoder layers into a single kernel launch, handling Qwen3-specific features like per-head query/key normalization, grouped-query attention (GQA), and tied word embeddings. On a B200, this achieves 2.0-4.9 ms time-to-first-token (TTFT) across prompt lengths of 16-1024 tokens, which is a 6x improvement over vLLM and SGLang. We also scale the approach to Qwen3-480B-A35B, a 160-expert Mixture-of-Experts (MoE) model, with a fused 3-stage pipeline across 8 B200s using Blackwell-native tensor core and memory instructions. Our results show that the megakernel paradigm generalizes well beyond Llama-style architectures, and that designing kernels specifically for Blackwell, rather than porting from the older Hopper (H100) architecture, is key to squeezing out the most performance from modern hardware.
+  For the Qwen3-1.7B model, we fuse all 28 decoder layers into a single kernel launch, handling Qwen3-specific features like per-head query/key normalization, grouped-query attention (GQA), and tied word embeddings. On a B200, this achieves 2.0-4.9 ms time-to-first-token (TTFT) across prompt lengths of 16-1024 tokens, which is a 6x improvement over vLLM and SGLang. We also scale the approach to Qwen3-480B-A35B, a 160-expert Mixture-of-Experts (MoE) model, with a fused 3-stage pipeline across 8 B200s using Blackwell-native tensor core and memory instructions. Our results show that the megakernel paradigm generalizes well beyond Llama-style architectures, and that designing kernels specifically for Blackwell, rather than porting from the older Hopper (H100) architecture, is key to squeezing out the most performance from modern hardware.
 \end{abstract}
 
 
@@ -92,20 +92,14 @@ For the Qwen3-1.7B model, we fuse all 28 decoder layers into a single kernel lau
 
 \noindent \textbf{Date:} March 5, 2026
 
+\section{Introduction}
+\section{Background and Motivation}
+\section{High-level ideas}
+\section{Implementation and Mechanism}
 
-
-\section{Current Progress}
-The project infrastructure has been fully established, including compute access via Modal for both NVIDIA H100 (sm\_90a) and B200 (sm\_100a) GPUs, GPU-specific Docker images, and a JIT compilation pipeline. The Hazy Research megakernel baseline for Llama-1B has been successfully reproduced on both H100 and B200, providing a reference point for performance comparison.
-
-All eight fused CUDA operations comprising a complete Qwen3-1.7B forward pass have been implemented and verified for numerical correctness against HuggingFace reference outputs on B200, with all operations passing below 7e-6 maximum difference. These operations span the full transformed decode path: RMSNorm, QKV projection with per-head Q/K RMSNorm and ROPE, flash attention with group query attention, attention reduction output projection with residual, up/gate projection with SiLU, down projection with residual, and a final RMSNorm fused with the LM head.
-
-The kernels account for Qwen3-specific architectural features not present in Llama, including per-head Q/K RMSNorm, a 2:1 GQA ratio, and tied word embeddings. A persistent megakernel decoder fuses all eight operations into a signal-kernel inference engine with token-level correctness validated against HuggingFace model.generate(). A benchmarking harness measures TTFT and decode throughput against Hugging Face Transformers, vLLM, and SGLang. A custom GPU profiler with Perfetto trace export enables fine-grained kernel analysis. A Qwen3 model loader has been integrated into the HazyResearch megakernel framework with tensor-parallel-aware weight mapping. Preliminary MoE megakernel work has begun, with CUDA kernels for expert routing and computation implemented targeting the Qwen3-480B-A35B architecture, along with test and benchmarking infrastructure.
-
-\section{Key Results}
-
+\section{Evaluation}
+In this section, we present the results of our reproduction of the Hazy megakernel, as well as our implementation of the megakernel architecture for the Qwen3-1.7B model and its scaling to the Qwen3-480B-A35B MoE model. We evaluate performance in terms of time-to-first-token (TTFT) across various prompt lengths, and compare against popular serving engines like vLLM and SGLang.
 \subsection{Baseline Reproduction}
-
-
 Reproduction of performance improvements of the Hazy megakernel, as presented in their blogs have been mostly successful. Reproduction was conducted using the H100s and B200s provided through the Modal cloud computing platform and invoking the benchmarking scripts as provided by the original authors, with minimal changes for code execution and environment compatibility. Figures describing our recovered results can be seen above, where similar results have been reproduced for the H100, while we note significant differences for B200s for when the inference is served using SGLang/vLLLM, which remains to be figured out. A final note is that Token/s in our figure are synonymous with Forward Passes (Fwd)/s with that of Hazy's.
 
 \begin{figure}[h]
@@ -128,38 +122,38 @@ Reproduction of performance improvements of the Hazy megakernel, as presented in
 Our persistent megakernel achieves 2.0-4.9ms TTFT across all prompt lengths on a single B200, compared to 14-19ms for production serving engines.
 
 \begin{table}[h]
-\caption{Comparison of our persistent megakernel vs baselines for Qwen3-1.7B model on Nvidia B200}
-\label{tab:1}
-\begin{tabular}{llll}
-\toprule
-Prompt Length & Ours (ms) & vLLM (ms) & SGLang (ms) \\
-\midrule
-16 & 2.02 & 14.28 & 16.15 \\
-64 & 2.23 & 13.91 & 14.70 \\
-128 & 2.36 & 16.45 & 15.59 \\
-256 & 2.64 & 14.15 & 14.87 \\
-512 & 3.28 & 15.45 & 15.22 \\
-1024 & 4.86 & 17.21 & 16.06 \\
-\bottomrule
-\end{tabular}
+  \caption{Comparison of our persistent megakernel vs baselines for Qwen3-1.7B model on Nvidia B200}
+  \label{tab:1}
+  \begin{tabular}{llll}
+    \toprule
+    Prompt Length & Ours (ms) & vLLM (ms) & SGLang (ms) \\
+    \midrule
+    16            & 2.02      & 14.28     & 16.15       \\
+    64            & 2.23      & 13.91     & 14.70       \\
+    128           & 2.36      & 16.45     & 15.59       \\
+    256           & 2.64      & 14.15     & 14.87       \\
+    512           & 3.28      & 15.45     & 15.22       \\
+    1024          & 4.86      & 17.21     & 16.06       \\
+    \bottomrule
+  \end{tabular}
 \end{table}
 
 At 128 tokens input, we achieve 7.0x over vLLM and 6.6x over SGLang.
 
 \begin{table}[h]
-\caption{Hardware utilization for our persistent megakernel on B200}
-\label{tab:2}
-\small
-\begin{tabular}{llll}
-\toprule
-Seq Len & Tok/s & BW (GB/s) & TFLOPS \\
-\midrule
-1 & 478 & 1645 (20.6\%) & 1.65 \\
-128 & 429 & 1484 (18.6\%) & 1.49 \\
-512 & 333 & 1165 (14.6\%) & 1.18 \\
-1024 & 256 & 912 (11.4\%) & 0.94 \\
-\bottomrule
-\end{tabular}
+  \caption{Hardware utilization for our persistent megakernel on B200}
+  \label{tab:2}
+  \small
+  \begin{tabular}{llll}
+    \toprule
+    Seq Len & Tok/s & BW (GB/s)     & TFLOPS \\
+    \midrule
+    1       & 478   & 1645 (20.6\%) & 1.65   \\
+    128     & 429   & 1484 (18.6\%) & 1.49   \\
+    512     & 333   & 1165 (14.6\%) & 1.18   \\
+    1024    & 256   & 912 (11.4\%)  & 0.94   \\
+    \bottomrule
+  \end{tabular}
 \end{table}
 
 The decode phase is memory-bandwidth bound (thin GEMVs), achieving up to 1645 GB/s of the B200's 8 TB/s peak.
@@ -177,21 +171,21 @@ All inter-layer communication is barrier-mediated, with 5 grid barriers per laye
 \subsection{Fused Operations}
 
 \begin{table*}[t]
-\caption{Fused operations eliminating intermediate HBM traffic. Each fused kernel replaces multiple standalone launches.}
-\label{tab:3}
-\begin{tabular}{p{0.25\linewidth} p{0.5\linewidth} l}
-\toprule
-Fused Kernel & Operations & Launches Saved \\
-\midrule
-rmsnorm\_qkv\_split & RMSNorm + Q/K/V projection + head split & $4 \rightarrow 1$ \\
-qknorm\_rope\_kvcache & Q/K per-head RMSNorm + RoPE ($\theta = 10^6$) + KV cache write & $5 \rightarrow 1$ \\
-flash\_decode\_gqa & GQA attention (online softmax, fast exp approx) & $3 \rightarrow 1$ \\
-oproj\_residual & Output projection + residual add & $2 \rightarrow 1$ \\
-upgate\_silu & Gate + Up GEMVs + SiLU + elementwise multiply & $4 \rightarrow 1$ \\
-downproj\_residual & Down projection + residual add & $2 \rightarrow 1$ \\
-rmsnorm\_lmhead & Final RMSNorm + vocabulary logit projection & $2 \rightarrow 1$ \\
-\bottomrule
-\end{tabular}
+  \caption{Fused operations eliminating intermediate HBM traffic. Each fused kernel replaces multiple standalone launches.}
+  \label{tab:3}
+  \begin{tabular}{p{0.25\linewidth} p{0.5\linewidth} l}
+    \toprule
+    Fused Kernel          & Operations                                                     & Launches Saved    \\
+    \midrule
+    rmsnorm\_qkv\_split   & RMSNorm + Q/K/V projection + head split                        & $4 \rightarrow 1$ \\
+    qknorm\_rope\_kvcache & Q/K per-head RMSNorm + RoPE ($\theta = 10^6$) + KV cache write & $5 \rightarrow 1$ \\
+    flash\_decode\_gqa    & GQA attention (online softmax, fast exp approx)                & $3 \rightarrow 1$ \\
+    oproj\_residual       & Output projection + residual add                               & $2 \rightarrow 1$ \\
+    upgate\_silu          & Gate + Up GEMVs + SiLU + elementwise multiply                  & $4 \rightarrow 1$ \\
+    downproj\_residual    & Down projection + residual add                                 & $2 \rightarrow 1$ \\
+    rmsnorm\_lmhead       & Final RMSNorm + vocabulary logit projection                    & $2 \rightarrow 1$ \\
+    \bottomrule
+  \end{tabular}
 \end{table*}
 
 The total per forward pass is 1 megakernel launch plus 1 CUTLASS SM100 FMHA call (for prefill), giving 2 launches compared to over 200 with PyTorch eager mode. The FMHA kernel uses CUTLASS's \texttt{Sm100FmhaFwdKernelTmaWarpspecialized} with tile shape $\langle 256, 128, 128 \rangle$ (Q-seq $\times$ K-seq $\times$ head\_dim), TMA-based async global-to-shared loads, and a persistent tile scheduler.
@@ -257,19 +251,19 @@ Beyond the persistent tcgen05 GEMM architecture, we applied three additional opt
 Table~\ref{tab:moe-kernel} shows per-layer MoE performance on a single B200, measured using synthetic inputs with Qwen3-480B dimensions (hidden size 6144, 20 local experts, intermediate size 2560, top-8 routing).
 
 \begin{table}[h]
-\caption{Per-layer MoE performance: our cuBLAS kernel pipeline vs.\ PyTorch baseline (single B200)}
-\label{tab:moe-kernel}
-\begin{tabular}{rrrr}
-\toprule
-Tokens & Ours (ms) & PyTorch (ms) & Speedup \\
-\midrule
-256  & 0.760 & 13.530 & 17.8$\times$ \\
-512  & 0.780 & 13.378 & 17.1$\times$ \\
-1024 & 0.798 & 13.953 & 17.5$\times$ \\
-2048 & 0.820 & 15.551 & 19.0$\times$ \\
-4096 & 1.126 & 19.073 & 16.9$\times$ \\
-\bottomrule
-\end{tabular}
+  \caption{Per-layer MoE performance: our cuBLAS kernel pipeline vs.\ PyTorch baseline (single B200)}
+  \label{tab:moe-kernel}
+  \begin{tabular}{rrrr}
+    \toprule
+    Tokens & Ours (ms) & PyTorch (ms) & Speedup      \\
+    \midrule
+    256    & 0.760     & 13.530       & 17.8$\times$ \\
+    512    & 0.780     & 13.378       & 17.1$\times$ \\
+    1024   & 0.798     & 13.953       & 17.5$\times$ \\
+    2048   & 0.820     & 15.551       & 19.0$\times$ \\
+    4096   & 1.126     & 19.073       & 16.9$\times$ \\
+    \bottomrule
+  \end{tabular}
 \end{table}
 
 At $T{=}4096$, the full MoE layer (router + gather + gate-up GEMM + SiLU + down GEMM + scatter) completes in 1.126\,ms, of which the two cuBLAS expert GEMMs account for 0.789\,ms (gate-up: 0.500\,ms at 513 TFLOPS, down: 0.289\,ms at 444 TFLOPS). The remaining 0.337\,ms covers routing, gather, SiLU, and scatter, down from 1.361\,ms before the cuBLAS router and vectorization optimizations.
@@ -281,20 +275,20 @@ Across 62 MoE layers, the estimated TTFT contribution from MoE compute alone is 
 Table~\ref{tab:moe-ttft} shows end-to-end TTFT for the full Qwen3-Coder-480B-A35B-Instruct model on 8 NVIDIA B200 GPUs with TP=8 and EP=8.
 
 \begin{table}[h]
-\caption{Full-model TTFT: Qwen3-480B on 8$\times$B200 (TP=8, EP=8)}
-\label{tab:moe-ttft}
-\begin{tabular}{rrr}
-\toprule
-Prompt Length & TTFT (ms) & Prefill (tok/s) \\
-\midrule
-128  &  94.9 &  1{,}232 \\
-256  &  98.7 &  2{,}361 \\
-512  & 114.4 &  4{,}073 \\
-1024 & 141.2 &  6{,}594 \\
-2048 & 158.3 & 11{,}762 \\
-4096 & 241.4 & 15{,}425 \\
-\bottomrule
-\end{tabular}
+  \caption{Full-model TTFT: Qwen3-480B on 8$\times$B200 (TP=8, EP=8)}
+  \label{tab:moe-ttft}
+  \begin{tabular}{rrr}
+    \toprule
+    Prompt Length & TTFT (ms) & Prefill (tok/s) \\
+    \midrule
+    128           & 94.9      & 1{,}232         \\
+    256           & 98.7      & 2{,}361         \\
+    512           & 114.4     & 4{,}073         \\
+    1024          & 141.2     & 6{,}594         \\
+    2048          & 158.3     & 11{,}762        \\
+    4096          & 241.4     & 15{,}425        \\
+    \bottomrule
+  \end{tabular}
 \end{table}
 
 The engine achieves 94.9\,ms TTFT at 128 tokens, scaling to 241.4\,ms at 4096 tokens (15{,}425 tokens/s prefill throughput). This includes all 62 MoE layers, 62 GQA attention layers, embedding, final normalization, EP all-reduce communication, and LM head computation. TTFT scales sub-linearly with prompt length due to fixed overheads of KV cache initialization and inter-GPU communication.
