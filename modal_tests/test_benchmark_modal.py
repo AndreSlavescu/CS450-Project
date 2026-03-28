@@ -88,7 +88,6 @@ else:
 
 @dataclass(frozen=True)
 class ModelConfig:
-
     name: str
     hf_id: str
     hidden_size: int
@@ -1375,9 +1374,9 @@ def _print_kernel_table(
     data = kernel_results.get("results", {})
     kernels = kernel_results.get("kernels", list(KERNEL_DEFAULTS))
 
-    print(f"\n{'='*90}")
+    print(f"\n{'=' * 90}")
     print(f"KERNEL MICROBENCH RESULTS ({model_cfg.name} on {gpu_name})")
-    print(f"{'='*90}")
+    print(f"{'=' * 90}")
     print(f"Kernels: {kernels}")
     for seq_len in seq_lens:
         rows = data.get(seq_len) or data.get(str(seq_len))
@@ -1633,9 +1632,9 @@ def main(
     model_slug = model.replace("-", "_").replace(".", "_")
 
     if mode == "kernels":
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("Running Attention Kernel Microbenchmarks...")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         kernel_results = run_attention_kernels_benchmark.remote(
             asdict(model_cfg),
             selected_kernel_seq_lens,
@@ -1695,13 +1694,13 @@ def main(
     model_cfg_dict = asdict(model_cfg)
 
     if mode == "megakernel":
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("Running Megakernel Benchmark (compile + decode only)...")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         mega_results = run_megakernel_benchmark.remote(model_cfg_dict, BENCH_SEQ_LENS, warmup_iters, bench_iters)
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("MEGAKERNEL RESULTS")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         mega_data = mega_results.get("results", {})
         print(f"{'seq_len':>8} {'mean_ms':>10} {'tok/s':>8} {'TFLOPS':>9} {'BW GB/s':>10}")
         print("-" * 55)
@@ -1716,10 +1715,10 @@ def main(
 
     if mode == "vm":
         vm_seq_lens = [1, 64, 256, 1024, 2048]
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f"VM Kernel A/B Benchmark: {model_cfg.name} on {gpu_name}")
         print(f"Seq lengths: {vm_seq_lens}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         vm_results = run_vm_benchmark.remote(model_cfg_dict, vm_seq_lens, warmup_iters, bench_iters)
 
         correct = vm_results.get("correctness_match", "N/A")
@@ -1728,7 +1727,7 @@ def main(
         vm_data = vm_results.get("results", {})
         peak_bw_gb_s = gpu_config["peak_bandwidth_tb_s"] * 1000
 
-        print(f"\n{'='*90}")
+        print(f"\n{'=' * 90}")
         print(
             f"{'seq_len':>8} {'baseline':>10} {'VM':>10} {'speedup':>8}"
             f" {'BL BW':>10} {'VM BW':>10} {'BL util':>8} {'VM util':>8}"
@@ -1749,7 +1748,7 @@ def main(
                 f"{sl:>8} {bl_ms:>9.3f}ms {vm_ms:>9.3f}ms {sp:>7.2f}x"
                 f" {bl_bw:>9.0f} {vm_bw:>9.0f} {bl_util:>7.1f}% {vm_util:>7.1f}%"
             )
-        print(f"{'='*90}")
+        print(f"{'=' * 90}")
 
         results_path = ref_dir / f"vm_benchmark_{model_slug}_{gpu}_{timestamp}.json"
         with open(results_path, "w") as f:
@@ -1758,10 +1757,10 @@ def main(
         return
 
     if mode == "ttft":
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f"TTFT Benchmark: {model_cfg.name} on {gpu_name}")
         print(f"Prompt lengths: {TTFT_PROMPT_LENS}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         ttft_handle = run_ttft_benchmark.spawn(model_cfg_dict, TTFT_PROMPT_LENS, warmup_iters, bench_iters)
         vllm_handle = None
@@ -1795,9 +1794,9 @@ def main(
                 backends_data[backend] = timings
         active_backends = [b for b in backends_data if backends_data[b]]
 
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("TTFT RESULTS (mean ms, lower is better)")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         print(f"{'prompt_len':>10}", end="")
         for b in active_backends:
@@ -1825,7 +1824,7 @@ def main(
                         print(f"  {'N/A':>12}", end="")
             print()
 
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         results_path = ref_dir / f"ttft_{model_slug}_{gpu}_{timestamp}.json"
         with open(results_path, "w") as f:
@@ -1833,9 +1832,9 @@ def main(
         print(f"\nTTFT results saved to {results_path}")
         return
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"Theoretical Analysis: {model_cfg.name} (per decode step, batch=1, bf16)")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     print(f"{'seq_len':>8} {'GFLOP':>10} {'GB traffic':>12} {'AI (F/B)':>10} {'Regime':>15}")
     print("-" * 70)
     ridge_point = gpu_config["peak_tflops_bf16"] * 1e12 / (gpu_config["peak_bandwidth_tb_s"] * 1e12)
@@ -1849,19 +1848,19 @@ def main(
         )
     print(f"  Ridge point (FLOP/byte): {ridge_point:.1f}")
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("Running HF Baseline Benchmark...")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     hf_results = run_hf_benchmark.remote(model_cfg_dict, BENCH_SEQ_LENS, WARMUP_ITERS, BENCH_ITERS)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("Running Megakernel Benchmark...")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     mega_results = run_megakernel_benchmark.remote(model_cfg_dict, BENCH_SEQ_LENS, WARMUP_ITERS, BENCH_ITERS)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("BENCHMARK RESULTS")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
     actual_seq_lens = []
     hf_data = hf_results.get("results", {})

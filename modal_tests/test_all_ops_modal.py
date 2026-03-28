@@ -314,9 +314,9 @@ def _run_all_ops(arch: str) -> dict:
     # Summary
     # ============================
     all_pass = all(r["pass"] for r in results.values())
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"Overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
 
     return {"all_pass": all_pass, "results": results}
 

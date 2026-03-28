@@ -175,9 +175,9 @@ def _compare_traces(ref_trace: dict, new_trace: dict, label: str) -> bool:
     ref_events = set(ref_durations.keys())
     new_events = set(new_durations.keys())
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"TRACE COMPARISON: {label}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  Reference events: {len(ref_events)}")
     print(f"  New events:       {len(new_events)}")
 
@@ -195,7 +195,7 @@ def _compare_traces(ref_trace: dict, new_trace: dict, label: str) -> bool:
         return len(missing) == 0
 
     print(f"\n  {'Event':<30} {'Ref (us)':>12} {'New (us)':>12} {'Delta':>10}")
-    print(f"  {'-'*64}")
+    print(f"  {'-' * 64}")
 
     for name in sorted(common):
         ref_mean = sum(ref_durations[name]) / len(ref_durations[name])

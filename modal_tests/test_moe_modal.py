@@ -66,9 +66,9 @@ def _worker(rank: int, world_size: int, results_dict: dict):
     )
 
     if rank == 0:
-        print(f"\n{'='*60}", flush=True)
+        print(f"\n{'=' * 60}", flush=True)
         print(f"Qwen3-Coder-480B-A35B-Instruct  TP={world_size}  EP={world_size}", flush=True)
-        print(f"{'='*60}\n", flush=True)
+        print(f"{'=' * 60}\n", flush=True)
 
     # NCCL latency microbenchmark
     if rank == 0:
@@ -235,9 +235,9 @@ def _worker(rank: int, world_size: int, results_dict: dict):
 
     # ── TTFT benchmark ──
     if rank == 0:
-        print(f"\n{'─'*60}")
+        print(f"\n{'─' * 60}")
         print("TTFT benchmark (prefill)")
-        print(f"{'─'*60}")
+        print(f"{'─' * 60}")
 
     ids = tokenizer.encode(PROMPT, add_special_tokens=True)
     input_ids = torch.tensor([ids], dtype=torch.long, device=f"cuda:{rank}")
@@ -275,9 +275,9 @@ def _worker(rank: int, world_size: int, results_dict: dict):
 
     # ── decode throughput ──
     if rank == 0:
-        print(f"\n{'─'*60}")
+        print(f"\n{'─' * 60}")
         print(f"Decode throughput ({GEN_TOKENS} tokens)")
-        print(f"{'─'*60}")
+        print(f"{'─' * 60}")
 
     # Prefill once, then measure decode
     model.stacked_kv_cache[0].zero_()
@@ -336,13 +336,13 @@ def _worker(rank: int, world_size: int, results_dict: dict):
         print(f"  Throughput: {decode_tps:.1f} tok/s")
 
         mem_gb = torch.cuda.max_memory_allocated(rank) / 1e9
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Summary: Qwen3-Coder-480B  8×B200  TP=8 EP=8")
         print(f"  Model load: {t_load:.1f}s")
         print(f"  Peak GPU memory: {mem_gb:.1f} GB / 192 GB")
         print(f"  Prefill ({len(ids)} tok): {median_ttft:.1f} ms ({tps:.0f} tok/s)")
         print(f"  Decode: {ms_per_tok:.1f} ms/tok ({decode_tps:.0f} tok/s)")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     if rank == 0:
         results_dict["ttft_ms"] = median_ttft

@@ -196,7 +196,7 @@ def _ours_persistent_worker(rank, world_size, barrier, exit_flag, prompt_lens_re
             ],
             text=True,
         ).strip()
-        extra_flags = f"{torch_incs} {torch_libs}" " -ltorch -ltorch_cpu -lc10 -ltorch_python"
+        extra_flags = f"{torch_incs} {torch_libs} -ltorch -ltorch_cpu -lc10 -ltorch_python"
 
         print("[Ours] Building MoE kernel...", flush=True)
         result = subprocess.run(
@@ -296,7 +296,7 @@ def _ours_persistent_worker(rank, world_size, barrier, exit_flag, prompt_lens_re
             if rank == 0:
                 tps = len(ids) / (median_ttft / 1000.0)
                 print(
-                    f"  [Ours] n={n_tok:>5} → " f"TTFT {median_ttft:8.1f} ms  " f"({tps:.0f} tok/s prefill)",
+                    f"  [Ours] n={n_tok:>5} → TTFT {median_ttft:8.1f} ms  ({tps:.0f} tok/s prefill)",
                     flush=True,
                 )
 
@@ -348,7 +348,7 @@ def _ours_persistent_worker(rank, world_size, barrier, exit_flag, prompt_lens_re
 
             if rank == 0:
                 print(
-                    f"  [Ours] n={n_tok:>5} → " f"Decode {ms_per_tok:.2f} ms/tok",
+                    f"  [Ours] n={n_tok:>5} → Decode {ms_per_tok:.2f} ms/tok",
                     flush=True,
                 )
 
@@ -494,7 +494,7 @@ class VllmEngine:
 
                 # Warmup
                 for wi in range(WARMUP):
-                    print(f"  [vLLM]   warmup {wi+1}/{WARMUP}...", flush=True)
+                    print(f"  [vLLM]   warmup {wi + 1}/{WARMUP}...", flush=True)
                     _gen(prompt_text, params)
 
                 print(f"  [vLLM] n={n_tok:>5} measuring...", flush=True)
@@ -540,7 +540,7 @@ class VllmEngine:
                     decode_ms_list.sort()
                     decode_results[n_tok] = decode_ms_list[len(decode_ms_list) // 2]
                     print(
-                        f"  [vLLM] n={n_tok:>5} → " f"Decode {decode_results[n_tok]:.2f} ms/tok",
+                        f"  [vLLM] n={n_tok:>5} → Decode {decode_results[n_tok]:.2f} ms/tok",
                         flush=True,
                     )
 
@@ -640,7 +640,7 @@ class SglangEngine:
                 median_ttft = ttft_times[len(ttft_times) // 2]
                 ttft_results[n_tok] = median_ttft
                 print(
-                    f"  [SGLang] n={n_tok:>5} → " f"TTFT {median_ttft:8.1f} ms",
+                    f"  [SGLang] n={n_tok:>5} → TTFT {median_ttft:8.1f} ms",
                     flush=True,
                 )
 
@@ -660,7 +660,7 @@ class SglangEngine:
                 ms_per_tok = decode_total / (GEN_TOKENS - 1) if GEN_TOKENS > 1 else decode_total
                 decode_results[n_tok] = ms_per_tok
                 print(
-                    f"  [SGLang] n={n_tok:>5} → " f"Decode {ms_per_tok:.2f} ms/tok",
+                    f"  [SGLang] n={n_tok:>5} → Decode {ms_per_tok:.2f} ms/tok",
                     flush=True,
                 )
 
@@ -694,9 +694,9 @@ def _print_table(
     """Print a comparison table for one metric across backends."""
     backends = list(all_results.keys())
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(title)
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
     header = f"{'prompt_len':>10}"
     for b in backends:
@@ -734,12 +734,12 @@ def orchestrate(prompt_lens: list[int]) -> dict:
     """Run all backends sequentially. Models stay loaded via keep_warm."""
     all_results = {}
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"TTFT Benchmark: {MODEL_NAME}")
     print("Hardware: 8x B200 per backend")
     print(f"Prompt lengths: {prompt_lens}")
     print(f"Decode tokens: {GEN_TOKENS}")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
     print("\n--- Running: Our engine (TP=8, EP=8) ---", flush=True)
     try:
@@ -779,9 +779,9 @@ def orchestrate(prompt_lens: list[int]) -> dict:
         if "error" in res:
             print(f"\n[{name}] Error: {res['error']}")
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("Benchmark complete.")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
     return all_results
 

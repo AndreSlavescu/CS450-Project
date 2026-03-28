@@ -388,10 +388,10 @@ def main(gpu: str = "h100", mode: str = "reference"):
         report = run_correctness_test.remote(reference)
 
         agg = report["aggregate"]
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("SELF-CHECK RESULTS")
-        print(f"{'='*60}")
-        print(f"  Argmax match rate: {agg['argmax_match_rate']*100:.1f}%")
+        print(f"{'=' * 60}")
+        print(f"  Argmax match rate: {agg['argmax_match_rate'] * 100:.1f}%")
         print(f"  Mean top-1 logit diff: {agg['mean_top1_logit_diff']:.6f}")
         print(f"  Max  top-1 logit diff: {agg['max_top1_logit_diff']:.6f}")
         print(f"  Mean top-100 overlap:  {agg['mean_top100_overlap']:.1f}/100")
@@ -420,10 +420,10 @@ def main(gpu: str = "h100", mode: str = "reference"):
         passed = agg["passed"]
         status = "PASSED" if passed else "FAILED"
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"CORRECTNESS TEST: {status}")
-        print(f"{'='*60}")
-        print(f"  Argmax match rate: {agg['argmax_match_rate']*100:.1f}%")
+        print(f"{'=' * 60}")
+        print(f"  Argmax match rate: {agg['argmax_match_rate'] * 100:.1f}%")
         if agg["mean_top1_logit_diff"] is not None:
             print(f"  Mean top-1 logit diff: {agg['mean_top1_logit_diff']:.6f}")
             print(f"  Max  top-1 logit diff: {agg['max_top1_logit_diff']:.6f}")
