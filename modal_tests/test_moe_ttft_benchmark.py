@@ -369,9 +369,9 @@ def _ours_persistent_worker(rank, world_size, barrier, exit_flag, prompt_lens_re
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={HF_CACHE_PATH: hf_cache},
-    keep_warm=1,
-    allow_concurrent_inputs=1,
+    min_containers=1,
 )
+@modal.concurrent(max_inputs=1)
 class OursEngine:
     """Our engine with persistent 8-GPU worker pool. Model loads once."""
 
@@ -431,9 +431,9 @@ class OursEngine:
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={HF_CACHE_PATH: hf_cache},
-    keep_warm=1,
-    allow_concurrent_inputs=1,
+    min_containers=1,
 )
+@modal.concurrent(max_inputs=1)
 class VllmEngine:
     """vLLM engine. Model loads once and stays in GPU memory."""
 
@@ -557,9 +557,9 @@ class VllmEngine:
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={HF_CACHE_PATH: hf_cache},
-    keep_warm=1,
-    allow_concurrent_inputs=1,
+    min_containers=1,
 )
+@modal.concurrent(max_inputs=1)
 class SglangEngine:
     """SGLang engine. Model loads once and stays in GPU memory."""
 
