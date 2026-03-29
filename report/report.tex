@@ -93,6 +93,21 @@
 
 
 \section{Introduction}
+
+Serving large language models (LLMs) with low latency is the defining challenge in deploying interactive AI systems. During the single-sequence decode phase, autoregressive token generation is fundamentally bottlenecked by the "memory wall" ~\cite{zhao2024llminference}, a phenomenon where execution time is dictated not by compute capacity, but by the massive data movement required between global memory (HBM) and on-chip SRAM. Because standard inference engines execute hundreds of small, isolated CUDA kernels per forward pass, they actively exacerbate this bottleneck. Each kernel boundary introduces launch overhead, synchronization stalls, and redundant memory round-trips that leave the GPU severely underutilized. While production engines like vLLM ~\cite{vllm} and SGLang ~\cite{sglang} mitigate memory fragmentation via paged attention, they remain tethered to the traditional multi-kernel execution model, imposing a hard floor on per-token latency.
+
+Hazy Research~\cite{hazyresearch} recently proposed an alternative: fusing the entire transformer decode pass into a single persistent \textit{megakernel} that eliminates kernel boundaries entirely. Their implementation for Llama-1B on an NVIDIA H100 demonstrated over 1.5$\times$ speedup against vLLM and SGLang. However, their approach is limited in three ways: it underexploits the newer Blackwell (B200) architecture, it is specialized to a single model family (Llama), and it does not address sparse Mixture-of-Experts (MoE) architectures that are increasingly prevalent in production LLMs.
+
+We address all three limitations. First, we design a megakernel inference engine from the ground up for NVIDIA B200 GPUs, exploiting Blackwell-specific features including \texttt{tcgen05} 5th-generation tensor core instructions, dedicated tensor memory, 2-CTA cluster execution, and cluster-scoped TMA multicast. Second, we generalize the megakernel approach to the Qwen3 model family~\cite{qwen3}, which introduces architectural features absent from Llama such as per-head Q/K RMSNorm, 2:1 grouped-query attention, and tied word embeddings. Third, we scale the paradigm to Qwen3-480B-A35B~\cite{qwen3}, a 160-expert MoE model, with a fused 3-stage kernel pipeline distributed across 8 B200 GPUs using expert parallelism.
+
+Our contributions are:
+\begin{itemize}
+  \item A persistent megakernel for Qwen3-1.7B that fuses all 28 decoder layers into a single cooperative kernel launch, achieving 2.0--4.9\,ms TTFT on a B200---a 3--8$\times$ improvement over vLLM and SGLang.
+  \item A fused MoE kernel pipeline for Qwen3-480B-A35B using persistent \texttt{tcgen05} expert GEMMs, achieving 94.9\,ms TTFT at 128 tokens on 8$\times$B200 with 16.9$\times$ per-layer speedup over PyTorch.
+  \item A successful reproduction of the Hazy Research baseline on both H100 and B200 hardware, validating our comparison.
+  \item Evidence that the megakernel paradigm generalizes beyond Llama-style architectures and that designing kernels natively for Blackwell yields significant gains over porting from Hopper.
+\end{itemize}
+
 \section{Background and Motivation}
 
 Autoregressive decoding in decoder-only LLMs generates one token per forward pass, where each token depends on all preceding tokens. Each forward pass performs matrix multiplication (GEMVs) across all model layers (operations that are heavily memory-bandwidth bound rather than compute bound). The key performance metric is time-to-first-token (TTFT), which the user perceives as latency when interacting with these LLMs.
