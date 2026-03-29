@@ -16,6 +16,8 @@ if [ ! -f acmart.cls ]; then
 fi
 
 pdflatex -interaction=nonstopmode "$TEX_FILE"
+bibtex "${TEX_FILE%.tex}"
+pdflatex -interaction=nonstopmode "$TEX_FILE"
 pdflatex -interaction=nonstopmode "$TEX_FILE"
 
 echo "Done: $(basename "${TEX_FILE%.tex}.pdf")"
