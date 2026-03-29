@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-TEX_FILE="sample-sigplan.tex"
+TEX_FILE="report.tex"
 
 # Generate acmart.cls if not present (requires acmart.dtx + acmart.ins)
 if [ ! -f acmart.cls ]; then
