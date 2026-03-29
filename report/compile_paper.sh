@@ -20,5 +20,4 @@ bibtex "${TEX_FILE%.tex}"
 pdflatex -interaction=nonstopmode "$TEX_FILE"
 pdflatex -interaction=nonstopmode "$TEX_FILE"
 
-cp "${TEX_FILE%.tex}.pdf" final_report.pdf
-echo "Done: final_report.pdf"
+echo "Done: ${TEX_FILE%.tex}.pdf"
