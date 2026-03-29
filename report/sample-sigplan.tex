@@ -1,5 +1,7 @@
 %% The first command in your LaTeX source must be the \documentclass command.
 \documentclass[sigplan,screen]{acmart}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, fit, backgrounds, calc}
 
 %% \BibTeX command to typeset BibTeX logo in the docs
 \AtBeginDocument{%
@@ -24,7 +26,7 @@
 %%
 %% The "title" command has an optional parameter,
 %% allowing the author to define a "short title" to be used in page headers.
-\title{Final Report CS 450}
+\title{Low-Latency Megakernels for LLM Inference}
 
 %%
 %% The "author" command and its associated commands are used to define
@@ -109,9 +111,71 @@ Despite its strong results, the Hazy Research megakernel has three key limitatio
 
 These limitations motivate our work to have a megakernel inference engine designed from the ground up for NVIDIA Blackwell B200 GPUs, extended to the Qwen3 model family spanning both dense (1.7B) and MoE (480B-A35B) architectures. By exploiting B200-specific features such as tcgen05 tensor core instructions, tensor memory, CTA cluster cooperation, and cluster-scoped TMA and by demonstrating generality across fundamentally different model architectures, we aim to push megakernel inference by leveraging newer generation hardware.
 
-\section{High-level ideas}
+\section{High-Level Ideas}
+
+Our approach rests on three pillars: (1) fusing the entire dense transformer into a single persistent kernel, (2) extending the megakernel paradigm to sparse Mixture-of-Experts architectures, and (3) exploiting Blackwell-specific hardware features throughout. Figure~\ref{fig:pipeline} illustrates the overall pipeline for the dense model.
+
+\paragraph{Persistent dense megakernel.}
+For Qwen3-1.7B, we fuse all 28 decoder layers into one cooperative kernel launch on 128 thread blocks, eliminating the 200+ kernel launches that PyTorch eager mode requires. Thread blocks are statically specialized: one coordinator block manages KV cache pointers, 16 blocks handle grouped-query attention (one per Q head), and 111 blocks perform the FFN GEMVs. All intermediate activations stay in shared memory, and layers are chained through lightweight global-memory grid barriers, so no intermediate results ever round-trip through HBM. We detail this architecture in Section~\ref{sec:dense}.
+
+\paragraph{MoE scaling.}
+To scale beyond dense models, we extend the megakernel idea to Qwen3-480B-A35B, a 160-expert MoE model distributed across 8 B200 GPUs. The MoE FFN is restructured as a 3-stage fused pipeline: (i) a single-kernel router that computes gating logits, selects top-8 experts, and sorts tokens by expert, (ii) a persistent tcgen05 gate-up GEMM with fused SiLU activation, and (iii) a persistent tcgen05 down GEMM with weighted scatter-accumulate. This replaces what would otherwise be 8+ separate kernel launches per MoE layer. Expert parallelism (EP=8) places 20 experts per GPU, while tensor parallelism (TP=8) shards the attention layers. The full MoE design is described in Section~\ref{sec:moe}.
+
+\paragraph{Blackwell-native optimizations.}
+Rather than porting Hopper (H100) kernels, we design for the B200 from the ground up. The expert GEMMs use \texttt{tcgen05} 5th-generation tensor core instructions with dedicated tensor memory and 2-CTA cluster execution, where each cluster CTA loads half the weight tile and multicasts to its partner via cluster-scoped TMA, halving weight-load bandwidth. Prefill attention uses a CUTLASS SM100 FMHA kernel exploiting the B200's larger register file and doubled shared memory. Additional optimizations---replacing the custom router with a cuBLAS GEMM (6$\times$ speedup), vectorizing elementwise kernels with \texttt{float4} loads, and moving the prefix scan to the GPU---collectively reduce per-layer MoE latency by 49\%. These optimizations are detailed in Sections~\ref{sec:b200} and~\ref{sec:addopt}.
+
+\begin{figure}[h]
+  \centering
+  \begin{tikzpicture}[
+    node distance=0.25cm and 0.4cm,
+    block/.style={draw, rounded corners, minimum height=0.55cm, font=\scriptsize, inner sep=3pt, thick},
+    attn/.style={block, fill=blue!15},
+    ffn/.style={block, fill=orange!15},
+    norm/.style={block, fill=green!15},
+    io/.style={block, fill=gray!15},
+    layerbox/.style={draw, dashed, rounded corners, inner sep=5pt, thick, gray},
+    arr/.style={-{Stealth[length=2.5pt]}, thick},
+  ]
+    % Input
+    \node[io] (input) {Input Embed};
+
+    % Layer ops
+    \node[norm, right=of input] (rms1) {RMSNorm};
+    \node[attn, right=of rms1] (qkv) {QKV+Rope};
+    \node[attn, right=of qkv] (attn) {FlashDecode};
+    \node[attn, right=of attn] (oproj) {OProj+Res};
+    \node[norm, right=of oproj] (rms2) {RMSNorm};
+    \node[ffn, right=of rms2] (ffn) {FFN+Res};
+
+    % Arrows
+    \draw[arr] (input) -- (rms1);
+    \draw[arr] (rms1) -- (qkv);
+    \draw[arr] (qkv) -- (attn);
+    \draw[arr] (attn) -- (oproj);
+    \draw[arr] (oproj) -- (rms2);
+    \draw[arr] (rms2) -- (ffn);
+
+    % Layer box
+    \begin{scope}[on background layer]
+      \node[layerbox, fit=(rms1)(qkv)(attn)(oproj)(rms2)(ffn), label={[font=\scriptsize, gray]above:$\times\,28$ layers (shared memory, grid barriers)}] (layer) {};
+    \end{scope}
+
+    % Output
+    \node[io, right=of ffn] (lmhead) {LM Head};
+    \draw[arr] (ffn) -- (lmhead);
+
+    % Block labels below
+    \node[font=\tiny, blue!60, below=0.08cm of attn] {Blk 1--16};
+    \node[font=\tiny, orange!60, below=0.08cm of ffn] {Blk 17--127};
+    \node[font=\tiny, gray!80, below=0.08cm of input] {Blk 0};
+  \end{tikzpicture}
+  \caption{Dense megakernel pipeline for Qwen3-1.7B. All 28 layers execute within a single persistent kernel launch. Thread blocks are statically assigned to attention (blue) or FFN (orange) roles.}
+  \label{fig:pipeline}
+\end{figure}
+
 \section{Implementation and Mechanism}
 \subsection{Dense Megakernel Architecture Qwen3 1.7B}
+\label{sec:dense}
 
 The core contribution for the dense model is a persistent megakernel that fuses all 28 transformer decoder layers into a single cooperative kernel launch. The kernel runs on a fixed grid of 128 blocks $\times$ 512 threads (65{,}536 threads total), launched via \texttt{cudaLaunchCooperativeKernel} to enable device-wide synchronization through a custom \newline \texttt{GridBarrier} built on global atomics.
 
@@ -149,6 +213,7 @@ The total per forward pass is 1 megakernel launch plus 1 CUTLASS SM100 FMHA call
 The kernel accounts for several Qwen3 architectural features not present in the Llama baseline. Per-head Q/K RMSNorm is applied after projection and before RoPE, fused into a single device function that avoids writing intermediate normalized values to HBM. For GQA with ratio 2, where 16 Q heads share 8 KV heads, the flash decode kernel maps $\lfloor \texttt{head\_idx} / 2 \rfloor$ to select the correct KV head, doubling compute reuse per KV cache read. The embedding matrix is also reused for the LM head via tied word embeddings, saving 300\,MB of weight memory for the 1.7B model.
 
 \subsection{Scaling to Qwen3-480B-A35B: MoE Megakernel}
+\label{sec:moe}
 
 The Qwen3-Coder-480B-A35B model replaces the dense FFN with a Mixture-of-Experts (MoE) layer consisting of 160 routed experts with top-8 gating, a hidden size of 6{,}144, and a per-expert intermediate dimension of 2{,}560. At approximately 960 GB in BF16, the model requires 8$\times$ B200 GPUs with expert parallelism (EP=8), giving 20 local experts per GPU.
 
@@ -183,12 +248,14 @@ The 8-GPU setup uses two orthogonal parallelism strategies. For attention, tenso
 For the TP all-reduce, we additionally explored multimem NVLS (NVLink SHARP), which is a fused \texttt{ld\_reduce\_add\_bf16x8} kernel that performs all-reduce directly through NVLink multicast memory, bypassing NCCL's ring protocol. This provides lower latency for the small activation tensors typical of batch-1 decode (approximately $6{,}144 \times 2 = 12$ KB per all-reduce).
 
 \subsection{B200 (SM100) Optimizations}
+\label{sec:b200}
 
 Several optimizations are specific to the Blackwell architecture. Unlike Hopper's \texttt{wgmma} which reads accumulators from registers, Blackwell's tcgen05 uses dedicated tensor memory with an explicit alloc/dealloc lifecycle. The \newline \texttt{tensor\_allocator<1,2>} manages column allocation across the 2-CTA cluster, and the \texttt{tcgen05.ld} instruction supports a \texttt{pack::16b} modifier that converts FP32 accumulator values to BF16 during the load, eliminating a separate conversion pass.
 
 The B200's cluster architecture allows two CTAs to share data through cluster-scoped TMA loads \newline (\texttt{tma::cluster::load\_async} with a multicast mask). Each CTA loads its half of the B matrix (128 of 256 columns) and broadcasts to the partner CTA, halving the required TMA bandwidth for weights. The prefill attention path uses a CUTLASS SM100 FMHA kernel~\cite{flashattention} with persistent tile scheduling, achieving higher occupancy than the SM90 (Hopper) equivalent by exploiting the B200's larger register file (256 registers/thread) and doubled shared memory capacity (228 KB/SM). The scatter-accumulate kernel uses FP32 \texttt{atomicAdd} for weighted output accumulation, and on B200 these atomics execute at the L2 cache level with 2$\times$ the bandwidth of H100, reducing the scatter bottleneck for high fan-out routing (top-8 $\times$ $T$ tokens).
 
 \subsection{Additional Kernel Optimizations}
+\label{sec:addopt}
 
 Beyond the persistent tcgen05 GEMM architecture, we applied three additional optimizations to the MoE pipeline that collectively reduced per-layer latency by 49\%.
 
