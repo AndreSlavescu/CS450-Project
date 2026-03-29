@@ -116,7 +116,7 @@ These limitations motivate our work to have a megakernel inference engine design
 Our approach rests on three pillars: (1) fusing the entire dense transformer into a single persistent kernel, (2) extending the megakernel paradigm to sparse Mixture-of-Experts architectures, and (3) exploiting Blackwell-specific hardware features throughout. Figure~\ref{fig:pipeline} illustrates the overall pipeline for the dense model.
 
 \paragraph{Persistent dense megakernel.}
-For Qwen3-1.7B, we fuse all 28 decoder layers into one cooperative kernel launch on 128 thread blocks, eliminating the 200+ kernel launches that PyTorch eager mode requires. Thread blocks are statically specialized: one coordinator block manages KV cache pointers, 16 blocks handle grouped-query attention (one per Q head), and 111 blocks perform the FFN GEMVs. All intermediate activations stay in shared memory, and layers are chained through lightweight global-memory grid barriers, so no intermediate results ever round-trip through HBM. We detail this architecture in Section~\ref{sec:dense}.
+For Qwen3-1.7B, we fuse all 28 decoder layers into one cooperative kernel launch on 128 thread blocks, eliminating the 200+ kernel launches that PyTorch eager mode requires. Thread blocks are statically specialized: blocks 0--15 handle grouped-query attention (one per Q head), with block 0 additionally serving as the KV cache coordinator, while blocks 16--127 (112 blocks) perform the FFN GEMVs. Intermediate activations are stored in small global-memory buffers sized to remain L2-resident, avoiding costly HBM round-trips, while shared memory is used for intra-block scratch (RMSNorm reductions, attention warp accumulators). Layers are chained through lightweight grid barriers on global atomics. We detail this architecture in Section~\ref{sec:dense}.
 
 \paragraph{MoE scaling.}
 To scale beyond dense models, we extend the megakernel idea to Qwen3-480B-A35B, a 160-expert MoE model distributed across 8 B200 GPUs. The MoE FFN is restructured as a 3-stage fused pipeline: (i) a single-kernel router that computes gating logits, selects top-8 experts, and sorts tokens by expert, (ii) a persistent tcgen05 gate-up GEMM with fused SiLU activation, and (iii) a persistent tcgen05 down GEMM with weighted scatter-accumulate. This replaces what would otherwise be 8+ separate kernel launches per MoE layer. Expert parallelism (EP=8) places 20 experts per GPU, while tensor parallelism (TP=8) shards the attention layers. The full MoE design is described in Section~\ref{sec:moe}.
@@ -162,16 +162,15 @@ Rather than porting Hopper (H100) kernels, we design for the B200 from the groun
     \end{scope}
 
     % Block labels to the right of the layer box
-    \node[lbl, gray!80, right=0.15cm of input] {Blk 0 (coordinator)};
-    \node[lbl, blue!60, right=0.15cm of layer.east |- attn] {Blk 1--16 (attn)};
-    \node[lbl, orange!60, right=0.15cm of layer.east |- ffn] {Blk 17--127 (FFN)};
+    \node[lbl, blue!60, right=0.15cm of layer.east |- attn] {Blk 0--15 (attn, blk 0 = coord)};
+    \node[lbl, orange!60, right=0.15cm of layer.east |- ffn] {Blk 16--127 (FFN)};
     \node[font=\scriptsize, gray, right=0.15cm of layer.east |- rms1] {$\times\,28$ layers};
 
     % Output
     \node[io, below=of ffn] (lmhead) {LM Head};
     \draw[arr] (ffn) -- (lmhead);
   \end{tikzpicture}
-  \caption{Dense megakernel pipeline for Qwen3-1.7B. All 28 layers execute within a single persistent kernel launch. Thread blocks are statically assigned to attention (blue) or FFN (orange) roles. All inter-layer data stays in shared memory.}
+  \caption{Dense megakernel pipeline for Qwen3-1.7B. All 28 layers execute within a single persistent kernel launch. Thread blocks are statically assigned to attention (blue) or FFN (orange) roles. Inter-layer activations remain L2-resident.}
   \label{fig:pipeline}
 \end{figure}
 
